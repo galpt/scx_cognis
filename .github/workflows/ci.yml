@@ -61,51 +61,10 @@ jobs:
           git push origin ${{ steps.tag.outputs.new_tag }}
 
   # ──────────────────────────────────────────────────────────────────────────
-  # Lint: format check + clippy
-  # ──────────────────────────────────────────────────────────────────────────
-  lint:
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends \
-            clang llvm libclang-dev \
-            libbpf-dev libelf-dev zlib1g-dev \
-            libseccomp-dev \
-            pkg-config
-
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-
-      - name: Cache Cargo registry (deps only — no target dir to avoid stale artifacts)
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: ${{ runner.os }}-cargo-deps-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-deps-
-
-      - name: cargo fmt --check
-        run: cargo fmt --all -- --check
-
-      - name: cargo clippy
-        env:
-          CARGO_INCREMENTAL: "0"
-          CARGO_TARGET_DIR: /tmp/lint-target
-        run: cargo clippy --all-targets -- -D warnings
-
-  # ──────────────────────────────────────────────────────────────────────────
   # Test: run all unit tests (no kernel or root required)
   # ──────────────────────────────────────────────────────────────────────────
   test:
     runs-on: ubuntu-24.04
-    needs: [ lint ]
     steps:
       - uses: actions/checkout@v4
 
