@@ -89,9 +89,10 @@ test result: ok. 13 passed; 0 failed; 0 ignored
 | Arch Linux | ≥ 6.12 (sched-ext) | x86-64 | [![CI (Arch Linux)](https://github.com/galpt/scx_cognis/actions/workflows/ci-arch.yml/badge.svg)](https://github.com/galpt/scx_cognis/actions/workflows/ci-arch.yml) |
 | CachyOS (latest) | 6.13+ (sched-ext) | x86-64 | [![CI (CachyOS)](https://github.com/galpt/scx_cognis/actions/workflows/ci-cachyos.yml/badge.svg)](https://github.com/galpt/scx_cognis/actions/workflows/ci-cachyos.yml) |
 
-> Each CI badge reflects a `cargo check --all` run inside the distribution's official Docker image on the latest push.
-> Runtime testing requires a `sched_ext`-enabled kernel (CONFIG_SCHED_CLASS_EXT=y) which standard CI runners do not provide.
-> Arch Linux and CachyOS are also verified manually on hardware with the `linux-sched-ext` / `linux-cachyos` kernels.
+> [!NOTE]
+> 1. Each CI badge reflects a `cargo check --all` run inside the distribution's official Docker image on the latest push.
+> 2. Runtime testing requires a `sched_ext`-enabled kernel (CONFIG_SCHED_CLASS_EXT=y) which standard CI runners do not provide.
+> 3. Arch Linux and CachyOS are also verified manually on hardware with the `linux-sched-ext` / `linux-cachyos` kernels.
 
 [↑ Back to Table of Contents](#table-of-contents)
 
