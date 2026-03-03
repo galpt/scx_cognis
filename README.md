@@ -85,7 +85,7 @@ test result: ok. 13 passed; 0 failed; 0 ignored
 
 | Platform | Kernel | Architecture | CI Status |
 |:---|:---|:---|:---|
-| Ubuntu 24.04 LTS | 6.8 | x86-64 | [![CI](https://github.com/galpt/scx_cognis/actions/workflows/ci.yml/badge.svg)](https://github.com/galpt/scx_cognis/actions/workflows/ci.yml) |
+| Ubuntu 24.04 LTS | 6.8 | x86-64 | [![CI (Ubuntu)](https://github.com/galpt/scx_cognis/actions/workflows/ci.yml/badge.svg)](https://github.com/galpt/scx_cognis/actions/workflows/ci.yml) |
 | Arch Linux | ≥ 6.12 (sched-ext) | x86-64 | [![CI (Arch Linux)](https://github.com/galpt/scx_cognis/actions/workflows/ci-arch.yml/badge.svg)](https://github.com/galpt/scx_cognis/actions/workflows/ci-arch.yml) |
 | CachyOS (latest) | 6.13+ (sched-ext) | x86-64 | [![CI (CachyOS)](https://github.com/galpt/scx_cognis/actions/workflows/ci-cachyos.yml/badge.svg)](https://github.com/galpt/scx_cognis/actions/workflows/ci-cachyos.yml) |
 

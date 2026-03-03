@@ -27,9 +27,9 @@ use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Action {
-    ShrinkSlice = 0,
-    KeepSlice = 1,
-    GrowSlice = 2,
+    Shrink = 0,
+    Keep = 1,
+    Grow = 2,
 }
 
 const N_ACTIONS: usize = 3;
@@ -74,13 +74,12 @@ impl QTable {
                 .try_into()
                 .unwrap_or_else(|_| {
                     // Fallback for platforms where const array conversion fails.
-                    let boxed = unsafe {
+                    unsafe {
                         let ptr = std::alloc::alloc_zeroed(
                             std::alloc::Layout::array::<[f64; N_ACTIONS]>(TABLE_SIZE).unwrap(),
                         ) as *mut [[f64; N_ACTIONS]; TABLE_SIZE];
                         Box::from_raw(ptr)
-                    };
-                    boxed
+                    }
                 }),
         }
     }
@@ -94,9 +93,9 @@ impl QTable {
             .map(|(i, _)| i)
             .unwrap_or(1); // default: keep slice
         match best_idx {
-            0 => Action::ShrinkSlice,
-            2 => Action::GrowSlice,
-            _ => Action::KeepSlice,
+            0 => Action::Shrink,
+            2 => Action::Grow,
+            _ => Action::Keep,
         }
     }
 
@@ -198,7 +197,7 @@ impl PolicyController {
             alpha: 0.01,
             gamma: 0.95,
             prev_state: 0,
-            prev_action: Action::KeepSlice,
+            prev_action: Action::Keep,
             current_slice_ns: base_slice_ns,
             base_slice_ns,
             reward_ema: 0.0,
@@ -239,9 +238,9 @@ impl PolicyController {
             // Explore: random action.
             let r = (rand_f64() * N_ACTIONS as f64) as usize;
             match r {
-                0 => Action::ShrinkSlice,
-                2 => Action::GrowSlice,
-                _ => Action::KeepSlice,
+                0 => Action::Shrink,
+                2 => Action::Grow,
+                _ => Action::Keep,
             }
         } else {
             self.q.best_action(state)

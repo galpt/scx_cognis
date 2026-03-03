@@ -142,7 +142,7 @@ impl AStarLoadBalancer {
         // O(n_cpus) but n_cpus is typically < 256, well within our latency budget.
         let mut heap = BinaryHeap::with_capacity(self.cpus.len());
 
-        for (_, cpu) in &self.cpus {
+        for cpu in self.cpus.values() {
             // Quarantine logic: flagged tasks must run on restricted CPUs only.
             if quarantine && !cpu.restricted {
                 continue;

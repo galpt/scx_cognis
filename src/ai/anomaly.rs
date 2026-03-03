@@ -160,7 +160,7 @@ impl IsolationForest {
         let n = samples.len().min(SAMPLE_SIZE);
         self.n_train = n;
 
-        let mut rng = SmallRng::seed_from_u64(0xC0FFEE_DEAD);
+        let mut rng = SmallRng::seed_from_u64(0x00C0_FFEE_DEAD);
         let subset: Vec<[f32; FEATURE_DIM]> = samples[..n].to_vec();
 
         self.trees = (0..N_TREES)
@@ -190,9 +190,8 @@ impl IsolationForest {
 
         // Anomaly score: 2^(-E[h(x)] / c)
         // Invert so higher score = more anomalous.
-        let normal_score = 2.0_f32.powf(-avg_path / c);
-        // normal_score is close to 0.5 for typical points, closer to 1 for anomalies.
-        normal_score
+        // Score is close to 0.5 for typical points, closer to 1 for anomalies.
+        2.0_f32.powf(-avg_path / c)
     }
 
     pub fn is_anomaly(&self, sample: &[f32; FEATURE_DIM]) -> bool {
@@ -262,7 +261,7 @@ impl AntiCheatEngine {
             .collect();
 
         // Possibly retrain.
-        if self.tick_count % RETRAIN_EVERY == 0 {
+        if self.tick_count.is_multiple_of(RETRAIN_EVERY) {
             let samples: Vec<[f32; FEATURE_DIM]> = stats_snapshot.iter().map(|(_, f)| *f).collect();
             // Also include historical buffer.
             let mut all = samples.clone();
@@ -280,8 +279,8 @@ impl AntiCheatEngine {
             self.train_head = (self.train_head + 1) % self.train_max;
 
             if self.forest.is_anomaly(&feats) {
-                if !self.flagged.contains_key(&tgid) {
-                    self.flagged.insert(tgid, now_ns);
+                if let std::collections::hash_map::Entry::Vacant(e) = self.flagged.entry(tgid) {
+                    e.insert(now_ns);
                     new_flags.push(tgid);
                 }
             } else {
