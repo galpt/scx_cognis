@@ -61,10 +61,27 @@ jobs:
           git push origin ${{ steps.tag.outputs.new_tag }}
 
   # ──────────────────────────────────────────────────────────────────────────
+  # Lint: format check
+  # ──────────────────────────────────────────────────────────────────────────
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+  # ──────────────────────────────────────────────────────────────────────────
   # Test: run all unit tests (no kernel or root required)
   # ──────────────────────────────────────────────────────────────────────────
   test:
     runs-on: ubuntu-24.04
+    needs: [ lint ]
     steps:
       - uses: actions/checkout@v4
 
@@ -86,7 +103,7 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            /tmp/target
+            /tmp/scx_cognis_build
           key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
 
       - name: cargo test
@@ -119,7 +136,7 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            /tmp/target
+            /tmp/scx_cognis_build
           key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
 
       - name: cargo build --release
@@ -129,7 +146,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: scx_cognis-linux-x86_64
-          path: target/release/scx_cognis
+          path: /tmp/scx_cognis_build/release/scx_cognis
           if-no-files-found: error
 
   # ──────────────────────────────────────────────────────────────────────────
