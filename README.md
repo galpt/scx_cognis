@@ -44,6 +44,8 @@ An intelligent, AI-driven CPU scheduler for Linux.
   - [Command-Line Options](#command-line-options)
   - [Stats Monitoring](#stats-monitoring)
 - [Installation Guide](#installation-guide)
+  - [Using install.sh (Recommended)](#using-installsh-recommended)
+  - [Using uninstall.sh](#using-uninstallsh)
   - [CachyOS](#cachyos)
   - [Arch Linux and Manjaro](#arch-linux-and-manjaro)
   - [Ubuntu and Debian](#ubuntu-and-debian)
@@ -472,6 +474,110 @@ Monitor live statistics from a second terminal while the scheduler runs:
 ---
 
 ## Installation Guide
+
+### Using install.sh (Recommended)
+
+`install.sh` is a self-contained POSIX shell script that handles the full system-wide installation in one command. It requires root.
+
+```bash
+sudo sh install.sh
+```
+
+**What it does — in order:**
+
+| Step | Action |
+|:---|:---|
+| 1 | Detects your CPU architecture (`x86_64` pre-built; other arches require `--build-from-source`) |
+| 2 | Detects your distro (`CachyOS`, `Arch`, `Ubuntu`, `Debian`, or generic) |
+| 3 | Checks that your running kernel has `CONFIG_SCHED_CLASS_EXT=y` (advisory — warns but does not abort) |
+| 4 | **Downloads** the pre-built binary from GitHub Releases into `/usr/bin/scx_cognis` (or **compiles** it locally if `--build-from-source` is given) |
+| 5 | On **Arch / CachyOS**: installs `scx-manager` (which provides `/etc/systemd/system/scx.service` and `/etc/default/scx`); falls back to writing its own service file if `scx-manager` is unavailable |
+| 6 | On **Ubuntu / Debian**: writes `/etc/systemd/system/scx.service` (skipped if a service file is already present) |
+| 7 | Backs up any existing `/etc/default/scx` to `/etc/default/scx.bak`, then writes `SCX_SCHEDULER=scx_cognis` (and any custom `SCX_FLAGS`) |
+| 8 | Runs `systemctl daemon-reload`, enables, and starts `scx.service` |
+
+**Options:**
+
+| Flag | Description |
+|:---|:---|
+| `--version TAG` | Install a specific release tag (e.g. `v0.1.5`); default: `latest` |
+| `--build-from-source` | Compile the binary locally instead of downloading a pre-built archive |
+| `--dry-run` | Print every action that *would* be taken without making any changes |
+| `--force` | Skip all interactive confirmation prompts |
+| `--flags "..."` | Custom scheduler flags written to `SCX_FLAGS` in `/etc/default/scx` (e.g. `--restricted-cpus 2`) |
+
+**Examples:**
+
+```bash
+# Install the latest release (default — asks for confirmation once):
+sudo sh install.sh
+
+# Preview every action without touching the system:
+sudo sh install.sh --dry-run
+
+# Install a specific version with custom flags, no prompts:
+sudo sh install.sh --version v0.1.5 --flags "--restricted-cpus 2" --force
+
+# Build and install from the local source tree:
+sudo sh install.sh --build-from-source
+```
+
+> [!NOTE]
+> After installation the scheduler starts automatically on every boot via `scx.service`. If the user-space daemon ever crashes, the kernel's sched_ext watchdog reverts all tasks to the default scheduler (CFS/EEVDF) within ~50 ms — there is no risk of a kernel panic or system lockup.
+
+[↑ Back to Table of Contents](#table-of-contents)
+
+---
+
+### Using uninstall.sh
+
+`uninstall.sh` cleanly removes everything the installer put in place. It requires root.
+
+```bash
+sudo sh uninstall.sh
+```
+
+**What it does — in order:**
+
+| Step | Action |
+|:---|:---|
+| 1 | Stops and disables `scx.service` via `systemctl` |
+| 2 | Reverts `/etc/default/scx`: restores the `.bak` backup if the installer left one, otherwise surgically removes only the `SCX_SCHEDULER=scx_cognis` and `SCX_FLAGS` lines it owns |
+| 3 | Deletes `/usr/bin/scx_cognis` |
+| 4 | Runs `systemctl daemon-reload` |
+
+The kernel reverts to its default scheduler (CFS/EEVDF) the moment `scx.service` is stopped in step 1.
+
+**Options:**
+
+| Flag | Description |
+|:---|:---|
+| `--dry-run` | Print every action that *would* be taken without making any changes |
+| `--force` | Skip the confirmation prompt |
+| `--purge` | Also remove `/etc/systemd/system/scx.service` — **only** if that file was originally created by this installer (detected by its content); distro-managed service files are left untouched |
+
+**Examples:**
+
+```bash
+# Standard uninstall (asks for confirmation once):
+sudo sh uninstall.sh
+
+# Preview what would be removed without touching the system:
+sudo sh uninstall.sh --dry-run
+
+# Uninstall and also remove the scx service file (if the installer created it):
+sudo sh uninstall.sh --purge
+
+# Fully silent removal:
+sudo sh uninstall.sh --force --purge
+```
+
+> [!NOTE]
+> `--purge` is only needed if you want to completely remove the `scx.service` unit. On Arch/CachyOS where `scx-manager` owns that file, `--purge` will print a warning and leave the file alone to avoid breaking the package manager's state.
+
+[↑ Back to Table of Contents](#table-of-contents)
+
+---
 
 ### CachyOS
 
