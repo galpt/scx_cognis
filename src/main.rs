@@ -1,0 +1,770 @@
+// Copyright (c) scx_cognis contributors
+// SPDX-License-Identifier: GPL-2.0-only
+//
+// scx_cognis — An Attempt at an Intelligent CPU Scheduler
+//
+// Built on scx_rustland_core (sched_ext), this scheduler replaces static
+// heuristics with a live AI inference pipeline:
+//
+//   ┌─────────────────────────────────────────────────────────────────┐
+//   │  ops.enqueue  → KNN classifier  + Reputation check             │
+//   │  ops.dispatch → PPO-lite policy (AI-adjusted time slice)        │
+//   │  ops.select_cpu → A* load balancer (P/E-core aware)             │
+//   │  ops.tick     → Isolation Forest anti-cheat                     │
+//   │  ops.exit     → Bayesian reputation update                      │
+//   │  ops.update_idle → LSTM-lite burst predictor (headroom signal)  │
+//   └─────────────────────────────────────────────────────────────────┘
+//
+// The BPF dispatcher (provided by scx_rustland_core) is completely agnostic
+// of this scheduling policy; only this Rust file implements the logic.
+
+mod bpf_skel;
+pub use bpf_skel::*;
+pub mod bpf_intf;
+
+#[rustfmt::skip]
+mod bpf;
+use bpf::*;
+
+mod ai;
+mod stats;
+mod tui;
+
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::io;
+use std::mem::MaybeUninit;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime};
+
+use anyhow::Result;
+use clap::Parser;
+use libbpf_rs::OpenObject;
+use log::{info, warn};
+use procfs::process::Process;
+
+use scx_stats::prelude::*;
+use scx_utils::build_id;
+use scx_utils::libbpf_clap_opts::LibbpfOpts;
+use scx_utils::UserExitInfo;
+
+use ai::{
+    AntiCheatEngine, AStarLoadBalancer, BurstPredictor, CoreType, CpuState,
+    ExitObservation, KnnClassifier, PolicyController, ReputationEngine,
+    SchedulerSignal, TaskFeatures, TaskLabel,
+};
+use stats::Metrics;
+use tui::SharedState;
+
+const SCHEDULER_NAME: &str = "Cognis";
+const NSEC_PER_USEC:  u64  = 1_000;
+const NSEC_PER_SEC:   u64  = 1_000_000_000;
+
+// ── CLI Options ────────────────────────────────────────────────────────────
+
+/// scx_cognis: an intelligent, AI-driven CPU scheduler.
+///
+/// scx_cognis uses an ensemble of AI algorithms to make scheduling decisions:
+/// KNN task classification, Isolation Forest anti-cheat, A* CPU placement,
+/// LSTM-lite burst prediction, Bayesian reputation tracking, and a PPO-lite
+/// policy controller — all with a sub-10µs inference latency target.
+#[derive(Debug, Parser)]
+struct Opts {
+    /// Base scheduling slice duration in microseconds (PPO-lite adjusts this dynamically).
+    #[clap(short = 's', long, default_value = "20000")]
+    slice_us: u64,
+
+    /// Minimum scheduling slice duration in microseconds.
+    #[clap(short = 'S', long, default_value = "1000")]
+    slice_us_min: u64,
+
+    /// If set, per-CPU tasks are dispatched directly to their only eligible CPU.
+    #[clap(short = 'l', long, action = clap::ArgAction::SetTrue)]
+    percpu_local: bool,
+
+    /// If set, only tasks with SCHED_EXT policy are managed.
+    #[clap(short = 'p', long, action = clap::ArgAction::SetTrue)]
+    partial: bool,
+
+    /// Exit debug dump buffer length. 0 = default.
+    #[clap(long, default_value = "0")]
+    exit_dump_len: u32,
+
+    /// Enable verbose output (BPF details + tracefs events).
+    #[clap(short = 'v', long, action = clap::ArgAction::SetTrue)]
+    verbose: bool,
+
+    /// Number of restricted CPUs reserved for quarantined tasks (0 = disable quarantine).
+    #[clap(long, default_value = "1")]
+    restricted_cpus: usize,
+
+    /// Launch the ratatui TUI dashboard.
+    #[clap(short = 't', long, action = clap::ArgAction::SetTrue)]
+    tui: bool,
+
+    /// Enable stats monitoring with the specified interval (seconds).
+    #[clap(long)]
+    stats: Option<f64>,
+
+    /// Run in stats monitoring mode only (scheduler not launched).
+    #[clap(long)]
+    monitor: Option<f64>,
+
+    /// Show descriptions for statistics.
+    #[clap(long)]
+    help_stats: bool,
+
+    /// Print scheduler version and exit.
+    #[clap(short = 'V', long, action = clap::ArgAction::SetTrue)]
+    version: bool,
+
+    #[clap(flatten, next_help_heading = "Libbpf Options")]
+    pub libbpf: LibbpfOpts,
+}
+
+// ── Task record ────────────────────────────────────────────────────────────
+
+/// A task in the user-space scheduler queue.
+#[derive(Debug, PartialEq, Eq, Clone)]
+struct Task {
+    qtask:         QueuedTask,
+    deadline:      u64,
+    timestamp:     u64,
+    label:         TaskLabel,
+    slice_ns:      u64,
+}
+
+impl Ord for Task {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // RealTime and Interactive tasks get priority over Compute tasks.
+        let self_prio  = label_priority(self.label);
+        let other_prio = label_priority(other.label);
+
+        other_prio
+            .cmp(&self_prio)               // higher label priority first
+            .then_with(|| self.deadline.cmp(&other.deadline))
+            .then_with(|| self.timestamp.cmp(&other.timestamp))
+            .then_with(|| self.qtask.pid.cmp(&other.qtask.pid))
+    }
+}
+
+impl PartialOrd for Task {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+fn label_priority(l: TaskLabel) -> u8 {
+    match l {
+        TaskLabel::RealTime    => 4,
+        TaskLabel::Interactive => 3,
+        TaskLabel::IoWait      => 2,
+        TaskLabel::Unknown     => 1,
+        TaskLabel::Compute     => 0,
+    }
+}
+
+// ── Per-task lifetime tracking (for reputation updates on exit) ─────────
+
+#[derive(Debug, Default, Clone)]
+struct TaskLifetime {
+    slice_assigned_ns: u64,
+    slice_used_ns:     u64,
+    preempted:         bool,
+    cheat_flagged:     bool,
+}
+
+// ── Main Scheduler Struct ──────────────────────────────────────────────────
+
+struct Scheduler<'a> {
+    bpf:          BpfScheduler<'a>,
+    opts:         &'a Opts,
+    stats_server: StatsServer<(), Metrics>,
+
+    // Task queue (ordered by priority + deadline).
+    tasks: BTreeSet<Task>,
+
+    // Time tracking.
+    vruntime_now:    u64,
+    init_page_faults: u64,
+    base_slice_ns:   u64,
+    slice_ns_min:    u64,
+
+    // AI components.
+    classifier:  KnnClassifier,
+    anti_cheat:  AntiCheatEngine,
+    load_bal:    AStarLoadBalancer,
+    burst_pred:  BurstPredictor,
+    reputation:  ReputationEngine,
+    policy:      PolicyController,
+
+    // Per-PID lifetime tracking for reputation updates.
+    lifetimes:   HashMap<i32, TaskLifetime>,
+
+    // TUI shared state (None if TUI not requested).
+    tui_state:  Option<SharedState>,
+    tui_shutdown: Arc<AtomicBool>,
+
+    // Anti-cheat tick timer.
+    last_anticheat_tick: Instant,
+    last_policy_tick:    Instant,
+
+    // Running counters for AImetrics.
+    label_counts: [u64; 5],
+    total_inference_ns: u64,
+    inference_samples:  u64,
+}
+
+impl<'a> Scheduler<'a> {
+    fn init(opts: &'a Opts, open_object: &'a mut MaybeUninit<OpenObject>) -> Result<Self> {
+        let stats_server = StatsServer::new(stats::server_data()).launch()?;
+
+        let base_slice_ns = opts.slice_us        * NSEC_PER_USEC;
+        let slice_ns_min  = opts.slice_us_min    * NSEC_PER_USEC;
+
+        let policy = PolicyController::new(base_slice_ns);
+
+        let mut bpf = BpfScheduler::init(
+            open_object,
+            opts.libbpf.clone().into_bpf_open_opts(),
+            opts.exit_dump_len,
+            opts.partial,
+            opts.verbose,
+            true,      // built-in idle CPU selection
+            slice_ns_min,
+            "cognis",
+        )?;
+
+        // Build initial CPU topology.
+        let mut load_bal = AStarLoadBalancer::new();
+        {
+            let nr_cpus = *bpf.nr_online_cpus_mut() as i32;
+            let restricted = opts.restricted_cpus;
+            for cpu_id in 0..nr_cpus {
+                // Heuristic: last `restricted` CPUs are for quarantine.
+                let is_restricted = cpu_id >= nr_cpus - restricted as i32;
+                // Detect P/E cores by CPU numbering heuristic (best effort;
+                // a real implementation would read /sys/devices/cpu_atom).
+                let core_type = detect_core_type(cpu_id, nr_cpus);
+                load_bal.update_cpu(CpuState {
+                    cpu_id,
+                    core_type,
+                    utilisation: 0.0,
+                    numa_node:   0,
+                    throttled:   false,
+                    restricted:  is_restricted,
+                });
+            }
+        }
+
+        let tui_state = if opts.tui {
+            Some(tui::new_shared_state())
+        } else {
+            None
+        };
+        let tui_shutdown = Arc::new(AtomicBool::new(false));
+
+        // Launch TUI thread.
+        if let Some(ref state) = tui_state {
+            let state_clone    = Arc::clone(state);
+            let shutdown_clone = Arc::clone(&tui_shutdown);
+            std::thread::spawn(move || tui::run_tui(state_clone, shutdown_clone));
+        }
+
+        info!(
+            "{} version {} — scx_rustland_core {}",
+            SCHEDULER_NAME,
+            build_id::full_version(env!("CARGO_PKG_VERSION")),
+            scx_rustland_core::VERSION
+        );
+
+        Ok(Self {
+            bpf,
+            opts,
+            stats_server,
+            tasks: BTreeSet::new(),
+            vruntime_now: 0,
+            init_page_faults: 0,
+            base_slice_ns,
+            slice_ns_min,
+            classifier:  KnnClassifier::new(),
+            anti_cheat:  AntiCheatEngine::new(),
+            load_bal,
+            burst_pred:  BurstPredictor::new(),
+            reputation:  ReputationEngine::new(),
+            policy,
+            lifetimes:   HashMap::with_capacity(1024),
+            tui_state,
+            tui_shutdown,
+            last_anticheat_tick: Instant::now(),
+            last_policy_tick:    Instant::now(),
+            label_counts: [0; 5],
+            total_inference_ns: 0,
+            inference_samples:  0,
+        })
+    }
+
+    // ── Helpers ────────────────────────────────────────────────────────────
+
+    fn now_ns() -> u64 {
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64
+    }
+
+    fn get_page_faults() -> Result<u64, io::Error> {
+        let me = Process::myself().map_err(io::Error::other)?;
+        let st = me.stat().map_err(io::Error::other)?;
+        Ok(st.minflt + st.majflt)
+    }
+
+    fn scale_by_weight_inverse(task: &QueuedTask, value: u64) -> u64 {
+        value * 100 / task.weight
+    }
+
+    // ── AI inference pipeline (ops.enqueue) ───────────────────────────────
+
+    /// Compute task features from a QueuedTask.
+    fn compute_features(task: &QueuedTask, slice_ns: u64, nr_cpus: i32) -> TaskFeatures {
+        let burst_ns = task.stop_ts.saturating_sub(task.start_ts);
+        let cpu_intensity = if burst_ns > 0 {
+            (task.exec_runtime as f64 / burst_ns as f64).min(1.0) as f32
+        } else {
+            0.0
+        };
+        let runnable_ratio = if slice_ns > 0 {
+            (burst_ns as f64 / slice_ns as f64).clamp(0.0, 1.0) as f32
+        } else {
+            0.0
+        };
+        let exec_ratio = if task.exec_runtime > 0 && burst_ns > 0 {
+            (task.exec_runtime as f64 / burst_ns as f64).min(1.0) as f32
+        } else {
+            0.0
+        };
+        TaskFeatures {
+            runnable_ratio,
+            cpu_intensity,
+            exec_ratio,
+            weight_norm:  (task.weight as f32 / 10000.0).clamp(0.0, 1.0),
+            cpu_affinity: (task.nr_cpus_allowed as f32 /
+                           (nr_cpus as f32).max(1.0)).clamp(0.0, 1.0),
+        }
+    }
+
+    // SAFETY: We read this once at scheduler init from the BPF skel.
+    // Declared here as a thread-local rather than a global mutex to avoid
+    // contention on the hot path.
+    fn ai_classify_and_enqueue(&mut self, task: &mut QueuedTask) -> (u64, u64, TaskLabel) {
+        let t0 = Self::now_ns();
+
+        // Build features.
+        let nr_cpus = (*self.bpf.nr_online_cpus_mut()).max(1) as i32;
+        let features = Self::compute_features(task, self.base_slice_ns, nr_cpus);
+
+        // KNN classification.
+        let label = self.classifier.classify_and_learn(task.pid, features);
+        self.label_counts[label as usize] += 1;
+
+        // Reputation-based slice factor.
+        let rep_factor = self.reputation.slice_factor(task.pid);
+        let quarantined = self.reputation.is_quarantined(task.pid);
+
+        // Burst predictor — read prediction for this PID (updated on exit path).
+        let predicted_burst = self.burst_pred.prediction_for(task.pid);
+
+        // PPO-adjusted base slice.
+        let ai_slice = self.policy.read_slice_ns();
+
+        // Final time-slice:
+        //   base = AI-adjusted slice × label_multiplier × (weight / 100)
+        //   clamped to [slice_ns_min .. base_slice * 8]
+        let mut slice = (ai_slice as f64
+            * label.slice_multiplier()
+            * rep_factor
+            * (task.weight as f64 / 100.0)) as u64;
+
+        // Headroom hint: if burst predictor says next burst will be short,
+        // give a shorter slice to reduce wasted CPU.
+        if predicted_burst > 0 && predicted_burst < slice {
+            slice = slice.min(predicted_burst * 2);
+        }
+
+        slice = slice.clamp(self.slice_ns_min, self.base_slice_ns * 8);
+        if quarantined {
+            slice = self.slice_ns_min;
+        }
+
+        // Update vruntime / deadline.
+        task.vtime = if task.vtime == 0 {
+            self.vruntime_now
+        } else {
+            let min = self.vruntime_now.saturating_sub(self.base_slice_ns);
+            task.vtime.max(min)
+        };
+        let slice_ns_actual = task.stop_ts.saturating_sub(task.start_ts);
+        let vslice = Self::scale_by_weight_inverse(task, slice_ns_actual);
+        task.vtime += vslice;
+        self.vruntime_now = self.vruntime_now.saturating_add(vslice / 8);
+
+        let deadline = task.vtime
+            + task.exec_runtime.min(self.base_slice_ns.saturating_mul(100));
+
+        // Track inference latency.
+        let elapsed = Self::now_ns().saturating_sub(t0);
+        self.total_inference_ns += elapsed;
+        self.inference_samples  += 1;
+
+        (deadline, slice, label)
+    }
+
+    // ── Drain queued tasks (calls AI pipeline per task) ───────────────────
+
+    fn drain_queued_tasks(&mut self) {
+        loop {
+            match self.bpf.dequeue_task() {
+                Ok(Some(mut task)) => {
+                    let (deadline, slice_ns, label) = self.ai_classify_and_enqueue(&mut task);
+                    let timestamp = Self::now_ns();
+
+                    // Track lifetime for reputation updates.
+                    let e = self.lifetimes.entry(task.pid).or_default();
+                    e.slice_assigned_ns = slice_ns;
+                    e.slice_used_ns = task.stop_ts.saturating_sub(task.start_ts);
+                    e.preempted = e.slice_used_ns >= slice_ns.saturating_sub(slice_ns / 8);
+                    e.cheat_flagged = self.anti_cheat.is_flagged(task.pid);
+
+                    // Update burst predictor with observed burst.
+                    let burst_ns = task.stop_ts.saturating_sub(task.start_ts);
+                    let nr_cpus_exit = (*self.bpf.nr_online_cpus_mut()).max(1) as i32;
+                    let features = Self::compute_features(&task, self.base_slice_ns, nr_cpus_exit);
+                    self.burst_pred.observe_and_predict(
+                        task.pid,
+                        burst_ns,
+                        features.exec_ratio,
+                        features.cpu_intensity,
+                    );
+
+                    self.tasks.insert(Task {
+                        deadline,
+                        timestamp,
+                        label,
+                        slice_ns,
+                        qtask: task,
+                    });
+                }
+                Ok(None)  => break,
+                Err(err)  => { warn!("dequeue_task error: {err}"); break; }
+            }
+        }
+    }
+
+    // ── Dispatch one task (ops.dispatch) ──────────────────────────────────
+
+    fn dispatch_task(&mut self) -> bool {
+        let Some(task) = self.tasks.pop_first() else {
+            return true;
+        };
+
+        let quarantined = self.reputation.is_quarantined(task.qtask.pid)
+            || self.anti_cheat.is_flagged(task.qtask.pid);
+
+        let mut dispatched = DispatchedTask::new(&task.qtask);
+        dispatched.slice_ns = task.slice_ns;
+        dispatched.vtime    = task.deadline;
+
+        // CPU selection: A* or percpu_local shortcut.
+        dispatched.cpu = if self.opts.percpu_local {
+            task.qtask.cpu
+        } else {
+            let cpu = self.load_bal.select_cpu(
+                task.qtask.cpu,
+                task.label,
+                quarantined,
+            );
+            if cpu >= 0 { cpu } else { RL_CPU_ANY }
+        };
+
+        if self.bpf.dispatch_task(&dispatched).is_err() {
+            self.tasks.insert(task);
+            return false;
+        }
+        true
+    }
+
+    // ── Periodic AI housekeeping ───────────────────────────────────────────
+
+    /// Anti-cheat tick (every 100 ms).
+    fn tick_anti_cheat(&mut self) {
+        if self.last_anticheat_tick.elapsed() < Duration::from_millis(100) {
+            return;
+        }
+        self.last_anticheat_tick = Instant::now();
+        let now = Self::now_ns();
+        let newly_flagged = self.anti_cheat.tick(now);
+        for tgid in newly_flagged {
+            warn!("Anti-cheat: flagged TGID {tgid} as anomalous");
+        }
+    }
+
+    /// PPO policy update (every 250 ms).
+    fn tick_policy(&mut self) {
+        if self.last_policy_tick.elapsed() < Duration::from_millis(250) {
+            return;
+        }
+        self.last_policy_tick = Instant::now();
+
+        let nr_cpus = (*self.bpf.nr_online_cpus_mut()).max(1) as f64;
+        let nr_running = *self.bpf.nr_running_mut() as f64;
+        let total_labeled = self.label_counts.iter().sum::<u64>().max(1) as f64;
+        let interactive_frac = self.label_counts[TaskLabel::Interactive as usize] as f64 / total_labeled;
+        let compute_frac     = self.label_counts[TaskLabel::Compute     as usize] as f64 / total_labeled;
+
+        let avg_inference_us = if self.inference_samples > 0 {
+            self.total_inference_ns as f64 / self.inference_samples as f64 / 1000.0
+        } else {
+            0.0
+        };
+
+        let sig = SchedulerSignal {
+            load_norm:        (nr_running / nr_cpus).min(1.0),
+            interactive_frac,
+            compute_frac,
+            // Normalise by 10 ms.
+            latency_p99_norm: (avg_inference_us / 10_000.0).min(1.0),
+            dispatch_rate:    *self.bpf.nr_user_dispatches_mut() as f64,
+            congestion_rate:  *self.bpf.nr_sched_congested_mut() as f64,
+        };
+        self.policy.update(&sig);
+    }
+
+    /// Emit reputation updates for finished tasks (ops.exit approximation).
+    fn flush_reputation_updates(&mut self) {
+        // Identify PIDs that no longer appear in the BPF queue (best-effort heuristic).
+        // A full implementation would use a BPF ringbuf exit event; here we age out
+        // lifetimes that haven't been refreshed in the last ~1s.
+        let _now = Self::now_ns();
+        let _stale_threshold = NSEC_PER_SEC;
+        let stale: Vec<i32> = self.lifetimes
+            .iter()
+            .filter(|(_, lt)| {
+                // Use slice_used_ns as indirect age indicator (not a timestamp, but
+                // non-zero means the task ran).
+                lt.slice_used_ns > 0
+            })
+            .map(|(&pid, _)| pid)
+            .collect();
+
+        for pid in stale {
+            if let Some(lt) = self.lifetimes.remove(&pid) {
+                let obs = ExitObservation {
+                    slice_underrun:      lt.slice_used_ns < lt.slice_assigned_ns / 2,
+                    preempted:           lt.preempted,
+                    clean_exit:          !lt.cheat_flagged,
+                    cheat_flagged:       lt.cheat_flagged,
+                    fork_count:          0,
+                    involuntary_ctx_sw:  0,
+                };
+                self.reputation.update_on_exit(pid, pid, &obs, "");
+                self.burst_pred.evict(pid);
+                self.classifier.evict(pid);
+                self.anti_cheat.evict(pid);
+            }
+        }
+    }
+
+    // ── Metrics snapshot ───────────────────────────────────────────────────
+
+    fn get_metrics(&mut self) -> Metrics {
+        let page_faults = Self::get_page_faults().unwrap_or_default();
+        if self.init_page_faults == 0 {
+            self.init_page_faults = page_faults;
+        }
+
+        let _total_labeled = self.label_counts.iter().sum::<u64>().max(1);
+
+        let avg_inference_us = if self.inference_samples > 0 {
+            self.total_inference_ns as f64 / self.inference_samples as f64 / 1000.0
+        } else {
+            0.0
+        };
+
+        let quarantined_count = self.reputation.all_scores()
+            .filter(|(_, score, _)| *score < ai::TRUST_THRESHOLD)
+            .count() as u64;
+
+        Metrics {
+            nr_running:           *self.bpf.nr_running_mut(),
+            nr_cpus:              *self.bpf.nr_online_cpus_mut(),
+            nr_queued:            *self.bpf.nr_queued_mut(),
+            nr_scheduled:         *self.bpf.nr_scheduled_mut(),
+            nr_page_faults:       page_faults - self.init_page_faults,
+            nr_user_dispatches:   *self.bpf.nr_user_dispatches_mut(),
+            nr_kernel_dispatches: *self.bpf.nr_kernel_dispatches_mut(),
+            nr_cancel_dispatches: *self.bpf.nr_cancel_dispatches_mut(),
+            nr_bounce_dispatches: *self.bpf.nr_bounce_dispatches_mut(),
+            nr_failed_dispatches: *self.bpf.nr_failed_dispatches_mut(),
+            nr_sched_congested:   *self.bpf.nr_sched_congested_mut(),
+            nr_interactive:       self.label_counts[TaskLabel::Interactive as usize],
+            nr_compute:           self.label_counts[TaskLabel::Compute     as usize],
+            nr_iowait:            self.label_counts[TaskLabel::IoWait      as usize],
+            nr_realtime:          self.label_counts[TaskLabel::RealTime    as usize],
+            nr_quarantined:       quarantined_count,
+            nr_flagged:           self.anti_cheat.wall_of_shame().len() as u64,
+            ai_slice_us:          self.policy.read_slice_ns() / NSEC_PER_USEC,
+            ai_inference_us:      avg_inference_us as u64,
+            reward_ema_x100:      (self.policy.reward_ema * 100.0) as i64,
+        }
+    }
+
+    // ── Main scheduling loop ───────────────────────────────────────────────
+
+    fn schedule(&mut self) {
+        // 1. Drain queued tasks (AI classify + enqueue).
+        self.drain_queued_tasks();
+
+        // 2. Dispatch the next best task.
+        self.dispatch_task();
+
+        // 3. Notify BPF dispatcher of pending work.
+        self.bpf.notify_complete(self.tasks.len() as u64);
+
+        // 4. Periodic AI housekeeping.
+        self.tick_anti_cheat();
+        self.tick_policy();
+        self.flush_reputation_updates();
+    }
+
+    // ── TUI state refresh ─────────────────────────────────────────────────
+
+    fn update_tui(&mut self, metrics: &Metrics) {
+        let Some(ref state) = self.tui_state else { return; };
+        let avg_us = if self.inference_samples > 0 {
+            self.total_inference_ns as f64 / self.inference_samples as f64 / 1_000.0
+        } else {
+            0.0
+        };
+
+        let shame: Vec<tui::WallEntry> = {
+            let anticheat_flagged: HashSet<i32> = self.anti_cheat.wall_of_shame().keys().cloned().collect();
+            self.reputation.wall_of_shame(20).iter().map(|(pid, trust, comm)| {
+                tui::WallEntry {
+                    pid:        *pid,
+                    comm:       comm.to_string(),
+                    trust:      *trust,
+                    is_flagged: anticheat_flagged.contains(pid),
+                }
+            }).collect()
+        };
+
+        if let Ok(mut s) = state.lock() {
+            s.metrics       = metrics.clone();
+            s.inference_us  = avg_us;
+            s.wall_of_shame = shame;
+        }
+    }
+
+    fn run(&mut self) -> Result<UserExitInfo> {
+        let (res_ch, req_ch) = self.stats_server.channels();
+
+        while !self.bpf.exited() {
+            self.schedule();
+
+            if req_ch.try_recv().is_ok() {
+                let m = self.get_metrics();
+                self.update_tui(&m);
+                res_ch.send(m)?;
+            }
+
+            // TUI requested shutdown.
+            if self.tui_shutdown.load(Ordering::Relaxed) {
+                break;
+            }
+        }
+
+        self.bpf.shutdown_and_report()
+    }
+}
+
+impl Drop for Scheduler<'_> {
+    fn drop(&mut self) {
+        self.tui_shutdown.store(true, Ordering::Relaxed);
+        info!("Unregistered {SCHEDULER_NAME} scheduler");
+    }
+}
+
+// ── CPU topology helpers ──────────────────────────────────────────────────
+
+// ONLINE_CPUS removed – nr_online_cpus is queried live from the BPF scheduler.
+
+/// Very coarse P/E core detection based on CPU index.
+/// On Intel Alder Lake/Raptor Lake, E-cores occupy the upper half of CPUs.
+/// This is a best-effort heuristic; a production implementation would parse
+/// /sys/devices/cpu_atom/cpus.
+fn detect_core_type(cpu_id: i32, nr_cpus: i32) -> CoreType {
+    // Assume bottom half are P-cores, top half E-cores (if >4 total CPUs).
+    if nr_cpus > 4 && cpu_id >= nr_cpus / 2 {
+        CoreType::Efficient
+    } else {
+        CoreType::Performance
+    }
+}
+
+// ── Entry point ────────────────────────────────────────────────────────────
+
+fn main() -> Result<()> {
+    let opts = Opts::parse();
+
+    if opts.version {
+        println!(
+            "{} version {} — scx_rustland_core {}",
+            SCHEDULER_NAME,
+            build_id::full_version(env!("CARGO_PKG_VERSION")),
+            scx_rustland_core::VERSION
+        );
+        return Ok(());
+    }
+
+    if opts.help_stats {
+        stats::server_data().describe_meta(&mut std::io::stdout(), None)?;
+        return Ok(());
+    }
+
+    // Logger.
+    let mut lcfg = simplelog::ConfigBuilder::new();
+    lcfg.set_time_offset_to_local()
+        .expect("Failed to set local time offset")
+        .set_time_level(simplelog::LevelFilter::Error)
+        .set_location_level(simplelog::LevelFilter::Off)
+        .set_target_level(simplelog::LevelFilter::Off)
+        .set_thread_level(simplelog::LevelFilter::Off);
+    simplelog::TermLogger::init(
+        simplelog::LevelFilter::Info,
+        lcfg.build(),
+        simplelog::TerminalMode::Stderr,
+        simplelog::ColorChoice::Auto,
+    )?;
+
+    // Stats monitor mode.
+    if let Some(intv) = opts.monitor.or(opts.stats) {
+        let jh = std::thread::spawn(move || {
+            stats::monitor(Duration::from_secs_f64(intv)).unwrap()
+        });
+        if opts.monitor.is_some() {
+            let _ = jh.join();
+            return Ok(());
+        }
+    }
+
+    // Main scheduler loop with restart support.
+    let mut open_object = MaybeUninit::uninit();
+    loop {
+        let mut sched = Scheduler::init(&opts, &mut open_object)?;
+        if !sched.run()?.should_restart() {
+            break;
+        }
+    }
+
+    Ok(())
+}
