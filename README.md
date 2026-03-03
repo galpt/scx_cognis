@@ -24,6 +24,13 @@ An intelligent, AI-driven CPU scheduler for Linux.
     - [Bayesian Reputation Engine](#bayesian-reputation-engine)
     - [PPO-lite Policy Controller](#ppo-lite-policy-controller)
     - [ratatui TUI Dashboard](#ratatui-tui-dashboard)
+- [Design Notes](#design-notes)
+  - [Architecture](#architecture)
+  - [AI Inference Pipeline Details](#ai-inference-pipeline-details)
+  - [Latency Budget](#latency-budget)
+  - [Scheduler Fail-Safe](#scheduler-fail-safe)
+  - [Reward Function](#reward-function)
+  - [Time-Slice Calculation](#time-slice-calculation)
 - [Requirements](#requirements)
   - [Kernel Requirements](#kernel-requirements)
   - [Rust Toolchain](#rust-toolchain)
@@ -41,13 +48,6 @@ An intelligent, AI-driven CPU scheduler for Linux.
   - [Arch Linux and Manjaro](#arch-linux-and-manjaro)
   - [Ubuntu and Debian](#ubuntu-and-debian)
   - [Running as a systemd Service](#running-as-a-systemd-service)
-- [Design Notes](#design-notes)
-  - [Architecture](#architecture)
-  - [AI Inference Pipeline Details](#ai-inference-pipeline-details)
-  - [Latency Budget](#latency-budget)
-  - [Scheduler Fail-Safe](#scheduler-fail-safe)
-  - [Reward Function](#reward-function)
-  - [Time-Slice Calculation](#time-slice-calculation)
 - [Limitations and Next Steps](#limitations-and-next-steps)
 - [Contributing](#contributing)
   - [Running Tests](#running-tests)
@@ -202,6 +202,107 @@ Panels:
 | AI Policy | Current slice, reward EMA, ε value |
 | Latency Sparkline | Rolling 120-sample chart of average per-event inference (µs) |
 | Wall of Shame | Top 10 quarantined or anti-cheat-flagged PIDs |
+
+[↑ Back to Table of Contents](#table-of-contents)
+
+---
+
+## Design Notes
+
+### Architecture
+
+```
+┌───────────────────────────────────────────────────────────────────┐
+│  Linux Kernel  (sched_ext BPF backend — scx_rustland_core)        │
+│                                                                   │
+│  ┌────────────────────────┐   ring buffer   ┌──────────────────┐  │
+│  │ BPF dispatcher         │ ─────────────▶  │  User-space      │  │
+│  │ (scx_rustland_core)    │ ◀─────────────  │  Scheduler       │  │
+│  └────────────────────────┘   user ring     │  (scx_cognis)    │  │
+│                                             └──────────────────┘  │
+└───────────────────────────────────────────────────────────────────┘
+                                     │
+              ┌──────────────────────▼──────────────────────────┐
+              │            AI Inference Pipeline                 │
+              │                                                  │
+              │  dequeue  → KNN classify                         │
+              │           → Bayesian reputation check            │
+              │           → Elman RNN headroom hint              │
+              │  select_cpu → A* topology search                 │
+              │  dispatch → PPO-lite time-slice read             │
+              │  tick     → Isolation Forest anti-cheat          │
+              └──────────────────────────────────────────────────┘
+                                     │
+              ┌──────────────────────▼──────────────────────────┐
+              │              ratatui TUI Dashboard               │
+              │  Arc<Mutex<DashboardState>>  (lock-free reads    │
+              │  on hot path via AtomicU64 slice)                │
+              └──────────────────────────────────────────────────┘
+```
+
+### AI Inference Pipeline Details
+
+The pipeline runs **synchronously on the hot scheduling path** for the per-task steps (KNN, reputation read, burst predictor read, A\*, PPO read). Heavier operations (anti-cheat forest ticks, Q-table updates) run on **periodic timers** off the hot path.
+
+| Step | Hot Path? | Frequency |
+|:---|:---|:---|
+| KNN classify | ✅ Yes | every `ops.enqueue` |
+| Reputation read | ✅ Yes | every `ops.enqueue` |
+| Burst predictor read | ✅ Yes | every `ops.enqueue` |
+| A\* CPU select | ✅ Yes | every `ops.select_cpu` |
+| PPO slice read | ✅ Yes | every `ops.dispatch` (atomic read) |
+| Anti-cheat tick | ❌ No | every 100 ms |
+| Q-table update (PPO) | ❌ No | every 250 ms |
+
+### Latency Budget
+
+| Component | Complexity | Typical cost |
+|:---|:---|:---|
+| KNN classify | O(W·d), W=512, d=5 | ~1–3 µs |
+| Reputation read | O(1) HashMap lookup | < 0.1 µs |
+| Burst predictor | O(H·X) = O(12) matmul | < 0.1 µs |
+| A\* placement | O(n\_cpus) BinaryHeap | ~1 µs |
+| PPO slice read | O(1) atomic read | < 0.05 µs |
+| **Total (typical)** | | **~2–5 µs** |
+
+[↑ Back to Table of Contents](#table-of-contents)
+
+### Scheduler Fail-Safe
+
+If the user-space daemon crashes or stops responding, `scx_rustland_core`'s built-in kernel-side watchdog automatically reverts all tasks to the default kernel scheduler within **~50 ms**, preventing any system lockup. This is a hard guarantee provided by the `sched_ext` framework itself.
+
+[↑ Back to Table of Contents](#table-of-contents)
+
+### Reward Function
+
+The PPO-lite controller optimises the global base time-slice using the following reward signal computed every 250 ms:
+
+$$R = w_1 \cdot \text{Throughput} \;-\; w_2 \cdot \text{Latency} \;-\; w_3 \cdot \text{Congestion}$$
+
+| Weight | Default | Controls |
+|:---|:---|:---|
+| w₁ | 0.4 | Reward for high task throughput |
+| w₂ | 0.4 | Penalty for scheduling latency |
+| w₃ | 0.2 | Penalty for scheduler queue congestion |
+
+The slice action space is: { shrink × 0.80, keep × 1.00, grow × 1.25 }.
+
+[↑ Back to Table of Contents](#table-of-contents)
+
+### Time-Slice Calculation
+
+For each dispatched task, the final slice is:
+
+```
+slice = base_slice_ns
+      × ai_policy_factor        (from PPO-lite AtomicU64)
+      × label_multiplier        (Interactive=1.2, Compute=0.8, IoWait=0.6, RT=1.5)
+      × reputation_factor       (Bayesian trust ∈ [0.5, 1.5])
+      × (weight / 100)          (scheduler priority)
+      clamped to [slice_ns_min, base_slice × 8]
+```
+
+If the Elman RNN predicts a short burst, the slice is further capped to `min(slice, predicted_burst × 2)`.
 
 [↑ Back to Table of Contents](#table-of-contents)
 
@@ -513,107 +614,6 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now scx_cognis
 sudo systemctl status scx_cognis
 ```
-
-[↑ Back to Table of Contents](#table-of-contents)
-
----
-
-## Design Notes
-
-### Architecture
-
-```
-┌───────────────────────────────────────────────────────────────────┐
-│  Linux Kernel  (sched_ext BPF backend — scx_rustland_core)        │
-│                                                                   │
-│  ┌────────────────────────┐   ring buffer   ┌──────────────────┐  │
-│  │ BPF dispatcher         │ ─────────────▶  │  User-space      │  │
-│  │ (scx_rustland_core)    │ ◀─────────────  │  Scheduler       │  │
-│  └────────────────────────┘   user ring     │  (scx_cognis)    │  │
-│                                             └──────────────────┘  │
-└───────────────────────────────────────────────────────────────────┘
-                                     │
-              ┌──────────────────────▼──────────────────────────┐
-              │            AI Inference Pipeline                 │
-              │                                                  │
-              │  dequeue  → KNN classify                         │
-              │           → Bayesian reputation check            │
-              │           → Elman RNN headroom hint              │
-              │  select_cpu → A* topology search                 │
-              │  dispatch → PPO-lite time-slice read             │
-              │  tick     → Isolation Forest anti-cheat          │
-              └──────────────────────────────────────────────────┘
-                                     │
-              ┌──────────────────────▼──────────────────────────┐
-              │              ratatui TUI Dashboard               │
-              │  Arc<Mutex<DashboardState>>  (lock-free reads    │
-              │  on hot path via AtomicU64 slice)                │
-              └──────────────────────────────────────────────────┘
-```
-
-### AI Inference Pipeline Details
-
-The pipeline runs **synchronously on the hot scheduling path** for the per-task steps (KNN, reputation read, burst predictor read, A\*, PPO read). Heavier operations (anti-cheat forest ticks, Q-table updates) run on **periodic timers** off the hot path.
-
-| Step | Hot Path? | Frequency |
-|:---|:---|:---|
-| KNN classify | ✅ Yes | every `ops.enqueue` |
-| Reputation read | ✅ Yes | every `ops.enqueue` |
-| Burst predictor read | ✅ Yes | every `ops.enqueue` |
-| A\* CPU select | ✅ Yes | every `ops.select_cpu` |
-| PPO slice read | ✅ Yes | every `ops.dispatch` (atomic read) |
-| Anti-cheat tick | ❌ No | every 100 ms |
-| Q-table update (PPO) | ❌ No | every 250 ms |
-
-### Latency Budget
-
-| Component | Complexity | Typical cost |
-|:---|:---|:---|
-| KNN classify | O(W·d), W=512, d=5 | ~1–3 µs |
-| Reputation read | O(1) HashMap lookup | < 0.1 µs |
-| Burst predictor | O(H·X) = O(12) matmul | < 0.1 µs |
-| A\* placement | O(n\_cpus) BinaryHeap | ~1 µs |
-| PPO slice read | O(1) atomic read | < 0.05 µs |
-| **Total (typical)** | | **~2–5 µs** |
-
-[↑ Back to Table of Contents](#table-of-contents)
-
-### Scheduler Fail-Safe
-
-If the user-space daemon crashes or stops responding, `scx_rustland_core`'s built-in kernel-side watchdog automatically reverts all tasks to the default kernel scheduler within **~50 ms**, preventing any system lockup. This is a hard guarantee provided by the `sched_ext` framework itself.
-
-[↑ Back to Table of Contents](#table-of-contents)
-
-### Reward Function
-
-The PPO-lite controller optimises the global base time-slice using the following reward signal computed every 250 ms:
-
-$$R = w_1 \cdot \text{Throughput} \;-\; w_2 \cdot \text{Latency} \;-\; w_3 \cdot \text{Congestion}$$
-
-| Weight | Default | Controls |
-|:---|:---|:---|
-| w₁ | 0.4 | Reward for high task throughput |
-| w₂ | 0.4 | Penalty for scheduling latency |
-| w₃ | 0.2 | Penalty for scheduler queue congestion |
-
-The slice action space is: { shrink × 0.80, keep × 1.00, grow × 1.25 }.
-
-[↑ Back to Table of Contents](#table-of-contents)
-
-### Time-Slice Calculation
-
-For each dispatched task, the final slice is:
-
-```
-slice = base_slice_ns
-      × ai_policy_factor        (from PPO-lite AtomicU64)
-      × label_multiplier        (Interactive=1.2, Compute=0.8, IoWait=0.6, RT=1.5)
-      × reputation_factor       (Bayesian trust ∈ [0.5, 1.5])
-      × (weight / 100)          (scheduler priority)
-      clamped to [slice_ns_min, base_slice × 8]
-```
-
-If the Elman RNN predicts a short burst, the slice is further capped to `min(slice, predicted_burst × 2)`.
 
 [↑ Back to Table of Contents](#table-of-contents)
 
