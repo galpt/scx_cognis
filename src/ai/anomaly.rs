@@ -37,10 +37,10 @@ impl ProcessStats {
     /// capped at reasonable maximums to keep the space bounded.
     pub fn to_features(&self) -> [f32; 4] {
         let window_s = (self.window_ns.max(1) as f64) / 1e9;
-        let fork_rate    = ((self.fork_count  as f64) / window_s).min(1000.0) as f32 / 1000.0;
-        let yield_rate   = ((self.yield_count  as f64) / window_s).min(5000.0) as f32 / 5000.0;
-        let cpu_fraction = (self.cpu_time_ns  as f64 / self.window_ns.max(1) as f64).min(1.0) as f32;
-        let switch_rate  = ((self.ctx_switches as f64) / window_s).min(10000.0) as f32 / 10000.0;
+        let fork_rate = ((self.fork_count as f64) / window_s).min(1000.0) as f32 / 1000.0;
+        let yield_rate = ((self.yield_count as f64) / window_s).min(5000.0) as f32 / 5000.0;
+        let cpu_fraction = (self.cpu_time_ns as f64 / self.window_ns.max(1) as f64).min(1.0) as f32;
+        let switch_rate = ((self.ctx_switches as f64) / window_s).min(10000.0) as f32 / 10000.0;
         [fork_rate, yield_rate, cpu_fraction, switch_rate]
     }
 }
@@ -52,10 +52,10 @@ const FEATURE_DIM: usize = 4;
 #[derive(Debug)]
 enum ITreeNode {
     Internal {
-        feature:   usize,
+        feature: usize,
         threshold: f32,
-        left:      Box<ITreeNode>,
-        right:     Box<ITreeNode>,
+        left: Box<ITreeNode>,
+        right: Box<ITreeNode>,
     },
     Leaf {
         size: usize,
@@ -64,10 +64,10 @@ enum ITreeNode {
 
 /// Build one random isolation tree on a sample of data.
 fn build_tree(
-    data:  &[[f32; FEATURE_DIM]],
+    data: &[[f32; FEATURE_DIM]],
     depth: usize,
     max_depth: usize,
-    rng:   &mut SmallRng,
+    rng: &mut SmallRng,
 ) -> ITreeNode {
     if data.len() <= 1 || depth >= max_depth {
         return ITreeNode::Leaf { size: data.len() };
@@ -77,7 +77,10 @@ fn build_tree(
     let feat = rng.gen_range(0..FEATURE_DIM);
 
     let min_val = data.iter().map(|r| r[feat]).fold(f32::INFINITY, f32::min);
-    let max_val = data.iter().map(|r| r[feat]).fold(f32::NEG_INFINITY, f32::max);
+    let max_val = data
+        .iter()
+        .map(|r| r[feat])
+        .fold(f32::NEG_INFINITY, f32::max);
 
     if (max_val - min_val).abs() < 1e-9 {
         return ITreeNode::Leaf { size: data.len() };
@@ -85,13 +88,12 @@ fn build_tree(
 
     let threshold = rng.gen_range(min_val..max_val);
 
-    let (left_data, right_data): (Vec<_>, Vec<_>) =
-        data.iter().partition(|r| r[feat] <= threshold);
+    let (left_data, right_data): (Vec<_>, Vec<_>) = data.iter().partition(|r| r[feat] <= threshold);
 
     ITreeNode::Internal {
         feature: feat,
         threshold,
-        left:  Box::new(build_tree(&left_data,  depth + 1, max_depth, rng)),
+        left: Box::new(build_tree(&left_data, depth + 1, max_depth, rng)),
         right: Box::new(build_tree(&right_data, depth + 1, max_depth, rng)),
     }
 }
@@ -99,12 +101,15 @@ fn build_tree(
 /// Compute path length for a single sample through one tree.
 fn path_length(node: &ITreeNode, sample: &[f32; FEATURE_DIM], depth: usize) -> f32 {
     match node {
-        ITreeNode::Leaf { size } => {
-            depth as f32 + adjustment(*size)
-        }
-        ITreeNode::Internal { feature, threshold, left, right } => {
+        ITreeNode::Leaf { size } => depth as f32 + adjustment(*size),
+        ITreeNode::Internal {
+            feature,
+            threshold,
+            left,
+            right,
+        } => {
             if sample[*feature] <= *threshold {
-                path_length(left,  sample, depth + 1)
+                path_length(left, sample, depth + 1)
             } else {
                 path_length(right, sample, depth + 1)
             }
@@ -123,9 +128,9 @@ fn adjustment(n: usize) -> f32 {
 
 // ── Isolation Forest ────────────────────────────────────────────────────────
 
-const N_TREES:      usize = 32;
-const SAMPLE_SIZE:  usize = 128;
-const MAX_DEPTH:    usize = 8;  // ceil(log2(SAMPLE_SIZE)) ≈ 7
+const N_TREES: usize = 32;
+const SAMPLE_SIZE: usize = 128;
+const MAX_DEPTH: usize = 8; // ceil(log2(SAMPLE_SIZE)) ≈ 7
 
 /// Lightweight Isolation Forest for real-time anomaly detection.
 ///
@@ -134,14 +139,14 @@ const MAX_DEPTH:    usize = 8;  // ceil(log2(SAMPLE_SIZE)) ≈ 7
 pub const ANOMALY_THRESHOLD: f32 = 0.65;
 
 pub struct IsolationForest {
-    trees:   Vec<ITreeNode>,
+    trees: Vec<ITreeNode>,
     n_train: usize,
 }
 
 impl IsolationForest {
     pub fn new() -> Self {
         Self {
-            trees:   Vec::new(),
+            trees: Vec::new(),
             n_train: 0,
         }
     }
@@ -171,7 +176,9 @@ impl IsolationForest {
             return 0.5;
         }
 
-        let avg_path: f32 = self.trees.iter()
+        let avg_path: f32 = self
+            .trees
+            .iter()
             .map(|t| path_length(t, sample, 0))
             .sum::<f32>()
             / self.trees.len() as f32;
@@ -197,29 +204,29 @@ impl IsolationForest {
 
 /// Manages per-TGID statistics and runs anomaly detection via `IsolationForest`.
 pub struct AntiCheatEngine {
-    forest:      IsolationForest,
-    stats:       HashMap<i32, ProcessStats>,
+    forest: IsolationForest,
+    stats: HashMap<i32, ProcessStats>,
     /// TGIDs currently flagged as cheaters.
-    flagged:     HashMap<i32, u64>,
-    tick_count:  u64,
+    flagged: HashMap<i32, u64>,
+    tick_count: u64,
     /// Training data buffer (ring buffer of recent samples).
-    train_buf:   Vec<[f32; FEATURE_DIM]>,
-    train_max:   usize,
-    train_head:  usize,
+    train_buf: Vec<[f32; FEATURE_DIM]>,
+    train_max: usize,
+    train_head: usize,
 }
 
 const TRAIN_BUF_SIZE: usize = 512;
-const RETRAIN_EVERY:  u64  = 500; // ticks
+const RETRAIN_EVERY: u64 = 500; // ticks
 
 impl AntiCheatEngine {
     pub fn new() -> Self {
         Self {
-            forest:     IsolationForest::new(),
-            stats:      HashMap::with_capacity(256),
-            flagged:    HashMap::new(),
+            forest: IsolationForest::new(),
+            stats: HashMap::with_capacity(256),
+            flagged: HashMap::new(),
             tick_count: 0,
-            train_buf:  vec![[0.0; FEATURE_DIM]; TRAIN_BUF_SIZE],
-            train_max:  TRAIN_BUF_SIZE,
+            train_buf: vec![[0.0; FEATURE_DIM]; TRAIN_BUF_SIZE],
+            train_max: TRAIN_BUF_SIZE,
             train_head: 0,
         }
     }
@@ -227,19 +234,19 @@ impl AntiCheatEngine {
     /// Update stats for a TGID.  Called every scheduler tick.
     pub fn update(
         &mut self,
-        tgid:        i32,
-        forks:       u64,
-        yields:      u64,
-        cpu_ns:      u64,
-        ctx_sw:      u64,
-        window_ns:   u64,
+        tgid: i32,
+        forks: u64,
+        yields: u64,
+        cpu_ns: u64,
+        ctx_sw: u64,
+        window_ns: u64,
     ) {
         let entry = self.stats.entry(tgid).or_default();
-        entry.fork_count   = forks;
-        entry.yield_count  = yields;
-        entry.cpu_time_ns  = cpu_ns;
+        entry.fork_count = forks;
+        entry.yield_count = yields;
+        entry.cpu_time_ns = cpu_ns;
         entry.ctx_switches = ctx_sw;
-        entry.window_ns    = window_ns;
+        entry.window_ns = window_ns;
     }
 
     /// Tick — evaluate all tracked TGIDs.  Returns the list of newly-flagged TGIDs.
@@ -248,7 +255,8 @@ impl AntiCheatEngine {
 
         // Collect feature vectors for all known TGIDs.
         let mut new_flags = Vec::new();
-        let stats_snapshot: Vec<(i32, [f32; FEATURE_DIM])> = self.stats
+        let stats_snapshot: Vec<(i32, [f32; FEATURE_DIM])> = self
+            .stats
             .iter()
             .map(|(&tgid, s)| (tgid, s.to_features()))
             .collect();
@@ -318,10 +326,12 @@ mod tests {
     fn anomaly_score_range() {
         let mut forest = IsolationForest::new();
         // Normal samples.
-        let normals: Vec<[f32; 4]> = (0..100).map(|i| {
-            let v = (i as f32) / 100.0 * 0.3;
-            [v, v * 0.5, v * 0.2, v * 0.1]
-        }).collect();
+        let normals: Vec<[f32; 4]> = (0..100)
+            .map(|i| {
+                let v = (i as f32) / 100.0 * 0.3;
+                [v, v * 0.5, v * 0.2, v * 0.1]
+            })
+            .collect();
         forest.fit(&normals);
 
         // Normal sample should have low score.
@@ -330,9 +340,12 @@ mod tests {
         let anomaly_score = forest.score(&[1.0, 0.9, 0.01, 0.8]);
 
         // Anomaly score should be higher than normal score.
-        assert!(anomaly_score > normal_score, "anomaly={anomaly_score} normal={normal_score}");
+        assert!(
+            anomaly_score > normal_score,
+            "anomaly={anomaly_score} normal={normal_score}"
+        );
         // Both should be in (0, 1).
-        assert!(normal_score  > 0.0 && normal_score  < 1.0);
+        assert!(normal_score > 0.0 && normal_score < 1.0);
         assert!(anomaly_score > 0.0 && anomaly_score < 1.0);
     }
 }

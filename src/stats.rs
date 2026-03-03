@@ -93,12 +93,12 @@ impl Metrics {
 
     pub fn delta(&self, rhs: &Self) -> Self {
         Self {
-            nr_user_dispatches:   self.nr_user_dispatches   - rhs.nr_user_dispatches,
+            nr_user_dispatches: self.nr_user_dispatches - rhs.nr_user_dispatches,
             nr_kernel_dispatches: self.nr_kernel_dispatches - rhs.nr_kernel_dispatches,
             nr_cancel_dispatches: self.nr_cancel_dispatches - rhs.nr_cancel_dispatches,
             nr_bounce_dispatches: self.nr_bounce_dispatches - rhs.nr_bounce_dispatches,
             nr_failed_dispatches: self.nr_failed_dispatches - rhs.nr_failed_dispatches,
-            nr_sched_congested:   self.nr_sched_congested   - rhs.nr_sched_congested,
+            nr_sched_congested: self.nr_sched_congested - rhs.nr_sched_congested,
             ..self.clone()
         }
     }

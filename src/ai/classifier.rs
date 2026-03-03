@@ -35,20 +35,20 @@ impl TaskLabel {
     pub fn slice_multiplier(self) -> f64 {
         match self {
             TaskLabel::Interactive => 0.5,
-            TaskLabel::RealTime    => 0.25,
-            TaskLabel::IoWait      => 0.75,
-            TaskLabel::Compute     => 2.0,
-            TaskLabel::Unknown     => 1.0,
+            TaskLabel::RealTime => 0.25,
+            TaskLabel::IoWait => 0.75,
+            TaskLabel::Compute => 2.0,
+            TaskLabel::Unknown => 1.0,
         }
     }
 
     pub fn as_str(self) -> &'static str {
         match self {
             TaskLabel::Interactive => "Interactive",
-            TaskLabel::Compute     => "Compute",
-            TaskLabel::IoWait      => "I/O Wait",
-            TaskLabel::RealTime    => "RealTime",
-            TaskLabel::Unknown     => "Unknown",
+            TaskLabel::Compute => "Compute",
+            TaskLabel::IoWait => "I/O Wait",
+            TaskLabel::RealTime => "RealTime",
+            TaskLabel::Unknown => "Unknown",
         }
     }
 }
@@ -72,10 +72,10 @@ impl TaskFeatures {
     /// Euclidean distance in feature space.
     pub fn distance(&self, other: &TaskFeatures) -> f32 {
         let d0 = self.runnable_ratio - other.runnable_ratio;
-        let d1 = self.cpu_intensity  - other.cpu_intensity;
-        let d2 = self.exec_ratio     - other.exec_ratio;
-        let d3 = self.weight_norm    - other.weight_norm;
-        let d4 = self.cpu_affinity   - other.cpu_affinity;
+        let d1 = self.cpu_intensity - other.cpu_intensity;
+        let d2 = self.exec_ratio - other.exec_ratio;
+        let d3 = self.weight_norm - other.weight_norm;
+        let d4 = self.cpu_affinity - other.cpu_affinity;
         (d0 * d0 + d1 * d1 + d2 * d2 + d3 * d3 + d4 * d4).sqrt()
     }
 }
@@ -84,7 +84,7 @@ impl TaskFeatures {
 #[derive(Debug, Clone, Copy)]
 struct Sample {
     features: TaskFeatures,
-    label:    TaskLabel,
+    label: TaskLabel,
 }
 
 /// Online K-Nearest Neighbours task classifier.
@@ -95,10 +95,10 @@ struct Sample {
 ///
 /// Window replacement strategy: oldest sample is evicted (ring buffer).
 pub struct KnnClassifier {
-    window:    Box<[Option<Sample>]>,
-    head:      usize,
-    capacity:  usize,
-    k:         usize,
+    window: Box<[Option<Sample>]>,
+    head: usize,
+    capacity: usize,
+    k: usize,
     /// Per-PID cached label to avoid re-classifying every enqueue.
     pid_cache: HashMap<i32, TaskLabel>,
 }
@@ -109,10 +109,10 @@ const K_NEIGHBOURS: usize = 5;
 impl KnnClassifier {
     pub fn new() -> Self {
         Self {
-            window:    vec![None; WINDOW_SIZE].into_boxed_slice(),
-            head:      0,
-            capacity:  WINDOW_SIZE,
-            k:         K_NEIGHBOURS,
+            window: vec![None; WINDOW_SIZE].into_boxed_slice(),
+            head: 0,
+            capacity: WINDOW_SIZE,
+            k: K_NEIGHBOURS,
             pid_cache: HashMap::with_capacity(1024),
         }
     }
@@ -165,7 +165,10 @@ impl KnnClassifier {
 
     /// Retrieve a previously computed label for a PID (fast path).
     pub fn cached_label(&self, pid: i32) -> TaskLabel {
-        self.pid_cache.get(&pid).copied().unwrap_or(TaskLabel::Unknown)
+        self.pid_cache
+            .get(&pid)
+            .copied()
+            .unwrap_or(TaskLabel::Unknown)
     }
 
     /// Remove a PID from the cache (called on task exit).
@@ -198,10 +201,10 @@ impl KnnClassifier {
 fn label_to_u8(l: TaskLabel) -> u8 {
     match l {
         TaskLabel::Interactive => 0,
-        TaskLabel::Compute     => 1,
-        TaskLabel::IoWait      => 2,
-        TaskLabel::RealTime    => 3,
-        TaskLabel::Unknown     => 4,
+        TaskLabel::Compute => 1,
+        TaskLabel::IoWait => 2,
+        TaskLabel::RealTime => 3,
+        TaskLabel::Unknown => 4,
     }
 }
 

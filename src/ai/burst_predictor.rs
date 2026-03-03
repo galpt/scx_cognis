@@ -95,7 +95,7 @@ fn tanh(x: f32) -> f32 {
 
 /// Maintains per-PID RNN state and provides next-burst predictions.
 pub struct BurstPredictor {
-    states:   HashMap<i32, RnnState>,
+    states: HashMap<i32, RnnState>,
     /// EWA alpha (how fast the EMA decays).
     ema_alpha: f64,
 }
@@ -103,7 +103,7 @@ pub struct BurstPredictor {
 impl BurstPredictor {
     pub fn new() -> Self {
         Self {
-            states:    HashMap::with_capacity(512),
+            states: HashMap::with_capacity(512),
             ema_alpha: 0.15,
         }
     }
@@ -115,29 +115,41 @@ impl BurstPredictor {
     /// `cpu_intensity`  — CPU usage intensity (0..1).
     pub fn observe_and_predict(
         &mut self,
-        pid:          i32,
-        burst_ns:     u64,
-        exec_ratio:   f32,
+        pid: i32,
+        burst_ns: u64,
+        exec_ratio: f32,
         cpu_intensity: f32,
     ) -> u64 {
         let state = self.states.entry(pid).or_default();
 
         // Build input vector, normalised to [0, 1].
         let burst_norm = (burst_ns as f64 / BURST_MAX_NS).min(1.0) as f32;
-        let x = [burst_norm, exec_ratio.clamp(0.0, 1.0), cpu_intensity.clamp(0.0, 1.0)];
+        let x = [
+            burst_norm,
+            exec_ratio.clamp(0.0, 1.0),
+            cpu_intensity.clamp(0.0, 1.0),
+        ];
 
         // ── Forward pass ──────────────────────────────────────────────────
         // h[t] = tanh( W_h * h[t-1]  +  W_x * x  +  b )
         let mut new_h = [0.0f32; H];
         for i in 0..H {
             let wx: f32 = W_X[i].iter().zip(x.iter()).map(|(w, xi)| w * xi).sum();
-            let wh: f32 = W_H[i].iter().zip(state.h.iter()).map(|(w, hi)| w * hi).sum();
+            let wh: f32 = W_H[i]
+                .iter()
+                .zip(state.h.iter())
+                .map(|(w, hi)| w * hi)
+                .sum();
             new_h[i] = tanh(wx + wh + B[i]);
         }
         state.h = new_h;
 
         // y = W_out · h  +  b_out, clamped to [0, 1].
-        let y_norm: f32 = W_OUT.iter().zip(new_h.iter()).map(|(w, h)| w * h).sum::<f32>()
+        let y_norm: f32 = W_OUT
+            .iter()
+            .zip(new_h.iter())
+            .map(|(w, h)| w * h)
+            .sum::<f32>()
             + B_OUT;
         let y_norm = y_norm.clamp(0.0, 1.0);
 
@@ -145,24 +157,28 @@ impl BurstPredictor {
         let predicted_ns = (y_norm as f64 * BURST_MAX_NS) as u64;
 
         // EMA smoothing to reduce jitter.
-        state.ema_burst_ns  = self.ema_alpha * predicted_ns as f64
-                             + (1.0 - self.ema_alpha) * state.ema_burst_ns;
-        state.ema_actual_ns = self.ema_alpha * burst_ns as f64
-                             + (1.0 - self.ema_alpha) * state.ema_actual_ns;
+        state.ema_burst_ns =
+            self.ema_alpha * predicted_ns as f64 + (1.0 - self.ema_alpha) * state.ema_burst_ns;
+        state.ema_actual_ns =
+            self.ema_alpha * burst_ns as f64 + (1.0 - self.ema_alpha) * state.ema_actual_ns;
 
         state.ema_burst_ns as u64
     }
 
     /// Latest prediction for a PID without updating (uses cached EMA).
     pub fn prediction_for(&self, pid: i32) -> u64 {
-        self.states.get(&pid).map(|s| s.ema_burst_ns as u64).unwrap_or(0)
+        self.states
+            .get(&pid)
+            .map(|s| s.ema_burst_ns as u64)
+            .unwrap_or(0)
     }
 
     /// Prediction error EMA (ns) — useful for the TUI dashboard.
     pub fn error_ema_for(&self, pid: i32) -> f64 {
-        self.states.get(&pid).map(|s| {
-            (s.ema_burst_ns - s.ema_actual_ns).abs()
-        }).unwrap_or(0.0)
+        self.states
+            .get(&pid)
+            .map(|s| (s.ema_burst_ns - s.ema_actual_ns).abs())
+            .unwrap_or(0.0)
     }
 
     /// Evict state for a PID that has exited.

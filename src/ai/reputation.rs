@@ -32,9 +32,9 @@ pub struct TrustPrior {
     /// Pseudocount for cooperative events.
     pub alpha: f64,
     /// Pseudocount for adversarial events.
-    pub beta:  f64,
+    pub beta: f64,
     /// Human-readable name (comm) for display in TUI.
-    pub comm:  String,
+    pub comm: String,
 }
 
 impl TrustPrior {
@@ -42,8 +42,8 @@ impl TrustPrior {
         // Non-informative prior: Beta(1, 1) = Uniform.
         Self {
             alpha: 1.0,
-            beta:  1.0,
-            comm:  comm.to_owned(),
+            beta: 1.0,
+            comm: comm.to_owned(),
         }
     }
 
@@ -110,14 +110,16 @@ pub struct ReputationEngine {
 impl ReputationEngine {
     pub fn new() -> Self {
         Self {
-            priors:    HashMap::with_capacity(1024),
+            priors: HashMap::with_capacity(1024),
             tgid_trust: HashMap::with_capacity(256),
         }
     }
 
     /// Get or create the trust prior for a PID.
     pub fn get_or_create(&mut self, pid: i32, comm: &str) -> &mut TrustPrior {
-        self.priors.entry(pid).or_insert_with(|| TrustPrior::new(comm))
+        self.priors
+            .entry(pid)
+            .or_insert_with(|| TrustPrior::new(comm))
     }
 
     /// Trust score for a PID in (0, 1).  Returns 1.0 (full trust) for unknown PIDs.
@@ -127,7 +129,10 @@ impl ReputationEngine {
 
     /// Conservative lower-bound trust score (used for quarantine decisions).
     pub fn trust_lower_bound(&self, pid: i32) -> f64 {
-        self.priors.get(&pid).map(|p| p.lower_bound()).unwrap_or(1.0)
+        self.priors
+            .get(&pid)
+            .map(|p| p.lower_bound())
+            .unwrap_or(1.0)
     }
 
     /// Whether a PID should currently be quarantined.
@@ -139,7 +144,10 @@ impl ReputationEngine {
     ///
     /// Called from `ops.exit`.
     pub fn update_on_exit(&mut self, pid: i32, tgid: i32, obs: &ExitObservation, comm: &str) {
-        let prior = self.priors.entry(pid).or_insert_with(|| TrustPrior::new(comm));
+        let prior = self
+            .priors
+            .entry(pid)
+            .or_insert_with(|| TrustPrior::new(comm));
 
         // Cooperative signals.
         if obs.slice_underrun {
@@ -191,7 +199,9 @@ impl ReputationEngine {
 
     /// Sorted (ascending trust) list of distrusted PIDs for the TUI wall-of-shame.
     pub fn wall_of_shame(&self, limit: usize) -> Vec<(i32, f64, &str)> {
-        let mut entries: Vec<(i32, f64, &str)> = self.priors.iter()
+        let mut entries: Vec<(i32, f64, &str)> = self
+            .priors
+            .iter()
             .map(|(&pid, p)| (pid, p.mean(), p.comm.as_str()))
             .filter(|(_, score, _)| *score < TRUST_THRESHOLD)
             .collect();
@@ -202,7 +212,9 @@ impl ReputationEngine {
 
     /// All known PIDs and their trust scores (for TUI sparklines).
     pub fn all_scores(&self) -> impl Iterator<Item = (i32, f64, &str)> {
-        self.priors.iter().map(|(&pid, p)| (pid, p.mean(), p.comm.as_str()))
+        self.priors
+            .iter()
+            .map(|(&pid, p)| (pid, p.mean(), p.comm.as_str()))
     }
 }
 
@@ -235,7 +247,7 @@ mod tests {
         let mut eng = ReputationEngine::new();
         let obs = ExitObservation {
             cheat_flagged: true,
-            preempted:     true,
+            preempted: true,
             ..Default::default()
         };
         // Apply multiple adversarial exits to cross the threshold.

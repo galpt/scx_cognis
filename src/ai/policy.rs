@@ -28,8 +28,8 @@ use std::sync::Arc;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Action {
     ShrinkSlice = 0,
-    KeepSlice   = 1,
-    GrowSlice   = 2,
+    KeepSlice = 1,
+    GrowSlice = 2,
 }
 
 const N_ACTIONS: usize = 3;
@@ -70,12 +70,13 @@ struct QTable {
 impl QTable {
     fn new() -> Self {
         Self {
-            data: vec![[0.0; N_ACTIONS]; TABLE_SIZE].try_into()
+            data: vec![[0.0; N_ACTIONS]; TABLE_SIZE]
+                .try_into()
                 .unwrap_or_else(|_| {
                     // Fallback for platforms where const array conversion fails.
                     let boxed = unsafe {
                         let ptr = std::alloc::alloc_zeroed(
-                            std::alloc::Layout::array::<[f64; N_ACTIONS]>(TABLE_SIZE).unwrap()
+                            std::alloc::Layout::array::<[f64; N_ACTIONS]>(TABLE_SIZE).unwrap(),
                         ) as *mut [[f64; N_ACTIONS]; TABLE_SIZE];
                         Box::from_raw(ptr)
                     };
@@ -86,7 +87,8 @@ impl QTable {
 
     fn best_action(&self, state: usize) -> Action {
         let row = &self.data[state];
-        let best_idx = row.iter()
+        let best_idx = row
+            .iter()
             .enumerate()
             .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
             .map(|(i, _)| i)
@@ -98,9 +100,20 @@ impl QTable {
         }
     }
 
-    fn update(&mut self, state: usize, action: Action, reward: f64, next_state: usize, alpha: f64, gamma: f64) {
+    fn update(
+        &mut self,
+        state: usize,
+        action: Action,
+        reward: f64,
+        next_state: usize,
+        alpha: f64,
+        gamma: f64,
+    ) {
         let a = action as usize;
-        let next_max = self.data[next_state].iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let next_max = self.data[next_state]
+            .iter()
+            .cloned()
+            .fold(f64::NEG_INFINITY, f64::max);
         let old = self.data[state][a];
         self.data[state][a] = old + alpha * (reward + gamma * next_max - old);
     }
@@ -112,7 +125,7 @@ pub struct RewardWeights {
     /// How much we care about throughput (dispatch rate).
     pub w_throughput: f64,
     /// How much we penalise scheduling latency.
-    pub w_latency:    f64,
+    pub w_latency: f64,
     /// How much we reward low congestion.
     pub w_congestion: f64,
 }
@@ -121,7 +134,7 @@ impl Default for RewardWeights {
     fn default() -> Self {
         Self {
             w_throughput: 0.4,
-            w_latency:    0.4,
+            w_latency: 0.4,
             w_congestion: 0.2,
         }
     }
@@ -153,24 +166,24 @@ pub struct SchedulerSignal {
 /// Runs in a background thread; updates `shared_slice_ns` which the main
 /// scheduling loop reads atomically.
 pub struct PolicyController {
-    q:               QTable,
-    weights:         RewardWeights,
+    q: QTable,
+    weights: RewardWeights,
     /// ε-greedy exploration rate (decays over time).
-    epsilon:         f64,
+    epsilon: f64,
     /// Learning rate.
-    alpha:           f64,
+    alpha: f64,
     /// Discount factor.
-    gamma:           f64,
+    gamma: f64,
     /// Previous state index.
-    prev_state:      usize,
+    prev_state: usize,
     /// Previous action taken.
-    prev_action:     Action,
+    prev_action: Action,
     /// Target slice value (nanoseconds) — written to shared atomic.
     pub current_slice_ns: u64,
     /// Base slice from user options (fixed reference point).
-    base_slice_ns:   u64,
+    base_slice_ns: u64,
     /// EMA of recent rewards (for TUI display).
-    pub reward_ema:  f64,
+    pub reward_ema: f64,
     /// Shared atomic that the scheduler hot-loop reads.
     pub shared_slice_ns: Arc<AtomicU64>,
 }
@@ -179,17 +192,17 @@ impl PolicyController {
     pub fn new(base_slice_ns: u64) -> Self {
         let shared = Arc::new(AtomicU64::new(base_slice_ns));
         Self {
-            q:                QTable::new(),
-            weights:          RewardWeights::default(),
-            epsilon:          0.15,
-            alpha:            0.01,
-            gamma:            0.95,
-            prev_state:       0,
-            prev_action:      Action::KeepSlice,
+            q: QTable::new(),
+            weights: RewardWeights::default(),
+            epsilon: 0.15,
+            alpha: 0.01,
+            gamma: 0.95,
+            prev_state: 0,
+            prev_action: Action::KeepSlice,
             current_slice_ns: base_slice_ns,
             base_slice_ns,
-            reward_ema:       0.0,
-            shared_slice_ns:  shared,
+            reward_ema: 0.0,
+            shared_slice_ns: shared,
         }
     }
 
@@ -209,7 +222,14 @@ impl PolicyController {
         self.reward_ema = 0.9 * self.reward_ema + 0.1 * reward;
 
         // Q-table update.
-        self.q.update(self.prev_state, self.prev_action, reward, state, self.alpha, self.gamma);
+        self.q.update(
+            self.prev_state,
+            self.prev_action,
+            reward,
+            state,
+            self.alpha,
+            self.gamma,
+        );
 
         // Decay exploration.
         self.epsilon = (self.epsilon * 0.9995).max(0.02);
@@ -218,7 +238,11 @@ impl PolicyController {
         let action = if rand_f64() < self.epsilon {
             // Explore: random action.
             let r = (rand_f64() * N_ACTIONS as f64) as usize;
-            match r { 0 => Action::ShrinkSlice, 2 => Action::GrowSlice, _ => Action::KeepSlice }
+            match r {
+                0 => Action::ShrinkSlice,
+                2 => Action::GrowSlice,
+                _ => Action::KeepSlice,
+            }
         } else {
             self.q.best_action(state)
         };
@@ -227,11 +251,10 @@ impl PolicyController {
         let ratio = ACTION_RATIO[action as usize];
         let min_slice = self.base_slice_ns / 4;
         let max_slice = self.base_slice_ns * 4;
-        let new_slice = ((self.current_slice_ns as f64 * ratio) as u64)
-            .clamp(min_slice, max_slice);
+        let new_slice = ((self.current_slice_ns as f64 * ratio) as u64).clamp(min_slice, max_slice);
 
         self.current_slice_ns = new_slice;
-        self.prev_state  = state;
+        self.prev_state = state;
         self.prev_action = action;
 
         // Publish to shared atomic.
@@ -263,7 +286,9 @@ fn rand_f64() -> f64 {
     use std::sync::atomic::{AtomicU64, Ordering};
     static STATE: AtomicU64 = AtomicU64::new(0xDEAD_BEEF_CAFE_1234);
     let mut s = STATE.load(Ordering::Relaxed);
-    s = s.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+    s = s
+        .wrapping_mul(6_364_136_223_846_793_005)
+        .wrapping_add(1_442_695_040_888_963_407);
     STATE.store(s, Ordering::Relaxed);
     (s >> 11) as f64 / (1u64 << 53) as f64
 }
@@ -276,11 +301,11 @@ mod tests {
     fn slice_stays_in_bounds() {
         let mut ctrl = PolicyController::new(20_000_000); // 20 ms base
         let sig = SchedulerSignal {
-            load_norm:       0.8,
+            load_norm: 0.8,
             interactive_frac: 0.3,
-            compute_frac:    0.5,
+            compute_frac: 0.5,
             latency_p99_norm: 0.6,
-            dispatch_rate:   50_000.0,
+            dispatch_rate: 50_000.0,
             congestion_rate: 100.0,
         };
         for _ in 0..1000 {

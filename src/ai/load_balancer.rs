@@ -15,32 +15,32 @@
 
 #![allow(dead_code)]
 
-use std::collections::{BinaryHeap, HashMap};
 use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap};
 
 use crate::ai::classifier::TaskLabel;
 
 /// Core types present on modern hybrid Intel™ / AMD CPUs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CoreType {
-    Performance,  // Big/P-core
-    Efficient,    // Little/E-core
+    Performance, // Big/P-core
+    Efficient,   // Little/E-core
     Unknown,
 }
 
 /// Snapshot of one CPU's current state.
 #[derive(Debug, Clone)]
 pub struct CpuState {
-    pub cpu_id:       i32,
-    pub core_type:    CoreType,
+    pub cpu_id: i32,
+    pub core_type: CoreType,
     /// Current utilisation 0..1.
-    pub utilisation:  f32,
+    pub utilisation: f32,
     /// NUMA node.
-    pub numa_node:    u32,
+    pub numa_node: u32,
     /// True if this CPU is being throttled by the thermal governor.
-    pub throttled:    bool,
+    pub throttled: bool,
     /// True if this CPU should only accept quarantined tasks.
-    pub restricted:   bool,
+    pub restricted: bool,
 }
 
 /// A node in the A* search graph.
@@ -63,7 +63,8 @@ impl Eq for SearchNode {}
 // Min-heap by f_cost.
 impl Ord for SearchNode {
     fn cmp(&self, other: &Self) -> Ordering {
-        other.f_cost
+        other
+            .f_cost
             .partial_cmp(&self.f_cost)
             .unwrap_or(Ordering::Equal)
     }
@@ -76,19 +77,19 @@ impl PartialOrd for SearchNode {
 
 /// Cost weights — tunable at runtime.
 pub struct CostWeights {
-    pub utilisation:     f32,  // weight on utilisation cost
-    pub numa_distance:   f32,  // penalty per NUMA hop
-    pub core_mismatch:   f32,  // penalty for wrong core type
-    pub thermal:         f32,  // penalty for throttled CPU
+    pub utilisation: f32,   // weight on utilisation cost
+    pub numa_distance: f32, // penalty per NUMA hop
+    pub core_mismatch: f32, // penalty for wrong core type
+    pub thermal: f32,       // penalty for throttled CPU
 }
 
 impl Default for CostWeights {
     fn default() -> Self {
         Self {
-            utilisation:   1.0,
+            utilisation: 1.0,
             numa_distance: 0.3,
             core_mismatch: 0.2,
-            thermal:       0.5,
+            thermal: 0.5,
         }
     }
 }
@@ -96,14 +97,14 @@ impl Default for CostWeights {
 /// The load balancer.
 pub struct AStarLoadBalancer {
     /// Topology: cpu_id → state.
-    pub cpus:    HashMap<i32, CpuState>,
+    pub cpus: HashMap<i32, CpuState>,
     pub weights: CostWeights,
 }
 
 impl AStarLoadBalancer {
     pub fn new() -> Self {
         Self {
-            cpus:    HashMap::new(),
+            cpus: HashMap::new(),
             weights: CostWeights::default(),
         }
     }
@@ -128,12 +129,7 @@ impl AStarLoadBalancer {
     /// * `quarantine` — whether this task is flagged by the anti-cheat engine.
     ///
     /// Returns the selected `cpu_id`, or `RL_CPU_ANY` (-1) as a fallback.
-    pub fn select_cpu(
-        &self,
-        prev_cpu:   i32,
-        label:      TaskLabel,
-        quarantine: bool,
-    ) -> i32 {
+    pub fn select_cpu(&self, prev_cpu: i32, label: TaskLabel, quarantine: bool) -> i32 {
         if self.cpus.is_empty() {
             return -1; // RL_CPU_ANY
         }
@@ -158,10 +154,18 @@ impl AStarLoadBalancer {
 
             let g = self.node_cost(cpu, prev_numa, preferred_type);
             // Heuristic h(n): nudge idle CPUs (utilisation == 0) towards zero cost.
-            let h = if cpu.utilisation < 0.01 { 0.0 } else { cpu.utilisation * 0.1 };
+            let h = if cpu.utilisation < 0.01 {
+                0.0
+            } else {
+                cpu.utilisation * 0.1
+            };
             let f = g + h;
 
-            heap.push(SearchNode { cpu_id: cpu.cpu_id, g_cost: g, f_cost: f });
+            heap.push(SearchNode {
+                cpu_id: cpu.cpu_id,
+                g_cost: g,
+                f_cost: f,
+            });
         }
 
         heap.pop().map(|n| n.cpu_id).unwrap_or(-1)
@@ -171,9 +175,13 @@ impl AStarLoadBalancer {
     fn node_cost(&self, cpu: &CpuState, prev_numa: u32, preferred: CoreType) -> f32 {
         let w = &self.weights;
 
-        let util_cost  = cpu.utilisation * w.utilisation;
-        let numa_cost  = if cpu.numa_node != prev_numa { w.numa_distance } else { 0.0 };
-        let type_cost  = if preferred != CoreType::Unknown && cpu.core_type != preferred {
+        let util_cost = cpu.utilisation * w.utilisation;
+        let numa_cost = if cpu.numa_node != prev_numa {
+            w.numa_distance
+        } else {
+            0.0
+        };
+        let type_cost = if preferred != CoreType::Unknown && cpu.core_type != preferred {
             w.core_mismatch
         } else {
             0.0
@@ -187,9 +195,9 @@ impl AStarLoadBalancer {
 fn preferred_core_type(label: TaskLabel) -> CoreType {
     match label {
         TaskLabel::Interactive | TaskLabel::RealTime => CoreType::Performance,
-        TaskLabel::Compute                           => CoreType::Performance,
-        TaskLabel::IoWait                            => CoreType::Efficient,
-        TaskLabel::Unknown                           => CoreType::Unknown,
+        TaskLabel::Compute => CoreType::Performance,
+        TaskLabel::IoWait => CoreType::Efficient,
+        TaskLabel::Unknown => CoreType::Unknown,
     }
 }
 
@@ -222,8 +230,18 @@ mod tests {
     #[test]
     fn quarantine_only_restricted() {
         let mut lb = AStarLoadBalancer::new();
-        lb.update_cpu(CpuState { cpu_id: 0, restricted: false, utilisation: 0.0, ..make_cpu(0, 0.0, CoreType::Efficient) });
-        lb.update_cpu(CpuState { cpu_id: 1, restricted: true,  utilisation: 0.5, ..make_cpu(1, 0.5, CoreType::Efficient) });
+        lb.update_cpu(CpuState {
+            cpu_id: 0,
+            restricted: false,
+            utilisation: 0.0,
+            ..make_cpu(0, 0.0, CoreType::Efficient)
+        });
+        lb.update_cpu(CpuState {
+            cpu_id: 1,
+            restricted: true,
+            utilisation: 0.5,
+            ..make_cpu(1, 0.5, CoreType::Efficient)
+        });
 
         // Quarantined task must land on cpu 1.
         let best = lb.select_cpu(0, TaskLabel::Compute, true);
