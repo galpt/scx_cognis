@@ -293,7 +293,7 @@ If the user-space daemon crashes or stops responding, `scx_rustland_core`'s buil
 
 The PPO-lite controller optimises the global base time-slice using the following reward signal computed every 250 ms:
 
-$$R = w_1 \cdot \text{Throughput} \;-\; w_2 \cdot \text{Latency} \;-\; w_3 \cdot \text{Congestion}$$
+$$R = w_1 \cdot \text{Throughput} - w_2 \cdot \text{Latency} - w_3 \cdot \text{Congestion}$$
 
 | Weight | Default | Controls |
 |:---|:---|:---|
