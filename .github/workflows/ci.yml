@@ -78,20 +78,22 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      - name: Cache Cargo registry
+      - name: Cache Cargo registry (deps only — no target dir to avoid stale artifacts)
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            /tmp/scx_cognis_build
-          key: ${{ runner.os }}-cargo-lint-${{ hashFiles('**/Cargo.lock', 'src/**/*.rs') }}
-          restore-keys: ${{ runner.os }}-cargo-lint-
+          key: ${{ runner.os }}-cargo-deps-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-deps-
 
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
 
       - name: cargo clippy
+        env:
+          CARGO_INCREMENTAL: "0"
+          CARGO_TARGET_DIR: /tmp/lint-target
         run: cargo clippy --all-targets -- -D warnings
 
   # ──────────────────────────────────────────────────────────────────────────
@@ -121,9 +123,8 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            /tmp/scx_cognis_build
-          key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock', 'src/**/*.rs') }}
-          restore-keys: ${{ runner.os }}-cargo-test-
+            /tmp/target
+          key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
 
       - name: cargo test
         run: cargo test --all -- --nocapture
@@ -155,9 +156,8 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            /tmp/scx_cognis_build
-          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock', 'src/**/*.rs') }}
-          restore-keys: ${{ runner.os }}-cargo-release-
+            /tmp/target
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
 
       - name: cargo build --release
         run: cargo build --release
