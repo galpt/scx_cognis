@@ -45,7 +45,11 @@ jobs:
           MINOR=${PARTS[1]:-1}
           PATCH=${PARTS[2]:-0}
           PATCH=$((PATCH + 1))
+          # base semantic version
           NEW="v$MAJOR.$MINOR.$PATCH"
+          # append UTC timestamp so that every tag is globally unique
+          TIMESTAMP=$(date -u +'%Y%m%d%H%M%S')
+          NEW="${NEW}-$TIMESTAMP"
           echo "new_tag=$NEW" >> $GITHUB_OUTPUT
           echo "New tag: $NEW"
 
