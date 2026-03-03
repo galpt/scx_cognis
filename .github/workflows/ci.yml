@@ -84,8 +84,9 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            /tmp/target
-          key: ${{ runner.os }}-cargo-lint-${{ hashFiles('**/Cargo.lock') }}
+            /tmp/scx_cognis_build
+          key: ${{ runner.os }}-cargo-lint-${{ hashFiles('**/Cargo.lock', 'src/**/*.rs') }}
+          restore-keys: ${{ runner.os }}-cargo-lint-
 
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
@@ -120,8 +121,9 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            /tmp/target
-          key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
+            /tmp/scx_cognis_build
+          key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock', 'src/**/*.rs') }}
+          restore-keys: ${{ runner.os }}-cargo-test-
 
       - name: cargo test
         run: cargo test --all -- --nocapture
@@ -153,8 +155,9 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            /tmp/target
-          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+            /tmp/scx_cognis_build
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock', 'src/**/*.rs') }}
+          restore-keys: ${{ runner.os }}-cargo-release-
 
       - name: cargo build --release
         run: cargo build --release
