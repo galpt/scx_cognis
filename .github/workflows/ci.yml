@@ -70,6 +70,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             clang llvm libclang-dev \
             libbpf-dev libelf-dev zlib1g-dev \
+            libseccomp-dev \
             pkg-config
 
       - name: Install Rust stable
@@ -106,6 +107,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             clang llvm libclang-dev \
             libbpf-dev libelf-dev zlib1g-dev \
+            libseccomp-dev \
             pkg-config
 
       - name: Install Rust stable
@@ -138,6 +140,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             clang llvm libclang-dev \
             libbpf-dev libelf-dev zlib1g-dev \
+            libseccomp-dev \
             pkg-config
 
       - name: Install Rust stable

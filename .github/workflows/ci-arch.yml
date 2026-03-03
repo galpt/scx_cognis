@@ -1,0 +1,44 @@
+name: CI (Arch Linux)
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Compile-check on Arch Linux using the official archlinux/archlinux:latest
+# Docker image.  Runtime (sched_ext) cannot be validated in CI because GitHub
+# Actions runners do not ship a sched_ext-enabled kernel; this job confirms that
+# the codebase compiles cleanly on the Arch toolchain.
+# ──────────────────────────────────────────────────────────────────────────────
+jobs:
+  build-arch:
+    name: Compile check — Arch Linux
+    runs-on: ubuntu-24.04
+    container:
+      image: archlinux/archlinux:latest
+
+    steps:
+      - name: Update system and install build dependencies
+        run: |
+          pacman -Syu --noconfirm
+          pacman -S --noconfirm --needed \
+            git base-devel clang llvm libbpf libelf zlib libseccomp pkg-config curl
+
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: arch-cargo-check-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: arch-cargo-check-
+
+      - name: cargo check
+        run: cargo check --all
