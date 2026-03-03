@@ -235,22 +235,27 @@ impl<'a> Scheduler<'a> {
             "cognis",
         )?;
 
-        // Build initial CPU topology.
+        // Build initial CPU topology from real sysfs data.
         let mut load_bal = AStarLoadBalancer::new();
         {
-            let nr_cpus = *bpf.nr_online_cpus_mut() as i32;
+            let nr_cpus   = *bpf.nr_online_cpus_mut() as i32;
             let restricted = opts.restricted_cpus;
+
+            // Read P/E-core and NUMA assignments once at startup.
+            let core_type_map = build_core_type_map(nr_cpus);
+            let numa_map      = build_numa_map();
+
             for cpu_id in 0..nr_cpus {
-                // Heuristic: last `restricted` CPUs are for quarantine.
+                // The last `restricted_cpus` CPUs are reserved for quarantined tasks.
                 let is_restricted = cpu_id >= nr_cpus - restricted as i32;
-                // Detect P/E cores by CPU numbering heuristic (best effort;
-                // a real implementation would read /sys/devices/cpu_atom).
-                let core_type = detect_core_type(cpu_id, nr_cpus);
+                let core_type     = core_type_map.get(&cpu_id).copied().unwrap_or(CoreType::Performance);
+                let numa_node     = numa_map.get(&cpu_id).copied().unwrap_or(0);
+
                 load_bal.update_cpu(CpuState {
                     cpu_id,
                     core_type,
                     utilisation: 0.0,
-                    numa_node:   0,
+                    numa_node,
                     throttled:   false,
                     restricted:  is_restricted,
                 });
@@ -698,17 +703,90 @@ impl Drop for Scheduler<'_> {
 
 // ONLINE_CPUS removed – nr_online_cpus is queried live from the BPF scheduler.
 
-/// Very coarse P/E core detection based on CPU index.
-/// On Intel Alder Lake/Raptor Lake, E-cores occupy the upper half of CPUs.
-/// This is a best-effort heuristic; a production implementation would parse
-/// /sys/devices/cpu_atom/cpus.
-fn detect_core_type(cpu_id: i32, nr_cpus: i32) -> CoreType {
-    // Assume bottom half are P-cores, top half E-cores (if >4 total CPUs).
-    if nr_cpus > 4 && cpu_id >= nr_cpus / 2 {
-        CoreType::Efficient
-    } else {
-        CoreType::Performance
+// ── Topology helpers (sysfs-based, no heuristics) ─────────────────────────
+
+/// Parse a Linux cpulist string such as "0-3,6,8-11" into a set of CPU IDs.
+fn parse_cpulist(s: &str) -> HashSet<i32> {
+    let mut set = HashSet::new();
+    for part in s.trim().split(',') {
+        let part = part.trim();
+        if let Some((lo, hi)) = part.split_once('-') {
+            if let (Ok(a), Ok(b)) = (lo.trim().parse::<i32>(), hi.trim().parse::<i32>()) {
+                for id in a..=b {
+                    set.insert(id);
+                }
+            }
+        } else if let Ok(id) = part.parse::<i32>() {
+            set.insert(id);
+        }
     }
+    set
+}
+
+/// Read a sysfs cpulist file and return the set of CPU IDs it contains.
+fn read_cpulist_file(path: &str) -> HashSet<i32> {
+    std::fs::read_to_string(path)
+        .map(|s| parse_cpulist(&s))
+        .unwrap_or_default()
+}
+
+/// Build a map from `cpu_id → NUMA node` by reading
+/// `/sys/devices/system/node/nodeN/cpulist` for every node present.
+/// Returns an empty map on single-socket or non-NUMA systems (all CPUs
+/// will default to node 0 in the caller).
+fn build_numa_map() -> HashMap<i32, u32> {
+    let mut map = HashMap::new();
+    let Ok(entries) = std::fs::read_dir("/sys/devices/system/node") else {
+        return map;
+    };
+    for entry in entries.flatten() {
+        let raw = entry.file_name();
+        let name = raw.to_string_lossy();
+        if !name.starts_with("node") {
+            continue;
+        }
+        let node_id: u32 = match name["node".len()..].parse() {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+        let cpulist_path = format!("{}/cpulist", entry.path().display());
+        for cpu_id in read_cpulist_file(&cpulist_path) {
+            map.insert(cpu_id, node_id);
+        }
+    }
+    map
+}
+
+/// Build a map from `cpu_id → CoreType` using the kernel's hybrid-topology
+/// sysfs entries:
+///
+/// - `/sys/devices/cpu_atom/cpus`  — Intel Atom / E-cores (Efficient)
+/// - `/sys/devices/cpu_core/cpus`  — Intel Core / P-cores (Performance)
+///
+/// On AMD, pure-Intel, or VM systems where these entries do not exist the
+/// file reads return empty sets and every CPU is treated as Performance
+/// (homogeneous topology).
+fn build_core_type_map(nr_cpus: i32) -> HashMap<i32, CoreType> {
+    let atom_cpus = read_cpulist_file("/sys/devices/cpu_atom/cpus");
+    let core_cpus = read_cpulist_file("/sys/devices/cpu_core/cpus");
+    let hybrid = !atom_cpus.is_empty() || !core_cpus.is_empty();
+
+    let mut map = HashMap::new();
+    for cpu_id in 0..nr_cpus {
+        let ct = if hybrid {
+            if atom_cpus.contains(&cpu_id) {
+                CoreType::Efficient
+            } else {
+                // Listed in cpu_core set, or not listed in either (treat as P-core).
+                CoreType::Performance
+            }
+        } else {
+            // Non-hybrid topology (AMD, homogeneous Intel, VMs).
+            CoreType::Performance
+        };
+        map.insert(cpu_id, ct);
+    }
+    map
 }
 
 // ── Entry point ────────────────────────────────────────────────────────────
