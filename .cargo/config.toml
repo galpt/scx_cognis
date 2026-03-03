@@ -1,0 +1,8 @@
+# Cargo configuration for scx_cognis
+#
+# The target directory is redirected to /tmp/scx_cognis_build to work around
+# the "Disk D" space in the workspace path, which breaks the vendored
+# libbpf-sys Makefile build.
+
+[build]
+target-dir = "/tmp/scx_cognis_build"

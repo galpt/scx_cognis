@@ -1,0 +1,34 @@
+# Build output
+/target/
+
+# Cargo lock is committed for binary crates (do not add Cargo.lock here)
+
+# BPF / LLVM artefacts that scx_rustland_core's build.rs drops in the project root
+main.bpf.c
+intf.h
+*.o
+*.d
+*.ll
+*.bc
+
+# Build directory override (set in .cargo/config.toml)
+/tmp/
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+
+# Environment / secrets
+.env
+.env.*
+
+# Profiling artefacts
+perf.data
+perf.data.old
+flamegraph.svg

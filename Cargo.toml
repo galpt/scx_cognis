@@ -1,0 +1,38 @@
+[package]
+name = "scx_cognis"
+version = "0.1.0"
+authors = ["scx_cognis contributors"]
+edition = "2021"
+description = "An attempt to make an intelligent CPU scheduler — AI-driven, sched_ext-based, user-space Linux CPU scheduler"
+license = "GPL-2.0-only"
+repository = "https://github.com/galpt/scx_cognis"
+
+[dependencies]
+anyhow      = "1.0"
+clap        = { version = "4.5", features = ["derive", "env", "unicode", "wrap_help"] }
+ctrlc       = { version = "3.1", features = ["termination"] }
+libbpf-rs   = "=0.26.0-beta.1"
+libc        = "0.2"
+log         = "0.4"
+plain       = "0.2"
+procfs      = "0.18"
+rand        = { version = "0.8", features = ["small_rng"] }
+serde       = { version = "1.0", features = ["derive"] }
+simplelog   = "0.12"
+
+# scx ecosystem (published to crates.io)
+scx_stats         = "1.0.22"
+scx_stats_derive  = "1.0.21"
+scx_utils         = "1.0.26"
+scx_rustland_core = "2.4.10"
+
+# TUI
+crossterm = "0.27"
+ratatui   = "0.26"
+
+[build-dependencies]
+scx_cargo         = "1.0.27"
+scx_rustland_core = "2.4.10"
+
+[features]
+enable_backtrace = []
