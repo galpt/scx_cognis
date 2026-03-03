@@ -85,9 +85,13 @@ test result: ok. 13 passed; 0 failed; 0 ignored
 
 | Platform | Kernel | Architecture | Status |
 |:---|:---|:---|:---|
-| CachyOS (latest) | 6.13+ (sched-ext) | x86-64 | ✅ Working |
-| Arch Linux | ≥ 6.12 (sched-ext) | x86-64 | ✅ Working |
-| Ubuntu 24.04+ | ≥ 6.12 (sched-ext) | x86-64 | ✅ Working |
+| Ubuntu 24.04 LTS (CI runner) | 6.8 | x86-64 | [![CI](https://github.com/galpt/scx_cognis/actions/workflows/ci.yml/badge.svg)](https://github.com/galpt/scx_cognis/actions/workflows/ci.yml) |
+| CachyOS (latest) | 6.13+ (sched-ext) | x86-64 | ✅ Verified |
+| Arch Linux | ≥ 6.12 (sched-ext) | x86-64 | ✅ Verified |
+
+> The CI badge reflects the latest `cargo build --release` + `cargo test` (13 unit tests) run on Ubuntu 24.04.
+> Runtime testing requires a `sched_ext`-enabled kernel (CONFIG_SCHED_CLASS_EXT=y) which standard CI runners do not provide.
+> CachyOS and Arch Linux are verified manually on hardware with the `linux-cachyos` / `linux-sched-ext` kernels.
 
 [↑ Back to Table of Contents](#table-of-contents)
 
@@ -141,6 +145,15 @@ Selects the optimal CPU for each task using an A\*-inspired heuristic traversal 
 - Core-type mismatch penalty (Performance vs. Efficiency cores)
 - Thermal throttle penalty
 - Quarantine routing (flagged tasks may only land on restricted CPUs)
+
+CPU topology is read from sysfs at scheduler startup:
+
+| Topology data | Source |
+|:---|:---|
+| Performance / Efficiency core classification | `/sys/devices/cpu_core/cpus`, `/sys/devices/cpu_atom/cpus` (Intel hybrid) |
+| NUMA node per CPU | `/sys/devices/system/node/nodeN/cpulist` |
+
+On non-hybrid CPUs (AMD, homogeneous Intel, VMs) the sysfs entries are absent and all CPUs are treated as Performance-class.
 
 Falls back to `RL_CPU_ANY` (kernel-side placement) when no CPU is a clear winner.
 
@@ -504,13 +517,46 @@ sudo ./target/release/scx_cognis --tui -s 10000
 sudo install -m755 target/release/scx_cognis /usr/local/bin/scx_cognis
 ```
 
-#### Notes for CachyOS users
+#### Step 6 — Register as the system-default scheduler via CachyOS Hello
 
-- If you are already running `scx_lavd`, `scx_bpfland`, or another `sched_ext` scheduler, stop it first — only one sched_ext scheduler can be active at a time:
-  ```bash
-  sudo systemctl stop scx   # stops the currently active scx scheduler
-  ```
-- CachyOS ships `scx-manager` / `scx.service`. You can swap it for `scx_cognis` by editing `/etc/scx-manager/config.toml` and setting the scheduler path, then restarting the service.
+CachyOS ships an `scx` systemd service and a GUI helper called **CachyOS Hello** that makes it easy to switch the active sched_ext scheduler.
+
+**Option A — CachyOS Hello (recommended for new users)**
+
+1. Open **CachyOS Hello** from the application launcher (it auto-starts on first boot and is also in the system menu).
+2. Click the **Tweaks** tab at the top.
+3. Under the **Scheduler** section, find the *sched_ext Scheduler* dropdown.
+4. Select **scx_cognis** from the list (it will appear once the binary is installed system-wide from Step 5).
+5. Click **Apply** — CachyOS Hello will write the choice to `/etc/default/scx`, reload the `scx` daemon, and activate `scx_cognis` immediately.
+
+**Option B — Manual (terminal)**
+
+```bash
+# Edit the scx service configuration:
+sudo nano /etc/default/scx
+
+# Set the scheduler to scx_cognis:
+SCX_SCHEDULER=scx_cognis
+SCX_FLAGS="--restricted-cpus 1"
+
+# Restart the scx service to apply:
+sudo systemctl restart scx
+
+# Verify it is running:
+sudo systemctl status scx
+# The log should show: "scx_cognis: started"
+```
+
+**Stop / switch back to default**
+
+```bash
+# Stop scx_cognis and return to the kernel's default CFS scheduler:
+sudo systemctl stop scx
+
+# Or open CachyOS Hello → Tweaks → Scheduler → select a different scheduler → Apply.
+```
+
+> **Note** Only one sched_ext scheduler can be active at a time. If `scx_lavd`, `scx_bpfland`, or another scheduler is already running via `scx.service`, the step above replaces it automatically.
 
 [↑ Back to Table of Contents](#table-of-contents)
 
@@ -623,8 +669,6 @@ sudo systemctl status scx_cognis
 
 - **Reward signal is estimated** — scheduling latency is derived from inference timestamps rather than a true per-task P99 measurement. A `BPF_MAP_TYPE_RINGBUF` exporting precise per-task exit latencies would improve the PPO reward signal significantly.
 - **Elman RNN vs. true LSTM** — the burst predictor uses a small Elman RNN (H=4) with hardcoded weights for latency reasons. A true LSTM using `burn` or `onnxruntime-rs` would provide better predictions at the cost of higher inference latency.
-- **CPU topology detection is heuristic** — P/E-core detection uses CPU index ordering as an approximation. Reading `/sys/devices/cpu_atom/cpus` or `/sys/devices/cpu_core/cpus` directly would give exact topology information.
-- **NUMA nodes default to 0** — NUMA-node-aware placement is partially implemented in the A\* load balancer (the `numa_node` field is present in `CpuState`), but all nodes are currently initialised to 0. Wiring in `scx_utils::Topology` would enable true multi-socket placement.
 - **Task exit hook is heuristic** — reputation updates are triggered by a lifecycle heuristic (stale lifetime entries) rather than a BPF ringbuf exit event. A dedicated BPF program exporting `task_dead` events would make this precise.
 
 [↑ Back to Table of Contents](#table-of-contents)
