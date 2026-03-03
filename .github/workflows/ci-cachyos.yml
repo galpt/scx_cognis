@@ -25,7 +25,7 @@ jobs:
         run: |
           pacman -Syu --noconfirm
           pacman -S --noconfirm --needed \
-            git base-devel clang llvm libbpf libelf zlib libseccomp pkg-config curl
+            git base-devel clang llvm libbpf libelf libseccomp pkg-config curl
 
       - uses: actions/checkout@v4
 
