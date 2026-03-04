@@ -323,7 +323,11 @@ impl<'a> Scheduler<'a> {
     fn get_page_faults() -> Result<u64, io::Error> {
         let me = Process::myself().map_err(io::Error::other)?;
         let st = me.stat().map_err(io::Error::other)?;
-        Ok(st.minflt + st.majflt)
+        // Only count *major* faults (requires disk I/O — genuine swap pressure).
+        // Minor faults (minflt) are normal anonymous-memory / CoW events and
+        // accumulate constantly during ordinary operation; including them would
+        // produce a permanently non-zero pf counter and a bogus TLDR warning.
+        Ok(st.majflt)
     }
 
     fn scale_by_weight_inverse(task: &QueuedTask, value: u64) -> u64 {

@@ -26,7 +26,7 @@ pub struct Metrics {
     pub nr_queued: u64,
     #[stat(desc = "Tasks waiting in user-space to be dispatched")]
     pub nr_scheduled: u64,
-    #[stat(desc = "User-space scheduler page faults (should be 0)")]
+    #[stat(desc = "Major page faults in the scheduler process (non-zero = swap pressure)")]
     pub nr_page_faults: u64,
     #[stat(desc = "Tasks dispatched by user-space scheduler")]
     pub nr_user_dispatches: u64,
@@ -200,6 +200,11 @@ impl Metrics {
             nr_bounce_dispatches: self.nr_bounce_dispatches - rhs.nr_bounce_dispatches,
             nr_failed_dispatches: self.nr_failed_dispatches - rhs.nr_failed_dispatches,
             nr_sched_congested: self.nr_sched_congested - rhs.nr_sched_congested,
+            // Major page faults — per-interval delta so --monitor shows faults/sec.
+            // (nr_page_faults is already baseline-subtracted in get_metrics(), but
+            // delta() must subtract again so each --monitor line shows only the faults
+            // that occurred during *that* interval, not the lifetime total.)
+            nr_page_faults: self.nr_page_faults - rhs.nr_page_faults,
             // AI classification counters — per-interval deltas so --monitor shows
             // events-per-interval instead of ever-growing cumulative totals.
             nr_interactive: self.nr_interactive - rhs.nr_interactive,

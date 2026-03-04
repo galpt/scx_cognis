@@ -514,7 +514,7 @@ Each line from `--monitor` is a snapshot of one polling interval. All counters l
 | `tldr: ...` | human summary | computed | One-line plain-English summary of current system health. Changes every interval based on load, reward, congestion, and threat level. See the [TLDR message reference](#tldr-message-reference) below. |
 | `r: 5/16` | running / online CPUs | instant | Tasks actively executing right now out of total online CPUs. High ratios (≥ 0.8) mean the system is busy. |
 | `q:1 /0` | queued / scheduled | instant | `queued` = tasks handed by the kernel to userspace and waiting for a dispatch decision; `scheduled` = tasks that have been ordered but not yet sent back to BPF. Under normal load both stay near 0. |
-| `pf:0` | page faults | instant | Page faults inside the userspace scheduler itself (should always be **0**; any non-zero value means the scheduler binary was swapped out, which hurts latency). |
+| `pf:0` | major page faults | per-interval | **Major** page faults (hard faults requiring disk I/O) inside the scheduler process per interval. Non-zero means the scheduler binary itself was partially swapped to disk — this causes real latency spikes and indicates memory pressure. Minor faults (normal anonymous-memory mapping) are intentionally excluded. Should always be **0** on a healthy system. |
 | `d→u:312` | user dispatches | per-interval | Tasks dispatched **by the Cognis userspace scheduler** in this interval. The primary work-done counter. |
 | `k:140` | kernel dispatches | per-interval | Tasks dispatched **by the kernel fallback path** (e.g. idle tasks, kthreads). A high ratio of `k` to `d→u` is normal. |
 | `c:0` | cancel dispatches | per-interval | Dispatches cancelled before execution (task exited or migrated away). Usually 0. |
@@ -551,7 +551,7 @@ Messages are evaluated each interval in **highest-severity-first** order. The fi
 
 | Message | Condition | What to do |
 |:---|:---|:---|
-| `I'm being swapped out! Latency will spike — check available RAM!` | `pf > 0` — scheduler binary was paged out | Free memory; the scheduler process should never be swapped |
+| `I'm being swapped out! Latency will spike — check available RAM!` | `pf > 0` per interval — scheduler had major (hard) page faults this second | Free memory; the scheduler process should never be swapped |
 | `Dispatch failures detected! Something unexpected went wrong — check dmesg.` | `failed_dispatches > 0` | Run `sudo dmesg \| grep sched` and file a bug |
 | `SOS! The system is overwhelmed. Hanging on by a thread here!` | `reward < −0.5` — deep, sustained congestion | Reduce workload or reboot; something is seriously wrong |
 | `Under siege! Multiple rule-breakers caught and caged — enforcing order.` | `flagged > 5` **and** `quarantined > 5` | Normal if running untrusted workloads; cognis is handling it |
