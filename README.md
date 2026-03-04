@@ -167,7 +167,10 @@ The primary classification feature is `cpu_intensity`. `prev_assigned_slice_ns` 
 | 0.10 – 0.85 (any exec_ratio) | Yields regularly — latency-sensitive | **Interactive** |
 | < 0.10 (any exec_ratio) | Released CPU far before slice expired — I/O-blocked | **IoWait** |
 
-The `exec_ratio` guard is critical: `exec_runtime` resets to 0 on every wakeup (`ops.runnable`), so a browser rendering WebGL frames at 120fps gets `exec_ratio ≈ 1.0` even though it consumes 100% of each slice. A true background Compute task (stress-ng, compiler) never sleeps, so `exec_runtime` accumulates for seconds and `exec_ratio → 0` within a few slices. Without this guard, the monitor would show `Interactive:1 Compute:77` for a browser workload — exactly the root cause of the [throughput regression seen during benchmarking](#reference-benchmark-results).
+> [!IMPORTANT]
+> **The `exec_ratio` guard is critical**
+>
+> `exec_runtime` resets to 0 on every wakeup (`ops.runnable`), so a browser rendering WebGL frames at 120fps gets `exec_ratio ≈ 1.0` even though it consumes 100% of each slice. A true background Compute task (stress-ng, compiler) never sleeps, so `exec_runtime` accumulates for seconds and `exec_ratio → 0` within a few slices. Without this guard, the monitor would show `Interactive:1 Compute:77` for a browser workload — exactly the root cause of the [throughput regression seen during benchmarking](#reference-benchmark-results).
 
 A weight-norm threshold (> 0.95) catches `SCHED_FIFO` / `SCHED_RR` tasks regardless of slice usage and labels them **RealTime**.
 
