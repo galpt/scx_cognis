@@ -237,25 +237,28 @@ mod tests {
     #[test]
     fn heuristic_compute() {
         let clf = KnnClassifier::new();
-        let f = feat(0.9, 0.05, 0.8);
+        // cpu_intensity=0.9 (burns full slice), runnable_ratio=0.8 (long run streak),
+        // exec_ratio≈0 (burst << exec_runtime → spinning without sleeping)
+        let f = feat(0.9, 0.8, 0.001);
         assert_eq!(clf.classify(&f), TaskLabel::Compute);
     }
 
     #[test]
     fn heuristic_interactive() {
         let clf = KnnClassifier::new();
-        let f = feat(0.3, 0.4, 0.1);
+        // cpu_intensity=0.3 (used only 30% of slice), exec_ratio=0.95 (just woke from sleep)
+        let f = feat(0.3, 0.02, 0.95);
         assert_eq!(clf.classify(&f), TaskLabel::Interactive);
     }
 
     #[test]
     fn knn_vote_after_warmup() {
         let mut clf = KnnClassifier::new();
-        // Feed compute samples
+        // Feed compute samples using feature values consistent with new semantics.
         for _ in 0..20 {
-            clf.feed(feat(0.85, 0.05, 0.8), TaskLabel::Compute);
+            clf.feed(feat(0.9, 0.8, 0.001), TaskLabel::Compute);
         }
-        let result = clf.classify(&feat(0.82, 0.06, 0.79));
+        let result = clf.classify(&feat(0.88, 0.75, 0.002));
         assert_eq!(result, TaskLabel::Compute);
     }
 }
