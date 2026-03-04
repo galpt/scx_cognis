@@ -345,9 +345,10 @@ If the user-space daemon crashes or stops responding, `scx_rustland_core`'s buil
 
 The Q-learning controller optimises the global base time-slice using the following reward signal computed every 250 ms:
 
-$$R = (\text{interactive\_frac} \times \text{load\_norm}) \times 0.7 - \text{congestion} \times 0.2 - \text{latency} \times 0.1$$
-
-Clamped to **[−1.0, +1.0]**.
+```
+R = (interactive_frac × load_norm) × 0.7 − congestion × 0.2 − latency × 0.1
+    clamped to [−1.0, +1.0]
+```
 
 | Term | Weight | Description |
 |:---|:---|:---|
@@ -568,7 +569,7 @@ Each line from `--monitor` is a snapshot of one polling interval. All counters l
 | `quarantine:0` | quarantined PIDs | instant | PIDs currently throttled by the **Reputation Engine** for consistently burning 100% of their assigned slice (monopolising behaviour). They receive the minimum time-slice until their reputation recovers. |
 | `flagged:0` | flagged TGIDs | instant | Thread-groups detected as outliers by the **Isolation Forest Anti-Cheat Engine** (statistical anomaly in scheduling behaviour). Flagged tasks are isolated to prevent them from starving others. |
 | `slice:4000µs` | policy time-slice | instant | The **Q-learning Policy Controller**'s current base time-slice in microseconds. The controller adjusts this every ~250 ms based on the reward signal — it shrinks when Interactive tasks are well-served and grows when the system is I/O-bound. |
-| `reward:0.42` | reward EMA | instant | Exponential moving average of the scheduler's **reward function**: $R = (\text{interactive\_frac} \times \text{load\_norm}) \times 0.7 - \text{congestion} \times 0.2 - \text{latency} \times 0.1$. Values near **1.0** are ideal (Interactive tasks served under load); near **0** means mostly Compute tasks dominating; negative values indicate sustained high congestion. |
+| `reward:0.42` | reward EMA | instant | Exponential moving average of the scheduler's **reward function**: `R = (interactive_frac × load_norm) × 0.7 − congestion × 0.2 − latency × 0.1`. Values near **1.0** are ideal (Interactive tasks served under load); near **0** means mostly Compute tasks dominating; negative values indicate sustained high congestion. |
 
 #### Classification Label Deep-Dive
 

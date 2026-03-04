@@ -39,7 +39,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Result;
 use clap::Parser;
-use libbpf_rs::{OpenObject, RingBufferBuilder};
+use libbpf_rs::OpenObject;
 use log::{info, warn};
 use procfs::process::Process;
 
@@ -663,39 +663,10 @@ impl<'a> Scheduler<'a> {
         self.policy.update(&sig);
     }
 
-    /// Drain the `task_exits` BPF ring buffer that `ops.disable` writes to.
-    ///
-    /// Returns the list of PIDs that have just left sched_ext. Called at the
-    /// start of every `flush_reputation_updates` tick for precise, same-tick
-    /// exit detection (pattern from scx_layered's `layered_disable` impl).
-    fn drain_task_exits(&mut self) -> Vec<i32> {
-        let mut pids: Vec<i32> = Vec::new();
-        // Borrow the map field only — different struct field from self.lifetimes
-        // etc., so NLL allows the concurrent accesses in the closure below.
-        let map = &self.bpf.skel.maps.task_exits;
-        let mut builder = RingBufferBuilder::new();
-        // `add` requires the callback lifetime to outlive the map reference
-        // ('cb : 'slf).  Both live for the scope of this function, satisfying
-        // the constraint without any unsafe code.
-        let _ = builder.add(map, |data: &[u8]| {
-            if data.len() >= 4 {
-                let pid = i32::from_ne_bytes([data[0], data[1], data[2], data[3]]);
-                pids.push(pid);
-            }
-            0
-        });
-        if let Ok(rb) = builder.build() {
-            let _ = rb.consume();
-        }
-        pids
-    }
-
     /// Emit reputation updates for finished tasks.
     ///
-    /// First drains the `task_exits` BPF ring buffer (populated by ops.disable)
-    /// for precise, same-tick exit notifications learned from the scx_bpfland /
-    /// scx_layered ops.disable pattern. Then falls back to the staleness heuristic
-    /// as a safety net for any PIDs that were not captured by ops.disable.
+    /// Uses a staleness heuristic: any PID not seen for > 2 seconds is
+    /// assumed to have exited. Called once per second.
     fn flush_reputation_updates(&mut self) {
         // Run at most once per second.
         if self.last_reputation_flush.elapsed() < Duration::from_secs(1) {
@@ -703,31 +674,9 @@ impl<'a> Scheduler<'a> {
         }
         self.last_reputation_flush = Instant::now();
 
-        // ── Phase 1: precise exit notifications via ops.disable ring buffer ──
-        // Drain any PIDs the BPF disable hook published since last tick.
-        // This gives exact, sub-millisecond exit detection for every normal
-        // user-space task.
-        let exact_exits = self.drain_task_exits();
-        for pid in exact_exits {
-            if let Some(lt) = self.lifetimes.remove(&pid) {
-                let obs = ExitObservation {
-                    slice_underrun: lt.slice_used_ns < lt.slice_assigned_ns / 2,
-                    preempted: lt.preempted,
-                    clean_exit: !lt.cheat_flagged,
-                    cheat_flagged: lt.cheat_flagged,
-                    fork_count: 0,
-                    involuntary_ctx_sw: 0,
-                };
-                self.reputation.update_on_exit(pid, pid, &obs, "");
-                self.burst_pred.evict(pid);
-                self.anti_cheat.evict(pid);
-            }
-        }
-
-        // ── Phase 2: staleness fallback ──────────────────────────────────────
-        // Safety net for any PIDs that slipped through (e.g. kthreads skipped
-        // by ops.disable, or tasks that exited before the scheduler fully
-        // attached). Tasks not seen for > 2 seconds are assumed departed.
+        // Staleness-based exit detection: any PID not seen for > 2 seconds
+        // is assumed to have exited. This is robust across all kernel versions
+        // and does not require a custom BPF ring buffer map.
         let now = Self::now_ns();
 
         const LIFETIMES_MAX: usize = 8192;
