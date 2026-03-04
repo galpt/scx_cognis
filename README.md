@@ -288,10 +288,10 @@ Panels:
 │                                             └──────────────────┘  │
 └───────────────────────────────────────────────────────────────────┘
                                      │
-              ┌──────────────────────▼──────────────────────────┐
+              ┌──────────────────────▼───────────────────────────┐
               │              Scheduling Pipeline                 │
               │                                                  │
-              │  dequeue  → heuristic classify                    │
+              │  dequeue  → heuristic classify                   │
               │           → Bayesian reputation check            │
               │           → Elman RNN headroom hint              │
               │  select_cpu → A* topology search                 │
@@ -299,7 +299,7 @@ Panels:
               │  tick     → Isolation Forest anti-cheat          │
               └──────────────────────────────────────────────────┘
                                      │
-              ┌──────────────────────▼──────────────────────────┐
+              ┌──────────────────────▼───────────────────────────┐
               │              ratatui TUI Dashboard               │
               │  Arc<Mutex<DashboardState>>  (lock-free reads    │
               │  on hot path via AtomicU64 slice)                │
@@ -584,7 +584,9 @@ The key feature is `cpu_intensity = burst_ns / prev_assigned_slice_ns` (slice-us
 | **Unknown** | 1.0× | reserved; not emitted by the current heuristic |
 
 > [!TIP]
-> **Why does Interactive dominate?** Most desktop, service, and shell tasks yield before consuming their full slice, giving `cpu_intensity` values in the 0.1–0.85 range. Pure CPU workloads (compilers, encoders, stress-ng) consume their entire slice and jump to `cpu_intensity > 0.85` within one or two scheduling events.
+> **Why does Interactive dominate?**
+>
+> Most desktop, service, and shell tasks yield before consuming their full slice, giving `cpu_intensity` values in the 0.1–0.85 range. Pure CPU workloads (compilers, encoders, stress-ng) consume their entire slice and jump to `cpu_intensity > 0.85` within one or two scheduling events.
 
 #### TLDR Message Reference
 
