@@ -1,10 +1,8 @@
 # scx_cognis
 
-A Linux CPU scheduler with adaptive scheduling policy, built on established statistical and machine-learning algorithms.
+"Cognis" (from Latin *cognōscere*) — to learn, to know — is a Linux CPU scheduler with adaptive scheduling policy, built on established statistical and machine-learning algorithms.
 
 `scx_cognis` is a Linux CPU scheduler built on the [`sched_ext`](https://www.kernel.org/doc/html/latest/scheduler/sched-ext.html) framework and [`scx_rustland_core`](https://crates.io/crates/scx_rustland_core). It combines a deterministic task classifier, Bayesian reputation tracking, tabular Q-learning, Isolation Forest anomaly detection, and an Elman RNN burst predictor — all running in user-space Rust with a sub-5 µs per-event inference target.
-
-> "Cognis" (from Latin *cognōscere*) — to learn, to know.
 
 ---
 
@@ -818,7 +816,8 @@ sudo systemctl stop scx
 # Or open CachyOS Hello → Tweaks → Scheduler → select a different scheduler → Apply.
 ```
 
-> **Note** Only one sched_ext scheduler can be active at a time. If `scx_lavd`, `scx_bpfland`, or another scheduler is already running via `scx.service`, the step above replaces it automatically.
+> [!NOTE]
+> Only one sched_ext scheduler can be active at a time. If `scx_lavd`, `scx_bpfland`, or another scheduler is already running via `scx.service`, the step above replaces it automatically.
 
 [↑ Back to Table of Contents](#table-of-contents)
 
