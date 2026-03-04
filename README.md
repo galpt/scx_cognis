@@ -44,6 +44,7 @@ An intelligent, AI-driven CPU scheduler for Linux.
   - [Command-Line Options](#command-line-options)
   - [Stats Monitoring](#stats-monitoring)
   - [How to Read Cognis Statistics](#how-to-read-cognis-statistics)
+    - [TLDR Message Reference](#tldr-message-reference)
 - [Installation Guide](#installation-guide)
   - [Using install.sh (Recommended)](#using-installsh-recommended)
   - [Using uninstall.sh](#using-uninstallsh)
