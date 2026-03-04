@@ -361,6 +361,33 @@ EOF
     log_ok "${SCX_DEFAULTS} updated"
 }
 
+# ─── systemd drop-in: ensure stats socket is world-accessible ────────────────
+# This is needed when scx-manager owns scx.service (CachyOS/Arch) because that
+# unit does not set RuntimeDirectory or UMask.  We write a drop-in override so
+# the socket at /run/scx/root/stats is accessible to non-root users, making
+# `scx_cognis --monitor` work without sudo.
+install_stats_dropin() {
+    _dropin_dir="/etc/systemd/system/${SERVICE_NAME}.service.d"
+    _dropin="${_dropin_dir}/scx_cognis_stats.conf"
+
+    if [ -n "$DRY_RUN" ]; then
+        log_info "(dry-run) Would write stats socket drop-in to ${_dropin}"
+        return
+    fi
+
+    run "mkdir -p '${_dropin_dir}'"
+    cat > "${_dropin}" <<'DROPIN'
+# Drop-in written by scx_cognis installer.
+# Ensures the stats socket at /run/scx/root/stats is world-accessible so that
+# `scx_cognis --monitor` works without root.
+[Service]
+RuntimeDirectory=scx/root
+RuntimeDirectoryMode=0755
+UMask=0111
+DROPIN
+    log_ok "Stats socket drop-in written: ${_dropin}"
+}
+
 # ─── Enable and start the scx service ────────────────────────────────────────
 enable_scx_service() {
     log_info "Reloading systemd and enabling scx.service ..."
@@ -446,6 +473,7 @@ main() {
     esac
 
     configure_scx_defaults
+    install_stats_dropin
     [ "$_service_installed" -eq 1 ] && enable_scx_service
 
     # ── Summary ──────────────────────────────────────────────────────────────
