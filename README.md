@@ -43,6 +43,7 @@ An intelligent, AI-driven CPU scheduler for Linux.
   - [TUI Dashboard](#tui-dashboard)
   - [Command-Line Options](#command-line-options)
   - [Stats Monitoring](#stats-monitoring)
+  - [How to Read Cognis Statistics](#how-to-read-cognis-statistics)
 - [Installation Guide](#installation-guide)
   - [Using install.sh (Recommended)](#using-installsh-recommended)
   - [Using uninstall.sh](#using-uninstallsh)
@@ -475,6 +476,57 @@ scx_cognis --monitor 0.5
 
 > [!NOTE]
 > If the scheduler was started **without** the provided service file (e.g. a manually launched instance), the socket may be root-only. In that case prefix with `sudo`.
+
+[↑ Back to Table of Contents](#table-of-contents)
+
+---
+
+### How to Read Cognis Statistics
+
+Each line from `--monitor` is a snapshot of one polling interval. All counters labelled as **per-interval** show how many events happened since the last sample; all others are instantaneous readings.
+
+#### Full Output Format
+
+```
+[cognis] r: 5/16  q:1 /0   | pf:0 | d→u:312   k:140 c:0  b:0  f:0  | cong:0 | 🧠 Interactive:18  Compute:3  IOwait:2  RT:0  Unknown:1 | quarantine:0 flagged:0 | slice:4000µs reward:0.42
+```
+
+#### Column Reference
+
+| Column | Full Name | Type | Meaning |
+|:---|:---|:---|:---|
+| `r: 5/16` | running / online CPUs | instant | Tasks actively executing right now out of total online CPUs. High ratios (≥ 0.8) mean the system is busy. |
+| `q:1 /0` | queued / scheduled | instant | `queued` = tasks handed by the kernel to userspace and waiting for a dispatch decision; `scheduled` = tasks that have been ordered but not yet sent back to BPF. Under normal load both stay near 0. |
+| `pf:0` | page faults | instant | Page faults inside the userspace scheduler itself (should always be **0**; any non-zero value means the scheduler binary was swapped out, which hurts latency). |
+| `d→u:312` | user dispatches | per-interval | Tasks dispatched **by the Cognis userspace scheduler** in this interval. The primary work-done counter. |
+| `k:140` | kernel dispatches | per-interval | Tasks dispatched **by the kernel fallback path** (e.g. idle tasks, kthreads). A high ratio of `k` to `d→u` is normal. |
+| `c:0` | cancel dispatches | per-interval | Dispatches cancelled before execution (task exited or migrated away). Usually 0. |
+| `b:0` | bounce dispatches | per-interval | Dispatches that had to be redirected to a different DSQ (CPU affinity conflict). Occasional bounces are fine; sustained high values suggest affinity misconfiguration. |
+| `f:0` | failed dispatches | per-interval | Dispatches that errored out entirely. Should always be **0**. |
+| `cong:0` | congestion events | per-interval | Times the scheduler's internal queue was full and had to drop or defer work. Sustained non-zero values indicate scheduler overload. |
+| `Interactive:18` | interactive events | per-interval | Scheduling events classified as **Interactive** (latency-sensitive: games, HID, GUI). Gets a 0.5× time-slice to stay responsive. |
+| `Compute:3` | compute events | per-interval | Events classified as **Compute** (CPU-bound: compilers, encoders). Gets a 2× time-slice for throughput. |
+| `IOwait:2` | I/O-wait events | per-interval | Events classified as **I/O Wait** (blocked on disk/network most of the time). Gets a 0.75× time-slice. |
+| `RT:0` | realtime events | per-interval | Events classified as **RealTime** (JACK, audio daemons, SCHED_FIFO tasks). Gets a 0.25× time-slice for minimum latency. |
+| `Unknown:1` | unclassified events | per-interval | Events where the KNN classifier had insufficient data (< 5 samples in its sliding window — normal during the first few seconds of the scheduler's life). Gets a 1× baseline time-slice. Once the window fills, this drops to 0. |
+| `quarantine:0` | quarantined PIDs | instant | PIDs currently throttled by the **Reputation Engine** for consistently burning 100% of their assigned slice (monopolising behaviour). They receive the minimum time-slice until their reputation recovers. |
+| `flagged:0` | flagged TGIDs | instant | Thread-groups detected as outliers by the **Isolation Forest Anti-Cheat Engine** (statistical anomaly in scheduling behaviour). Flagged tasks are isolated to prevent them from starving others. |
+| `slice:4000µs` | AI time-slice | instant | The **PPO-lite Policy Controller**'s current base time-slice in microseconds. The controller adjusts this every ~100 ms based on the reward signal — it shrinks under interactive load and grows under compute load. |
+| `reward:0.42` | reward EMA | instant | Exponential moving average of the scheduler's **reward function**: $R = w_1 \cdot \text{Throughput} - w_2 \cdot \text{Latency} - w_3 \cdot \text{Congestion}$. Values near **1.0** are ideal; near **0** means the scheduler is under stress; negative values are extremely rare and indicate sustained congestion. |
+
+#### Classification Label Deep-Dive
+
+The KNN classifier uses a **sliding window of 512 labelled samples** and 5 nearest neighbours. During startup (< 5 samples) it falls back to the heuristic rules below. Once warm, it self-labels via majority vote:
+
+| Label | Slice Multiplier | Heuristic Rule (cold start) |
+|:---|:---|:---|
+| **RealTime** | 0.25× | priority weight > 95% of max (SCHED_FIFO / SCHED_RR tasks) |
+| **Interactive** | 0.5× | short exec windows (`exec_ratio < 0.3`) — wakes up often, uses little CPU per burst |
+| **IoWait** | 0.75× | low CPU intensity (< 15%) **and** high runnable wait (> 60%) |
+| **Compute** | 2.0× | high CPU intensity (> 70%) **and** low runnable wait (< 20%) |
+| **Unknown** | 1.0× | none of the above — classifier not yet warmed up |
+
+> **Why does Interactive dominate?** Most desktop, service, and shell tasks have short, frequent scheduling bursts (`exec_ratio < 0.3`), so the heuristic naturally classifies them as Interactive. This is intentional: when in doubt, treat a task as latency-sensitive. The KNN refines this over time as it gathers more data.
 
 [↑ Back to Table of Contents](#table-of-contents)
 

@@ -50,6 +50,8 @@ pub struct Metrics {
     pub nr_iowait: u64,
     #[stat(desc = "Tasks classified as RealTime")]
     pub nr_realtime: u64,
+    #[stat(desc = "Tasks not yet classified (classifier still warming up)")]
+    pub nr_unknown: u64,
     #[stat(desc = "PIDs currently quarantined by reputation engine")]
     pub nr_quarantined: u64,
     #[stat(desc = "TGIDs flagged by anti-cheat isolation forest")]
@@ -67,7 +69,7 @@ impl Metrics {
         writeln!(
             w,
             "[cognis] r:{:>3}/{:<3} q:{:<3}/{:<3} | pf:{:<4} | d→u:{:<6} k:{:<4} c:{:<4} b:{:<4} f:{:<4} | cong:{:<4} | \
-             🧠 Interactive:{:<4} Compute:{:<4} IOwait:{:<4} RT:{:<4} | quarantine:{} flagged:{} | slice:{}µs reward:{:.2}",
+             🧠 Interactive:{:<4} Compute:{:<4} IOwait:{:<4} RT:{:<4} Unknown:{:<4} | quarantine:{} flagged:{} | slice:{}µs reward:{:.2}",
             self.nr_running,
             self.nr_cpus,
             self.nr_queued,
@@ -83,6 +85,7 @@ impl Metrics {
             self.nr_compute,
             self.nr_iowait,
             self.nr_realtime,
+            self.nr_unknown,
             self.nr_quarantined,
             self.nr_flagged,
             self.ai_slice_us,
@@ -93,12 +96,20 @@ impl Metrics {
 
     pub fn delta(&self, rhs: &Self) -> Self {
         Self {
+            // Dispatch counters — per-interval deltas.
             nr_user_dispatches: self.nr_user_dispatches - rhs.nr_user_dispatches,
             nr_kernel_dispatches: self.nr_kernel_dispatches - rhs.nr_kernel_dispatches,
             nr_cancel_dispatches: self.nr_cancel_dispatches - rhs.nr_cancel_dispatches,
             nr_bounce_dispatches: self.nr_bounce_dispatches - rhs.nr_bounce_dispatches,
             nr_failed_dispatches: self.nr_failed_dispatches - rhs.nr_failed_dispatches,
             nr_sched_congested: self.nr_sched_congested - rhs.nr_sched_congested,
+            // AI classification counters — per-interval deltas so --monitor shows
+            // events-per-interval instead of ever-growing cumulative totals.
+            nr_interactive: self.nr_interactive - rhs.nr_interactive,
+            nr_compute: self.nr_compute - rhs.nr_compute,
+            nr_iowait: self.nr_iowait - rhs.nr_iowait,
+            nr_realtime: self.nr_realtime - rhs.nr_realtime,
+            nr_unknown: self.nr_unknown - rhs.nr_unknown,
             ..self.clone()
         }
     }

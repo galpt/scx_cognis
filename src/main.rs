@@ -627,6 +627,7 @@ impl<'a> Scheduler<'a> {
             nr_compute: self.label_counts[TaskLabel::Compute as usize],
             nr_iowait: self.label_counts[TaskLabel::IoWait as usize],
             nr_realtime: self.label_counts[TaskLabel::RealTime as usize],
+            nr_unknown: self.label_counts[TaskLabel::Unknown as usize],
             nr_quarantined: quarantined_count,
             nr_flagged: self.anti_cheat.wall_of_shame().len() as u64,
             ai_slice_us: self.policy.read_slice_ns() / NSEC_PER_USEC,
