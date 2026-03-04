@@ -97,7 +97,7 @@ open_aquarium() {
     say "  • Stutter     — pause or jank = scheduler struggling under load"
     say "  • Tab latency — click Fish Count slider: should respond instantly"
     say ""
-    say "Increase the fish count to 10 000+ for maximum GPU+CPU pressure."
+    say "Use the default 500 fish — it gives realistic load without overwhelming the system."
 }
 
 # ── Print what to watch in the cognis monitor output ─────────────────────────
@@ -143,7 +143,6 @@ run_stress() {
     # ── Phase 1: CPU ──────────────────────────────────────────────────────────
     say "Phase 1/3 — CPU stress (${STRESS_DURATION}s) ..."
     stress-ng --cpu "$STRESS_CPU_WORKERS" \
-              --cpu-ops 0 \
               --metrics-brief \
               --timeout "${STRESS_DURATION}s" \
               --log-brief 2>&1 | grep -E "stress-ng:|bogo|cpu" || true

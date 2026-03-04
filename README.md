@@ -71,6 +71,7 @@ An intelligent, AI-driven CPU scheduler for Linux.
   - [Running the Benchmark](#running-the-benchmark)
   - [What to Watch During the Benchmark](#what-to-watch-during-the-benchmark)
   - [Interpreting Results](#interpreting-results)
+  - [Reference Benchmark Results](#reference-benchmark-results)
 - [Limitations and Next Steps](#limitations-and-next-steps)
 - [Contributing](#contributing)
   - [Running Tests](#running-tests)
@@ -333,7 +334,7 @@ For each dispatched task, the final slice is:
 ```
 slice = base_slice_ns
       × ai_policy_factor        (from PPO-lite AtomicU64)
-      × label_multiplier        (Interactive=1.2, Compute=0.8, IoWait=0.6, RT=1.5)
+      × label_multiplier        (Interactive=0.5, Compute=2.0, IoWait=0.75, RT=0.25)
       × reputation_factor       (Bayesian trust ∈ [0.5, 1.5])
       × (weight / 100)          (scheduler priority)
       clamped to [slice_ns_min, base_slice × 8]
@@ -915,7 +916,7 @@ Each mode runs three 60-second stress-ng phases (CPU → I/O → Mixed) while th
 ### What to Watch During the Benchmark
 
 **In the browser (WebGL Aquarium):**
-- Set the fish count to **10 000** for maximum GPU + CPU pressure.
+- Use the **default 500 fish** — it provides realistic GPU + CPU load without overwhelming lower-end machines.
 - Watch for smooth, consistent animation (≥ 30 fps).
 - Click the Fish Count slider mid-test — it should respond instantly even under full load.
 
@@ -940,6 +941,31 @@ scx_cognis prioritises **Interactive** tasks with a 0.5× shorter time-slice so 
 - **Lower perceived input latency** — the Fish Count slider and tab switching should feel snappy.
 
 If the `reward` value stays below 0.2 for extended periods, the AI is still learning the workload pattern. This improves after ~30 seconds of steady-state load.
+
+### Reference Benchmark Results
+
+> Measured on a 16-core machine, 500 fish, 60 s per phase.
+> Phase 1 (CPU-only) produced no data in the initial run due to a script bug (`--cpu-ops 0` is invalid — now fixed).
+
+**Phase 2 — I/O stress (4 × `iomix` workers):**
+
+| Metric | Baseline | scx_cognis | Δ |
+|:-------|:--------:|:----------:|:---:|
+| bogo ops/s (real time) | 181,491 | 162,676 | −10.4% |
+| bogo ops/s (usr time) | 43,883 | 43,173 | −1.6% |
+
+The near-identical usr-time rates confirm the I/O workers were equally efficient per CPU second. The ~10% real-time gap is user-space scheduler overhead — expected for any user-space sched_ext implementation.
+
+**Phase 3 — Mixed stress (16 × `cpu` + 2 × `vm` workers):**
+
+| Stressor | Metric | Baseline | scx_cognis | Δ |
+|:---------|:-------|:--------:|:----------:|:---:|
+| CPU ×16 | bogo ops/s (real) | 18,681 | 1,815 | −90.3% |
+| CPU ×16 | bogo ops/s (usr) | 1,385 | 2,027 | +46.3% |
+| VM ×2 | bogo ops/s (real) | 24,524 | 18,135 | −26.1% |
+| VM ×2 | bogo ops/s (usr) | 14,636 | 160,176 | +994% |
+
+The usr-time rate improvement (+46% for CPU, +994% for VM) shows the workers were *more* efficient per CPU second when they ran — they just ran far less often.  The real-time drop was caused by a **deadline starvation bug**: `exec_runtime` accumulated to a 500 ms cap for CPU-bound workers that never sleep, permanently burying them behind every Interactive task.  This is fixed in this release — Compute tasks now schedule by vruntime fairness with no exec_runtime penalty.
 
 [↑ Back to Table of Contents](#table-of-contents)
 

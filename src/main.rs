@@ -427,10 +427,17 @@ impl<'a> Scheduler<'a> {
         task.vtime += vslice;
         self.vruntime_now = self.vruntime_now.saturating_add(vslice / 8);
 
-        let deadline = task.vtime
-            + task
-                .exec_runtime
-                .min(self.base_slice_ns.saturating_mul(100));
+        // Compute tasks must not accumulate an exec_runtime deadline penalty.
+        // CPU-bound workers never sleep, so exec_runtime instantly hits the
+        // 100-slice cap (≈500 ms) and buries them behind every Interactive task
+        // that resets its exec_runtime on each sleep.  Schedule Compute tasks
+        // by vruntime fairness alone; all other labels keep the starvation guard.
+        let exec_cap = if matches!(label, TaskLabel::Compute) {
+            0
+        } else {
+            self.base_slice_ns.saturating_mul(100)
+        };
+        let deadline = task.vtime + task.exec_runtime.min(exec_cap);
 
         // Track inference latency.
         let elapsed = Self::now_ns().saturating_sub(t0);
