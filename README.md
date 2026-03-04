@@ -11,6 +11,10 @@ An intelligent, AI-driven CPU scheduler for Linux.
 <a name="table-of-contents"></a>
 ## Table of Contents
 
+- [Benchmarks](#benchmarks)
+  - [Running the Benchmark](#running-the-benchmark)
+  - [What to Watch During the Benchmark](#what-to-watch-during-the-benchmark)
+  - [Interpreting Results](#interpreting-results)
 - [Status](#status)
   - [Test Results](#test-results)
   - [Tested Platforms](#tested-platforms)
@@ -72,6 +76,60 @@ An intelligent, AI-driven CPU scheduler for Linux.
   - [Running Tests](#running-tests)
   - [Adding a New AI Module](#adding-a-new-ai-module)
 - [License](#license)
+
+---
+
+## Benchmarks
+
+The easiest way to experience the difference scx_cognis makes is to run a CPU stress workload while the browser renders a heavy WebGL scene. `cognis_benchmark.sh` automates this for you.
+
+### Running the Benchmark
+
+```bash
+chmod +x cognis_benchmark.sh
+./cognis_benchmark.sh
+```
+
+The script presents two modes:
+
+| Mode | What it does |
+|:----:|:-------------|
+| **1 — Baseline** | Runs the workload with the kernel's default scheduler (CFS/EEVDF). Use this to establish a performance baseline. |
+| **2 — With scx_cognis** | Runs the same workload while scx_cognis is active. Start the scheduler before selecting this mode. |
+
+Each mode runs three 60-second stress-ng phases (CPU → I/O → Mixed) while the [WebGL Aquarium](https://webglsamples.org/aquarium/aquarium.html) is open in your browser.
+
+> [!TIP]
+> Run the script **twice** — once per mode — and compare the Aquarium smoothness and `bogo-ops/s` values between runs.
+
+### What to Watch During the Benchmark
+
+**In the browser (WebGL Aquarium):**
+- Set the fish count to **10 000** for maximum GPU + CPU pressure.
+- Watch for smooth, consistent animation (≥ 30 fps).
+- Click the Fish Count slider mid-test — it should respond instantly even under full load.
+
+**In `scx_cognis --monitor 1.0` (open a second terminal when using Mode 2):**
+
+| Field | What to look for |
+|:------|:-----------------|
+| `tldr:` | Should stay in *"Rest assured"*, *"Busy but responsive"*, or *"Smooth sailing"* |
+| `d→u` vs `k` | User dispatches (`d→u`) should be non-trivial; `k >> d→u` means cognis isn't keeping up |
+| `Interactive` | Should remain the dominant label — browser/compositor tasks stay prioritised |
+| `Compute` | Will rise during the CPU phase — expected and correct |
+| `cong` | Occasional spikes are fine; sustained high values = scheduler under pressure |
+| `slice` | Should shrink during interactive phases and grow during compute phases |
+| `reward` | Aim for ≥ 0.3 throughout; lower values indicate the AI is compensating |
+
+### Interpreting Results
+
+scx_cognis prioritises **Interactive** tasks with a 0.5× shorter time-slice so the browser's compositing thread pre-empts compute-bound stress workers more frequently. You should observe:
+
+- **Smoother Aquarium animation** under load compared to the baseline.
+- **Equal or higher bogo-ops/s** — the scheduler does not throttle compute tasks, it only re-orders them.
+- **Lower perceived input latency** — the Fish Count slider and tab switching should feel snappy.
+
+If the `reward` value stays below 0.2 for extended periods, the AI is still learning the workload pattern. This improves after ~30 seconds of steady-state load.
 
 ---
 
