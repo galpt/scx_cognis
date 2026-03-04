@@ -50,10 +50,10 @@ impl TaskLabel {
     pub fn slice_multiplier(self) -> f64 {
         match self {
             TaskLabel::Interactive => 0.5,
-            TaskLabel::RealTime    => 0.25,
-            TaskLabel::IoWait      => 0.75,
-            TaskLabel::Compute     => 1.0,   // was 2.0 — see comment above
-            TaskLabel::Unknown     => 1.0,
+            TaskLabel::RealTime => 0.25,
+            TaskLabel::IoWait => 0.75,
+            TaskLabel::Compute => 1.0, // was 2.0 — see comment above
+            TaskLabel::Unknown => 1.0,
         }
     }
 
