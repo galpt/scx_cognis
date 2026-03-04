@@ -340,6 +340,17 @@ EOF
 enable_scx_service() {
     log_info "Reloading systemd and enabling scx.service ..."
     run "systemctl daemon-reload"
+
+    # Guard: if the unit is still not visible after daemon-reload (e.g., the
+    # scx-manager package on this distro does not ship an scx.service file),
+    # write our own service file and reload before proceeding.
+    if [ -z "$DRY_RUN" ] && \
+       ! systemctl list-unit-files "${SERVICE_NAME}.service" 2>/dev/null | grep -q "${SERVICE_NAME}"; then
+        log_warn "scx.service unit not found — writing fallback service file ..."
+        install_scx_service_file
+        run "systemctl daemon-reload"
+    fi
+
     run "systemctl enable ${SERVICE_NAME}"
     run "systemctl restart ${SERVICE_NAME}"
     log_ok "scx.service is enabled and running"
