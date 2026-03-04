@@ -472,26 +472,45 @@ impl<'a> Scheduler<'a> {
         }
 
         // Update vruntime / deadline.
+        //
+        // vruntime_now tracks the MAXIMUM observed task vtime — the "virtual
+        // clock front".  This matches the scx_rustland reference pattern:
+        //   1. New tasks (vtime == 0) start exactly at the current front so
+        //      they enter the BTreeSet at the end of the queue, not at the
+        //      very beginning (which would give them spurious burst priority).
+        //   2. Sleeping tasks can reclaim at most one base_slice of credit,
+        //      preventing any preemption cascade when they wake up.
+        //   3. Using max() instead of a leaky ÷8 additive keeps vruntime_now
+        //      aligned with the true task-vtime front regardless of how many
+        //      tasks drain_queued_tasks() processes in a single batch.
         task.vtime = if task.vtime == 0 {
             self.vruntime_now
         } else {
-            let min = self.vruntime_now.saturating_sub(self.base_slice_ns);
-            task.vtime.max(min)
+            // Sleeping tasks gain at most one base_slice of credit.
+            let vruntime_min = self.vruntime_now.saturating_sub(self.base_slice_ns);
+            task.vtime.max(vruntime_min)
         };
         let slice_ns_actual = task.stop_ts.saturating_sub(task.start_ts);
         let vslice = Self::scale_by_weight_inverse(task, slice_ns_actual);
         task.vtime = task.vtime.saturating_add(vslice);
-        self.vruntime_now = self.vruntime_now.saturating_add(vslice / 8);
+        // Advance the virtual clock to the new task vtime front.
+        self.vruntime_now = self.vruntime_now.max(task.vtime);
 
         // Compute tasks must not accumulate an exec_runtime deadline penalty.
-        // CPU-bound workers never sleep, so exec_runtime instantly hits the
-        // 100-slice cap (≈500 ms) and buries them behind every Interactive task
-        // that resets its exec_runtime on each sleep.  Schedule Compute tasks
-        // by vruntime fairness alone; all other labels keep the starvation guard.
+        // CPU-bound workers never sleep, so exec_runtime would instantly hit
+        // the cap and bury them behind every Interactive task.
+        // Schedule Compute tasks by vruntime fairness alone.
+        //
+        // For all other labels, cap at 100 × slice_ns_min (≈ 100 ms at
+        // default --slice-us-min 1000).  The old cap of 100 × base_slice_ns
+        // (≈ 2000 ms) meant any non-Compute task that didn't sleep frequently
+        // accumulated a 2-second deadline penalty and was treated as Compute
+        // regardless of its label — breaking interactivity under 100% CPU
+        // load.  The tighter 100 ms cap matches scx_rustland's behaviour.
         let exec_cap = if matches!(label, TaskLabel::Compute) {
             0
         } else {
-            self.base_slice_ns.saturating_mul(100)
+            self.slice_ns_min.saturating_mul(100)
         };
         let deadline = task.vtime.saturating_add(task.exec_runtime.min(exec_cap));
 
@@ -656,17 +675,23 @@ impl<'a> Scheduler<'a> {
 
         // Hard cap: if the lifetimes map grows beyond 8192 entries (e.g., from
         // a heavy benchmark with many short-lived browser sub-processes), evict
-        // the oldest entries first so the per-second flush stays O(1) bounded.
+        // stale entries.  Use HashMap::retain() in cascading time-window passes
+        // (each O(N)) rather than sorting the full map (O(N log N)).  We stop
+        // as soon as the map fits within the cap.
         const LIFETIMES_MAX: usize = 8192;
         if self.lifetimes.len() > LIFETIMES_MAX {
-            let mut entries: Vec<(i32, u64)> = self
-                .lifetimes
-                .iter()
-                .map(|(&pid, lt)| (pid, lt.last_seen_ns))
-                .collect();
-            entries.sort_unstable_by_key(|(_, ts)| *ts);
-            for (pid, _) in entries.iter().take(self.lifetimes.len() - LIFETIMES_MAX) {
-                self.lifetimes.remove(pid);
+            // Pass 1: keep entries seen within the last 10 s.
+            let cutoff = now.saturating_sub(10 * NSEC_PER_SEC);
+            self.lifetimes.retain(|_, lt| lt.last_seen_ns >= cutoff);
+            // Pass 2: tighten to 5 s if still over cap.
+            if self.lifetimes.len() > LIFETIMES_MAX {
+                let cutoff = now.saturating_sub(5 * NSEC_PER_SEC);
+                self.lifetimes.retain(|_, lt| lt.last_seen_ns >= cutoff);
+            }
+            // Pass 3: final tighten to 2 s (aligns with the stale-eviction window).
+            if self.lifetimes.len() > LIFETIMES_MAX {
+                let cutoff = now.saturating_sub(2 * NSEC_PER_SEC);
+                self.lifetimes.retain(|_, lt| lt.last_seen_ns >= cutoff);
             }
         }
 
@@ -723,7 +748,7 @@ impl<'a> Scheduler<'a> {
             nr_cpus: *self.bpf.nr_online_cpus_mut(),
             nr_queued: *self.bpf.nr_queued_mut(),
             nr_scheduled: *self.bpf.nr_scheduled_mut(),
-            nr_page_faults: page_faults - self.init_page_faults,
+            nr_page_faults: page_faults.saturating_sub(self.init_page_faults),
             nr_user_dispatches: *self.bpf.nr_user_dispatches_mut(),
             nr_kernel_dispatches: *self.bpf.nr_kernel_dispatches_mut(),
             nr_cancel_dispatches: *self.bpf.nr_cancel_dispatches_mut(),
@@ -771,8 +796,18 @@ impl<'a> Scheduler<'a> {
 
         // 3. Notify BPF dispatcher of remaining pending work.
         self.bpf.notify_complete(self.tasks.len() as u64);
+    }
 
-        // 4. Periodic AI housekeeping.
+    // ── Background AI housekeeping ─────────────────────────────────────────────
+    //
+    // Kept OFF the schedule() critical path.  schedule() is called in a
+    // tight BPF dispatch loop; any stall there risks the sched_ext watchdog
+    // (which fires if ops.dispatch is not called for several seconds).
+    //
+    // All three inner functions carry their own rate-limit timers, so
+    // calling housekeeping() every ~50 ms from run() is safe: each will
+    // no-op immediately if its own timer has not elapsed.
+    fn housekeeping(&mut self) {
         self.tick_anti_cheat();
         self.tick_policy();
         self.flush_reputation_updates();
@@ -814,10 +849,15 @@ impl<'a> Scheduler<'a> {
 
     fn run(&mut self) -> Result<UserExitInfo> {
         let (res_ch, req_ch) = self.stats_server.channels();
+        let mut last_housekeeping = Instant::now();
 
         while !self.bpf.exited() {
+            // Core dispatch: classify tasks, fill BPF dispatch ring, notify.
+            // Must never stall — sched_ext watchdog fires if too slow.
             self.schedule();
 
+            // Stats: non-blocking try_recv so a disconnected client can't
+            // block or crash the scheduler.
             if !self.stats_channel_failed && req_ch.try_recv().is_ok() {
                 let m = self.get_metrics();
                 self.update_tui(&m);
@@ -827,6 +867,16 @@ impl<'a> Scheduler<'a> {
                     );
                     self.stats_channel_failed = true;
                 }
+            }
+
+            // Background AI housekeeping (anti-cheat, policy, reputation).
+            // Runs outside schedule() so the BPF dispatch path is never
+            // delayed by periodic work.  50 ms outer gate plus each
+            // function's inner timer ensures at most one unit of work
+            // executes between two consecutive schedule() calls.
+            if last_housekeeping.elapsed() >= Duration::from_millis(50) {
+                last_housekeeping = Instant::now();
+                self.housekeeping();
             }
 
             // TUI requested shutdown.
