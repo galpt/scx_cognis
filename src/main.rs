@@ -226,6 +226,9 @@ struct Scheduler<'a> {
     /// Rate-limiter for [`flush_reputation_updates`]: only runs once per second
     /// and only evicts PIDs that have not been seen for ≥ 2 s.
     last_reputation_flush: Instant,
+    /// True once stats response channel fails (e.g. broken pipe). Scheduling
+    /// must continue regardless of stats client lifecycle.
+    stats_channel_failed: bool,
 
     // Running counters for AImetrics.
     label_counts: [u64; 5],
@@ -325,6 +328,7 @@ impl<'a> Scheduler<'a> {
             last_anticheat_tick: Instant::now(),
             last_policy_tick: Instant::now(),
             last_reputation_flush: Instant::now(),
+            stats_channel_failed: false,
             label_counts: [0; 5],
             total_inference_ns: 0,
             inference_samples: 0,
@@ -336,7 +340,7 @@ impl<'a> Scheduler<'a> {
     fn now_ns() -> u64 {
         SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_nanos() as u64
     }
 
@@ -351,7 +355,8 @@ impl<'a> Scheduler<'a> {
     }
 
     fn scale_by_weight_inverse(task: &QueuedTask, value: u64) -> u64 {
-        value * 100 / task.weight
+        let weight = task.weight.max(1);
+        value.saturating_mul(100) / weight
     }
 
     // ── AI inference pipeline (ops.enqueue) ───────────────────────────────
@@ -797,10 +802,15 @@ impl<'a> Scheduler<'a> {
         while !self.bpf.exited() {
             self.schedule();
 
-            if req_ch.try_recv().is_ok() {
+            if !self.stats_channel_failed && req_ch.try_recv().is_ok() {
                 let m = self.get_metrics();
                 self.update_tui(&m);
-                res_ch.send(m)?;
+                if let Err(err) = res_ch.send(m) {
+                    warn!(
+                        "Stats response channel failed ({err}); continuing scheduler without stats responses"
+                    );
+                    self.stats_channel_failed = true;
+                }
             }
 
             // TUI requested shutdown.
@@ -932,9 +942,10 @@ fn main() -> Result<()> {
 
     // Logger.
     let mut lcfg = simplelog::ConfigBuilder::new();
-    lcfg.set_time_offset_to_local()
-        .expect("Failed to set local time offset")
-        .set_time_level(simplelog::LevelFilter::Error)
+    if lcfg.set_time_offset_to_local().is_err() {
+        eprintln!("[WARN] Failed to set local time offset");
+    }
+    lcfg.set_time_level(simplelog::LevelFilter::Error)
         .set_location_level(simplelog::LevelFilter::Off)
         .set_target_level(simplelog::LevelFilter::Off)
         .set_thread_level(simplelog::LevelFilter::Off);
@@ -947,7 +958,11 @@ fn main() -> Result<()> {
 
     // Stats monitor mode.
     if let Some(intv) = opts.monitor.or(opts.stats) {
-        let jh = std::thread::spawn(move || stats::monitor(Duration::from_secs_f64(intv)).unwrap());
+        let jh = std::thread::spawn(move || {
+            if let Err(err) = stats::monitor(Duration::from_secs_f64(intv)) {
+                eprintln!("[WARN] stats monitor exited: {err}");
+            }
+        });
         if opts.monitor.is_some() {
             let _ = jh.join();
             return Ok(());

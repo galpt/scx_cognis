@@ -194,24 +194,36 @@ impl Metrics {
     pub fn delta(&self, rhs: &Self) -> Self {
         Self {
             // Dispatch counters — per-interval deltas.
-            nr_user_dispatches: self.nr_user_dispatches - rhs.nr_user_dispatches,
-            nr_kernel_dispatches: self.nr_kernel_dispatches - rhs.nr_kernel_dispatches,
-            nr_cancel_dispatches: self.nr_cancel_dispatches - rhs.nr_cancel_dispatches,
-            nr_bounce_dispatches: self.nr_bounce_dispatches - rhs.nr_bounce_dispatches,
-            nr_failed_dispatches: self.nr_failed_dispatches - rhs.nr_failed_dispatches,
-            nr_sched_congested: self.nr_sched_congested - rhs.nr_sched_congested,
+            nr_user_dispatches: self
+                .nr_user_dispatches
+                .saturating_sub(rhs.nr_user_dispatches),
+            nr_kernel_dispatches: self
+                .nr_kernel_dispatches
+                .saturating_sub(rhs.nr_kernel_dispatches),
+            nr_cancel_dispatches: self
+                .nr_cancel_dispatches
+                .saturating_sub(rhs.nr_cancel_dispatches),
+            nr_bounce_dispatches: self
+                .nr_bounce_dispatches
+                .saturating_sub(rhs.nr_bounce_dispatches),
+            nr_failed_dispatches: self
+                .nr_failed_dispatches
+                .saturating_sub(rhs.nr_failed_dispatches),
+            nr_sched_congested: self
+                .nr_sched_congested
+                .saturating_sub(rhs.nr_sched_congested),
             // Major page faults — per-interval delta so --monitor shows faults/sec.
             // (nr_page_faults is already baseline-subtracted in get_metrics(), but
             // delta() must subtract again so each --monitor line shows only the faults
             // that occurred during *that* interval, not the lifetime total.)
-            nr_page_faults: self.nr_page_faults - rhs.nr_page_faults,
+            nr_page_faults: self.nr_page_faults.saturating_sub(rhs.nr_page_faults),
             // AI classification counters — per-interval deltas so --monitor shows
             // events-per-interval instead of ever-growing cumulative totals.
-            nr_interactive: self.nr_interactive - rhs.nr_interactive,
-            nr_compute: self.nr_compute - rhs.nr_compute,
-            nr_iowait: self.nr_iowait - rhs.nr_iowait,
-            nr_realtime: self.nr_realtime - rhs.nr_realtime,
-            nr_unknown: self.nr_unknown - rhs.nr_unknown,
+            nr_interactive: self.nr_interactive.saturating_sub(rhs.nr_interactive),
+            nr_compute: self.nr_compute.saturating_sub(rhs.nr_compute),
+            nr_iowait: self.nr_iowait.saturating_sub(rhs.nr_iowait),
+            nr_realtime: self.nr_realtime.saturating_sub(rhs.nr_realtime),
+            nr_unknown: self.nr_unknown.saturating_sub(rhs.nr_unknown),
             ..self.clone()
         }
     }
