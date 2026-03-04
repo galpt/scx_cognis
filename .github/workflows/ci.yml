@@ -32,17 +32,19 @@ jobs:
         id: get_tag
         run: |
           git fetch --tags
-          LATEST=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.1.0")
+          LATEST=$(git describe --tags --abbrev=0 2>/dev/null || echo "v1.0.0")
           echo "latest_tag=$LATEST" >> $GITHUB_OUTPUT
 
       - name: Increment patch version
         id: tag
         run: |
           LATEST=${{ steps.get_tag.outputs.latest_tag }}
+          # Strip leading 'v' and any trailing -TIMESTAMP suffix to get pure semver
           VERSION=${LATEST#v}
+          VERSION=${VERSION%%-*}
           IFS='.' read -ra PARTS <<< "$VERSION"
-          MAJOR=${PARTS[0]:-0}
-          MINOR=${PARTS[1]:-1}
+          MAJOR=${PARTS[0]:-1}
+          MINOR=${PARTS[1]:-0}
           PATCH=${PARTS[2]:-0}
           PATCH=$((PATCH + 1))
           # base semantic version
@@ -114,7 +116,7 @@ jobs:
   # ──────────────────────────────────────────────────────────────────────────
   build:
     runs-on: ubuntu-24.04
-    needs: [ test ]
+    needs: [ auto-tag, test ]
     steps:
       - uses: actions/checkout@v4
 
@@ -138,6 +140,18 @@ jobs:
             ~/.cargo/git
             /tmp/scx_cognis_build
           key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Patch Cargo.toml version to match release tag
+        run: |
+          # Prefer the auto-tag output; fall back to the git ref on tag-triggered builds.
+          RAW_TAG="${{ needs.auto-tag.outputs.new_tag }}"
+          [ -z "$RAW_TAG" ] && RAW_TAG="${GITHUB_REF_NAME}"
+          # Strip 'v' prefix and any -TIMESTAMP suffix → pure semver e.g. 1.0.1
+          SEMVER="${RAW_TAG#v}"
+          SEMVER="${SEMVER%%-*}"
+          echo "Patching Cargo.toml version to: $SEMVER"
+          sed -i "s/^version = \".*\"/version = \"$SEMVER\"/" Cargo.toml
+          grep '^version' Cargo.toml
 
       - name: cargo build --release
         run: cargo build --release
