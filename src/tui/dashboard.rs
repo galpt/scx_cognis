@@ -56,7 +56,7 @@ pub struct DashboardState {
 }
 
 impl DashboardState {
-    fn push_history(&mut self) {
+    pub fn push_history(&mut self) {
         push_bounded(&mut self.inference_hist, self.inference_us, HISTORY_LEN);
         push_bounded(
             &mut self.reward_hist,
@@ -85,7 +85,7 @@ fn push_bounded<T>(q: &mut VecDeque<T>, v: T, max: usize) {
 
 // ── Terminal setup / teardown ──────────────────────────────────────────────
 
-type Term = Terminal<CrosstermBackend<io::Stdout>>;
+pub type Term = Terminal<CrosstermBackend<io::Stdout>>;
 
 pub fn setup_terminal() -> Result<Term, io::Error> {
     enable_raw_mode()?;
@@ -383,7 +383,9 @@ pub fn new_shared_state() -> SharedState {
 /// Run the TUI in a blocking loop until the user presses 'q' or the
 /// `shutdown` flag is set.
 ///
-/// Call this in a separate thread via `std::thread::spawn`.
+/// Kept for reference — the scheduler now uses [`tick_tui`] to drive the
+/// TUI inline from its main loop instead of spawning a separate thread.
+#[allow(dead_code)]
 pub fn run_tui(state: SharedState, shutdown: Arc<std::sync::atomic::AtomicBool>) {
     let mut terminal = match setup_terminal() {
         Ok(t) => t,
@@ -429,6 +431,40 @@ pub fn run_tui(state: SharedState, shutdown: Arc<std::sync::atomic::AtomicBool>)
     }
 
     let _ = restore_terminal(&mut terminal);
+}
+
+/// Render one TUI frame and check for quit key.  Call this from the
+/// scheduler's main loop to drive the TUI without spawning a thread.
+///
+/// * `last_hist` — caller-owned `Instant` that governs history push (500 ms).
+/// * Returns `true` if the user pressed 'q' or Esc (scheduler should stop).
+pub fn tick_tui(state: &SharedState, terminal: &mut Term, last_hist: &mut Instant) -> bool {
+    use crossterm::event::{self, Event, KeyCode};
+
+    // Non-blocking key poll.
+    if event::poll(Duration::from_millis(0)).unwrap_or(false) {
+        if let Ok(Event::Key(key)) = event::read() {
+            if key.code == KeyCode::Char('q') || key.code == KeyCode::Esc {
+                return true;
+            }
+        }
+    }
+
+    // Push history every 500 ms.
+    if last_hist.elapsed() >= Duration::from_millis(500) {
+        *last_hist = Instant::now();
+        if let Ok(mut s) = state.lock() {
+            s.push_history();
+        }
+    }
+
+    // Draw frame.
+    if let Ok(snap) = state.lock() {
+        let snap = snap.clone();
+        let _ = terminal.draw(|f| draw(f, &snap));
+    }
+
+    false
 }
 
 // DashboardState needs to be Clone for the above to work.

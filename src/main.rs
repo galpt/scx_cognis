@@ -31,8 +31,7 @@ mod tui;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io;
 use std::mem::MaybeUninit;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Result;
@@ -216,7 +215,12 @@ struct Scheduler<'a> {
 
     // TUI shared state (None if TUI not requested).
     tui_state: Option<SharedState>,
-    tui_shutdown: Arc<AtomicBool>,
+    /// Inline TUI terminal handle — avoids spawning a thread (prevents EPERM
+    /// from cgroup pids.max limits when running under sudo).
+    tui_term: Option<tui::Term>,
+    tui_quit: bool,
+    last_tui_render: Instant,
+    last_tui_hist: Instant,
 
     // Periodic tick timers.
     last_anticheat_tick: Instant,
@@ -293,14 +297,19 @@ impl<'a> Scheduler<'a> {
         } else {
             None
         };
-        let tui_shutdown = Arc::new(AtomicBool::new(false));
-
-        // Launch TUI thread.
-        if let Some(ref state) = tui_state {
-            let state_clone = Arc::clone(state);
-            let shutdown_clone = Arc::clone(&tui_shutdown);
-            std::thread::spawn(move || tui::run_tui(state_clone, shutdown_clone));
-        }
+        // Set up TUI terminal inline — no thread spawned. The TUI is driven
+        // from within the scheduler's main run() loop via tick_tui().
+        let tui_term = if opts.tui {
+            match tui::setup_terminal() {
+                Ok(t) => Some(t),
+                Err(e) => {
+                    eprintln!("[WARN] TUI init failed: {e}; continuing without TUI");
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         info!(
             "{} version {} — scx_rustland_core {}",
@@ -326,7 +335,10 @@ impl<'a> Scheduler<'a> {
             policy,
             lifetimes: HashMap::with_capacity(1024),
             tui_state,
-            tui_shutdown,
+            tui_term,
+            tui_quit: false,
+            last_tui_render: Instant::now(),
+            last_tui_hist: Instant::now(),
             last_anticheat_tick: Instant::now(),
             last_policy_tick: Instant::now(),
             last_reputation_flush: Instant::now(),
@@ -879,8 +891,22 @@ impl<'a> Scheduler<'a> {
                 self.housekeeping();
             }
 
-            // TUI requested shutdown.
-            if self.tui_shutdown.load(Ordering::Relaxed) {
+            // Inline TUI rendering (no separate thread — avoids EPERM under sudo).
+            if self.tui_term.is_some() {
+                let should_render =
+                    self.last_tui_render.elapsed() >= Duration::from_millis(50);
+                if should_render {
+                    self.last_tui_render = Instant::now();
+                    if let (Some(ref state), Some(ref mut term)) =
+                        (&self.tui_state, &mut self.tui_term)
+                    {
+                        if tui::tick_tui(state, term, &mut self.last_tui_hist) {
+                            self.tui_quit = true;
+                        }
+                    }
+                }
+            }
+            if self.tui_quit {
                 break;
             }
         }
@@ -891,7 +917,9 @@ impl<'a> Scheduler<'a> {
 
 impl Drop for Scheduler<'_> {
     fn drop(&mut self) {
-        self.tui_shutdown.store(true, Ordering::Relaxed);
+        if let Some(ref mut term) = self.tui_term {
+            let _ = tui::restore_terminal(term);
+        }
         info!("Unregistered {SCHEDULER_NAME} scheduler");
     }
 }

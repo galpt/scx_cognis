@@ -3,4 +3,4 @@
 
 pub mod dashboard;
 
-pub use dashboard::{new_shared_state, run_tui, SharedState, WallEntry};
+pub use dashboard::{new_shared_state, setup_terminal, restore_terminal, tick_tui, SharedState, Term, WallEntry};
