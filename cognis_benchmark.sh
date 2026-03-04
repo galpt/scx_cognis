@@ -206,7 +206,7 @@ run_baseline() {
 
     open_aquarium
     say ""
-    say "Aquarium is open. Set fish count to 10 000, let it settle for ~5s,"
+    say "Aquarium is open. Leave the fish count at the default (500), let it settle for ~5s,"
     say "then press Enter here to start the stress workload."
     printf "  Press Enter to begin ... "
     read -r _
@@ -245,7 +245,7 @@ run_with_cognis() {
 
     open_aquarium
     say ""
-    say "Aquarium is open. Set fish count to 10 000, let it settle for ~5s,"
+    say "Aquarium is open. Leave the fish count at the default (500), let it settle for ~5s,"
     say "then press Enter here to start the stress workload."
     printf "  Press Enter to begin ... "
     read -r _

@@ -178,20 +178,22 @@ impl KnnClassifier {
 
     /// Heuristic rule-based fallback classifer.
     fn heuristic_classify(&self, f: &TaskFeatures) -> TaskLabel {
-        // Real-time hint: high-priority weight (e.g. SCHED_FIFO tasks appear with weight > 0.95).
+        // Real-time: high-priority weight (e.g., SCHED_FIFO tasks have weight > 0.95).
         if f.weight_norm > 0.95 {
             return TaskLabel::RealTime;
         }
-        // I/O bound: low CPU intensity, high runnable wait.
-        if f.cpu_intensity < 0.15 && f.runnable_ratio > 0.6 {
-            return TaskLabel::IoWait;
-        }
-        // Compute bound: high CPU intensity, low runnable wait.
-        if f.cpu_intensity > 0.7 && f.runnable_ratio < 0.2 {
+        // Compute: burning through the full assigned slice AND has been running
+        // continuously without sleeping for many slices (high run streak).
+        if f.cpu_intensity > 0.85 && f.runnable_ratio > 0.6 {
             return TaskLabel::Compute;
         }
-        // Interactive: moderate CPU, responds quickly (short exec_ratio means frequent wakeups).
-        if f.exec_ratio < 0.3 {
+        // I/O-bound: very low CPU consumption per scheduling event.
+        if f.cpu_intensity < 0.15 {
+            return TaskLabel::IoWait;
+        }
+        // Interactive: used only a small-to-moderate fraction of its assigned slice,
+        // or just woke from a sleep (high freshness ratio → exec_runtime ≈ burst_ns).
+        if f.cpu_intensity < 0.5 || f.exec_ratio > 0.4 {
             return TaskLabel::Interactive;
         }
         TaskLabel::Unknown

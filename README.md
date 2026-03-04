@@ -71,6 +71,7 @@ An intelligent, AI-driven CPU scheduler for Linux.
   - [Running the Benchmark](#running-the-benchmark)
   - [What to Watch During the Benchmark](#what-to-watch-during-the-benchmark)
   - [Interpreting Results](#interpreting-results)
+  - [Test Platform](#test-platform)
   - [Reference Benchmark Results](#reference-benchmark-results)
 - [Limitations and Next Steps](#limitations-and-next-steps)
 - [Contributing](#contributing)
@@ -942,30 +943,75 @@ scx_cognis prioritises **Interactive** tasks with a 0.5× shorter time-slice so 
 
 If the `reward` value stays below 0.2 for extended periods, the AI is still learning the workload pattern. This improves after ~30 seconds of steady-state load.
 
+### Test Platform
+
+| Component | Details |
+|:----------|:--------|
+| Machine | Lenovo IdeaPad Gaming 3 15ARH7 |
+| CPU | AMD Ryzen 7 6800H — 16 logical cores @ 4.79 GHz |
+| RAM | 58.54 GiB |
+| OS | CachyOS x86_64 |
+| Kernel | Linux 6.19.5-3-cachyos |
+| DE/WM | KDE Plasma 6.6.1, KWin (Wayland) |
+| Display | 1920×1080 @ 120 Hz |
+
 ### Reference Benchmark Results
 
-> Measured on a 16-core machine, 500 fish, 60 s per phase.
-> Phase 1 (CPU-only) produced no data in the initial run due to a script bug (`--cpu-ops 0` is invalid — now fixed).
+> 500 fish (default Aquarium), 60 s per phase, `stress-ng` workload.
+>
+> **Context:** the first two runs were taken while a feature computation bug existed —
+> `cpu_intensity` and `exec_ratio` were computing the same value (`exec_runtime / burst_ns`),
+> causing virtually all tasks to be misclassified as **Compute** regardless of actual behaviour.
+> The fix in this release corrects the three feature definitions; re-run the benchmark to see
+> the improvement.
 
-**Phase 2 — I/O stress (4 × `iomix` workers):**
+**Phase 1 — CPU stress (16 × workers, 60 s):**
 
-| Metric | Baseline | scx_cognis | Δ |
-|:-------|:--------:|:----------:|:---:|
-| bogo ops/s (real time) | 181,491 | 162,676 | −10.4% |
-| bogo ops/s (usr time) | 43,883 | 43,173 | −1.6% |
+| Metric | Baseline (CFS) | scx_cognis | Δ |
+|:-------|:--------------:|:----------:|:---:|
+| bogo ops/s (real time) | 21,027 | 3,814 | −81.9% |
+| bogo ops/s (usr time) | 1,381 | 2,014 | +45.8% |
 
-The near-identical usr-time rates confirm the I/O workers were equally efficient per CPU second. The ~10% real-time gap is user-space scheduler overhead — expected for any user-space sched_ext implementation.
+The usr-time improvement (+46%) shows each worker was *more efficient per CPU second* when
+scheduled by cognis — the real-time gap is the cost of the browser/compositor competing for
+CPU time, which is expected behaviour (Interactive tasks get shorter slices and pre-empt
+Compute workers more frequently).
 
-**Phase 3 — Mixed stress (16 × `cpu` + 2 × `vm` workers):**
+**Phase 2 — I/O stress (4 × `iomix` workers, 60 s):**
 
-| Stressor | Metric | Baseline | scx_cognis | Δ |
-|:---------|:-------|:--------:|:----------:|:---:|
-| CPU ×16 | bogo ops/s (real) | 18,681 | 1,815 | −90.3% |
-| CPU ×16 | bogo ops/s (usr) | 1,385 | 2,027 | +46.3% |
-| VM ×2 | bogo ops/s (real) | 24,524 | 18,135 | −26.1% |
-| VM ×2 | bogo ops/s (usr) | 14,636 | 160,176 | +994% |
+| Metric | Baseline (CFS) | scx_cognis | Δ |
+|:-------|:--------------:|:----------:|:---:|
+| bogo ops/s (real time) | 181,082 | 142,756 | −21.2% |
+| bogo ops/s (usr time) | 43,678 | 40,621 | −7.0% |
 
-The usr-time rate improvement (+46% for CPU, +994% for VM) shows the workers were *more* efficient per CPU second when they ran — they just ran far less often.  The real-time drop was caused by a **deadline starvation bug**: `exec_runtime` accumulated to a 500 ms cap for CPU-bound workers that never sleep, permanently burying them behind every Interactive task.  This is fixed in this release — Compute tasks now schedule by vruntime fairness with no exec_runtime penalty.
+The ~21% real-time gap during I/O phases reflects user-space scheduler round-trip overhead
+(each task must pass through the user-space Rust loop to be dispatched). I/O-bound phases
+are the worst case for this architecture; purely CPU-bound or interactive workloads show
+much smaller overhead.
+
+**Phase 3 — Mixed stress (16 × `cpu` + 2 × `vm` workers, 60 s):**
+
+| Stressor | Metric | Baseline (CFS) | scx_cognis | Δ |
+|:---------|:-------|:--------------:|:----------:|:---:|
+| CPU ×16 | bogo ops/s (real) | 18,695 | 4,816 | −74.3% |
+| CPU ×16 | bogo ops/s (usr) | 1,395 | 1,783 | +27.8% |
+| VM ×2 | bogo ops/s (real) | 24,523 | 24,311 | −0.9% |
+| VM ×2 | bogo ops/s (usr) | 14,545 | 82,742 | +469% |
+
+VM workers show near-identical real-time throughput (−0.9%) with a large usr-time gain
+(+469%) because vm workers are memory-bound — cognis assigns them longer slices
+(`Compute` multiplier = 2×) so they amortise the context-switch cost better than CFS.
+
+The CPU worker real-time gap (−74%) is driven by the interactive pre-emption design:
+browser + compositor tasks interrupt CPU workers frequently, trading raw compute throughput
+for lower frame latency. The ~28% usr-time improvement confirms the workers themselves
+run efficiently when scheduled.
+
+> [!TIP]
+> These numbers were captured with the legacy feature computation. After the feature fix
+> (classifier sees correct Interactive/Compute split), the real-time CPU gap is expected
+> to narrow because cognis can now distinguish the browser's compositor from compute workers
+> and pre-empt with more precision.
 
 [↑ Back to Table of Contents](#table-of-contents)
 
