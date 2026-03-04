@@ -206,6 +206,7 @@ fn set_ctrlc_handler(shutdown: Arc<AtomicBool>) -> Result<(), anyhow::Error> {
 }
 
 impl<'cb> BpfScheduler<'cb> {
+    #[allow(clippy::too_many_arguments)]
     pub fn init(
         open_object: &'cb mut MaybeUninit<OpenObject>,
         open_opts: Option<bpf_object_open_opts>,
@@ -547,22 +548,12 @@ impl<'cb> BpfScheduler<'cb> {
             .expect("failed to convert bytes");
 
         // Convert the dispatched task into the low-level dispatched task context.
-        let bpf_intf::dispatched_task_ctx {
-            pid,
-            cpu,
-            flags,
-            slice_ns,
-            vtime,
-            enq_cnt,
-            ..
-        } = &mut dispatched_task.as_mut();
-
-        *pid = task.pid;
-        *cpu = task.cpu;
-        *flags = task.flags;
-        *slice_ns = task.slice_ns;
-        *vtime = task.vtime;
-        *enq_cnt = task.enq_cnt;
+        dispatched_task.pid = task.pid;
+        dispatched_task.cpu = task.cpu;
+        dispatched_task.flags = task.flags;
+        dispatched_task.slice_ns = task.slice_ns;
+        dispatched_task.vtime = task.vtime;
+        dispatched_task.enq_cnt = task.enq_cnt;
 
         // Store the task in the user ring buffer.
         //

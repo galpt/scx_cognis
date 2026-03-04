@@ -171,6 +171,11 @@ struct TaskLifetime {
     slice_used_ns: u64,
     preempted: bool,
     cheat_flagged: bool,
+    /// Nanosecond timestamp from [`Scheduler::now_ns`] of the last time this
+    /// PID was dequeued from BPF. Used to detect genuinely departed tasks so
+    /// the reputation / KNN eviction only fires for tasks that have actually
+    /// left, not for still-active tasks on every scheduling loop.
+    last_seen_ns: u64,
 }
 
 // ── Main Scheduler Struct ──────────────────────────────────────────────────
@@ -204,9 +209,12 @@ struct Scheduler<'a> {
     tui_state: Option<SharedState>,
     tui_shutdown: Arc<AtomicBool>,
 
-    // Anti-cheat tick timer.
+    // Periodic tick timers.
     last_anticheat_tick: Instant,
     last_policy_tick: Instant,
+    /// Rate-limiter for [`flush_reputation_updates`]: only runs once per second
+    /// and only evicts PIDs that have not been seen for ≥ 2 s.
+    last_reputation_flush: Instant,
 
     // Running counters for AImetrics.
     label_counts: [u64; 5],
@@ -305,6 +313,7 @@ impl<'a> Scheduler<'a> {
             tui_shutdown,
             last_anticheat_tick: Instant::now(),
             last_policy_tick: Instant::now(),
+            last_reputation_flush: Instant::now(),
             label_counts: [0; 5],
             total_inference_ns: 0,
             inference_samples: 0,
@@ -446,6 +455,7 @@ impl<'a> Scheduler<'a> {
                     e.slice_used_ns = task.stop_ts.saturating_sub(task.start_ts);
                     e.preempted = e.slice_used_ns >= slice_ns.saturating_sub(slice_ns / 8);
                     e.cheat_flagged = self.anti_cheat.is_flagged(task.pid);
+                    e.last_seen_ns = Self::now_ns();
 
                     // Update burst predictor with observed burst.
                     let burst_ns = task.stop_ts.saturating_sub(task.start_ts);
@@ -558,19 +568,28 @@ impl<'a> Scheduler<'a> {
     }
 
     /// Emit reputation updates for finished tasks (ops.exit approximation).
+    ///
+    /// Rate-limited to once per second. A task is considered departed only when
+    /// its `last_seen_ns` timestamp is more than 2 seconds old — this prevents
+    /// the previous bug where every still-active task was evicted on every loop,
+    /// wiping the KNN pid_cache constantly and corrupting reputation scores.
     fn flush_reputation_updates(&mut self) {
-        // Identify PIDs that no longer appear in the BPF queue (best-effort heuristic).
-        // A full implementation would use a BPF ringbuf exit event; here we age out
-        // lifetimes that haven't been refreshed in the last ~1s.
-        let _now = Self::now_ns();
-        let _stale_threshold = NSEC_PER_SEC;
+        // Run at most once per second.
+        if self.last_reputation_flush.elapsed() < Duration::from_secs(1) {
+            return;
+        }
+        self.last_reputation_flush = Instant::now();
+
+        // Tasks not seen for >2 seconds are assumed to have exited.
+        let stale_threshold_ns = 2 * NSEC_PER_SEC;
+        let now = Self::now_ns();
+
         let stale: Vec<i32> = self
             .lifetimes
             .iter()
             .filter(|(_, lt)| {
-                // Use slice_used_ns as indirect age indicator (not a timestamp, but
-                // non-zero means the task ran).
-                lt.slice_used_ns > 0
+                lt.last_seen_ns > 0
+                    && now.saturating_sub(lt.last_seen_ns) >= stale_threshold_ns
             })
             .map(|(&pid, _)| pid)
             .collect();
