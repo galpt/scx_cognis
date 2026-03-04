@@ -411,17 +411,21 @@ sudo ./target/release/scx_cognis
 
 ### TUI Dashboard
 
+`--tui` starts `scx_cognis` as the active scheduler **with** a live dashboard. Because only one sched_ext scheduler can run at a time, you must stop the systemd service first if it is running:
+
 ```bash
-# Launch with the real-time TUI dashboard:
-sudo ./target/release/scx_cognis --tui
+# Stop the background service, then launch with TUI:
+sudo systemctl stop scx && sudo scx_cognis --tui
 ```
 
-#### TUI Key Bindings
+> [!NOTE]
+> Pressing `q` or `Esc` exits the TUI and stops the scheduler. The `scx.service` will **not** restart automatically — run `sudo systemctl start scx` to bring it back.
 
-| Key | Action |
-|-----|--------|
-| `q` | Quit the scheduler and TUI |
-| `Esc` | Quit the scheduler and TUI |
+For live stats while the service is running (no TUI, no scheduler restart needed):
+
+```bash
+scx_cognis --monitor 1.0
+```
 
 ### Command-Line Options
 
@@ -524,6 +528,15 @@ sudo sh install.sh --build-from-source
 
 > [!NOTE]
 > After installation the scheduler starts automatically on every boot via `scx.service`. If the user-space daemon ever crashes, the kernel's sched_ext watchdog reverts all tasks to the default scheduler (CFS/EEVDF) within ~50 ms — there is no risk of a kernel panic or system lockup.
+>
+> **TUI and the systemd service cannot run at the same time.** `--tui` starts its own scheduler instance; if `scx.service` is already active you will get `Error: another sched_ext scheduler is already running`. To use the TUI, stop the service first:
+> ```bash
+> sudo systemctl stop scx && sudo scx_cognis --tui
+> ```
+> For live stats *without* stopping the service, use `--monitor` instead (no root needed):
+> ```bash
+> scx_cognis --monitor 1.0
+> ```
 
 [↑ Back to Table of Contents](#table-of-contents)
 
