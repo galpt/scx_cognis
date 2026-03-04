@@ -176,25 +176,36 @@ impl KnnClassifier {
         self.pid_cache.remove(&pid);
     }
 
-    /// Heuristic rule-based fallback classifer.
-    fn heuristic_classify(&self, f: &TaskFeatures) -> TaskLabel {
-        // Real-time: high-priority weight (e.g., SCHED_FIFO tasks have weight > 0.95).
+    /// Classify a task using deterministic heuristic rules only.
+    ///
+    /// This is the primary classification path — it is always called directly
+    /// rather than going through KNN voting.  KNN voting introduced a
+    /// self-poisoning feedback loop: the first few desktop idle tasks correctly
+    /// get `IoWait` labels, those samples fill the 512-entry window, and every
+    /// subsequent task — including CPU-bound stress-ng workers — receives an
+    /// `IoWait` vote regardless of its actual features.  By bypassing the
+    /// voting window we get a deterministic, loop-free classifier.
+    ///
+    /// Feature semantics after the fix:
+    ///   `cpu_intensity` = `burst_ns / prev_assigned_slice_ns`  (0..1)
+    ///   • ≈ 1.0  task consumed virtually all of the slice it was given      → Compute
+    ///   • ≈ 0.0  task released the CPU far before the slice expired          → IoWait
+    ///   • in between  latency-sensitive, regularly yielding work              → Interactive
+    pub fn heuristic_classify(&self, f: &TaskFeatures) -> TaskLabel {
+        // Real-time: SCHED_FIFO / SCHED_RR tasks carry a very high weight.
         if f.weight_norm > 0.95 {
             return TaskLabel::RealTime;
         }
-        // Compute: sustained CPU-heavy run streak with low freshness.
-        if f.cpu_intensity > 0.85 && f.exec_ratio < 0.15 {
+        // Compute: used > 85 % of the assigned slice → CPU-bound, rarely yields.
+        if f.cpu_intensity > 0.85 {
             return TaskLabel::Compute;
         }
-        // I/O wait: short, low-intensity bursts that also use only a small slice fraction.
-        if f.cpu_intensity < 0.15 && f.runnable_ratio < 0.2 {
+        // IoWait: used < 10 % of the assigned slice → almost immediately blocked.
+        if f.cpu_intensity < 0.10 {
             return TaskLabel::IoWait;
         }
-        // Interactive: moderate slice usage or fresh wake-up behaviour.
-        if f.runnable_ratio < 0.6 || f.exec_ratio > 0.35 {
-            return TaskLabel::Interactive;
-        }
-        TaskLabel::Unknown
+        // Everything else is latency-sensitive interactive work.
+        TaskLabel::Interactive
     }
 }
 
@@ -222,6 +233,8 @@ fn u8_to_label(v: u8) -> TaskLabel {
 mod tests {
     use super::*;
 
+    // feat(cpu_intensity, runnable_ratio, exec_ratio)
+    // cpu_intensity = burst_ns / prev_assigned_slice_ns (slice-usage fraction, 0..1)
     fn feat(cpu: f32, io: f32, exec: f32) -> TaskFeatures {
         TaskFeatures {
             runnable_ratio: io,
@@ -235,27 +248,65 @@ mod tests {
     #[test]
     fn heuristic_compute() {
         let clf = KnnClassifier::new();
-        // cpu_intensity=0.9 (burns full slice), runnable_ratio=0.8 (long run streak),
-        // exec_ratio≈0 (burst << exec_runtime → spinning without sleeping)
+        // cpu_intensity = 0.9 → used 90 % of its assigned slice → Compute.
         let f = feat(0.9, 0.8, 0.001);
-        assert_eq!(clf.classify(&f), TaskLabel::Compute);
+        assert_eq!(clf.heuristic_classify(&f), TaskLabel::Compute);
     }
 
     #[test]
     fn heuristic_interactive() {
         let clf = KnnClassifier::new();
-        // cpu_intensity=0.3 (used only 30% of slice), exec_ratio=0.95 (just woke from sleep)
-        let f = feat(0.3, 0.02, 0.95);
-        assert_eq!(clf.classify(&f), TaskLabel::Interactive);
+        // cpu_intensity = 0.45 → used 45 % of its assigned slice → Interactive.
+        let f = feat(0.45, 0.02, 0.95);
+        assert_eq!(clf.heuristic_classify(&f), TaskLabel::Interactive);
+    }
+
+    #[test]
+    fn heuristic_iowait() {
+        let clf = KnnClassifier::new();
+        // cpu_intensity = 0.04 → used only 4 % of assigned slice → I/O blocked.
+        let f = feat(0.04, 0.04, 0.5);
+        assert_eq!(clf.heuristic_classify(&f), TaskLabel::IoWait);
+    }
+
+    #[test]
+    fn heuristic_boundary_interactive_low() {
+        let clf = KnnClassifier::new();
+        // cpu_intensity = 0.10 → exactly at IoWait/Interactive boundary → Interactive.
+        let f = feat(0.10, 0.1, 0.5);
+        assert_eq!(clf.heuristic_classify(&f), TaskLabel::Interactive);
+    }
+
+    #[test]
+    fn heuristic_boundary_compute_high() {
+        let clf = KnnClassifier::new();
+        // cpu_intensity = 0.85 → exactly at Interactive/Compute boundary → Interactive.
+        let f = feat(0.85, 0.8, 0.01);
+        assert_eq!(clf.heuristic_classify(&f), TaskLabel::Interactive);
+    }
+
+    #[test]
+    fn heuristic_realtime() {
+        let clf = KnnClassifier::new();
+        // weight_norm > 0.95 → SCHED_FIFO/RR → RealTime.
+        let f = TaskFeatures {
+            runnable_ratio: 0.5,
+            cpu_intensity: 0.5,
+            exec_ratio: 0.5,
+            weight_norm: 0.99,
+            cpu_affinity: 1.0,
+        };
+        assert_eq!(clf.heuristic_classify(&f), TaskLabel::RealTime);
     }
 
     #[test]
     fn knn_vote_after_warmup() {
         let mut clf = KnnClassifier::new();
-        // Feed compute samples using feature values consistent with new semantics.
+        // Feed compute samples into the window; KNN should vote Compute.
         for _ in 0..20 {
             clf.feed(feat(0.9, 0.8, 0.001), TaskLabel::Compute);
         }
+        // KNN classify (not heuristic) — window has 20 Compute samples.
         let result = clf.classify(&feat(0.88, 0.75, 0.002));
         assert_eq!(result, TaskLabel::Compute);
     }

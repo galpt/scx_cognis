@@ -124,6 +124,11 @@ struct Opts {
 // ── Task record ────────────────────────────────────────────────────────────
 
 /// A task in the user-space scheduler queue.
+///
+/// Ordering: RealTime > Interactive > IoWait > Unknown > Compute (by label
+/// priority), then by earliest deadline, then by arrival timestamp.  This
+/// ensures latency-sensitive tasks always run before batch/compute work while
+/// the vtime deadline provides fairness within each priority band.
 #[derive(Debug, PartialEq, Eq, Clone)]
 struct Task {
     qtask: QueuedTask,
@@ -171,6 +176,11 @@ struct TaskLifetime {
     slice_used_ns: u64,
     preempted: bool,
     cheat_flagged: bool,
+    /// The time-slice (ns) that was assigned to this task on its most recent
+    /// scheduling event.  Used in the next cycle as the denominator for
+    /// `cpu_intensity = burst_ns / last_slice_ns`, which gives a reliable
+    /// slice-usage fraction. Defaults to 0 (→ base_slice_ns is used instead).
+    last_slice_ns: u64,
     /// Nanosecond timestamp from [`Scheduler::now_ns`] of the last time this
     /// PID was dequeued from BPF. Used to detect genuinely departed tasks so
     /// the reputation / KNN eviction only fires for tasks that have actually
@@ -346,28 +356,44 @@ impl<'a> Scheduler<'a> {
     // ── AI inference pipeline (ops.enqueue) ───────────────────────────────
 
     /// Compute task features from a QueuedTask.
-    fn compute_features(task: &QueuedTask, base_slice_ns: u64, nr_cpus: i32) -> TaskFeatures {
+    ///
+    /// `prev_slice_ns` is the slice duration that was assigned to this task
+    /// on its most recent scheduling event (read from `lifetimes`).  If no
+    /// history is available yet, the caller passes `base_slice_ns` instead.
+    ///
+    /// The key feature is `cpu_intensity = burst_ns / prev_slice_ns`, i.e.
+    /// "what fraction of its assigned slice did the task actually consume?".
+    /// This is unambiguous and stable:
+    ///   • ≈ 1.0  task ran to the end of its slice → CPU-bound (Compute)
+    ///   • ≈ 0.0  task released the CPU long before the slice expired → I/O-bound
+    ///   • ≈ 0.3–0.8  task yields regularly → Interactive
+    ///
+    /// No dependency on `exec_runtime` semantics, no normalisation against a
+    /// global constant that can produce degenerate extreme values.
+    fn compute_features(
+        task: &QueuedTask,
+        base_slice_ns: u64,
+        prev_slice_ns: u64,
+        nr_cpus: i32,
+    ) -> TaskFeatures {
         let burst_ns = task.stop_ts.saturating_sub(task.start_ts);
 
-        // CPU intensity: accumulated CPU runtime since last sleep, normalised by base slice.
-        // This is robust for bursty tasks because exec_runtime is maintained by the kernel and
-        // reset on sleep, making it a good proxy for "how CPU-bound is this task right now".
-        let cpu_intensity = if base_slice_ns > 0 {
-            (task.exec_runtime as f64 / base_slice_ns as f64).clamp(0.0, 1.0) as f32
-        } else {
-            0.0
-        };
+        // Primary classification feature: slice-usage fraction.
+        // prev_slice_ns is the slice assigned in the *previous* cycle for this PID.
+        // On a task's very first scheduling event, base_slice_ns is used as a stand-in.
+        let denominator = prev_slice_ns.max(1);
+        let cpu_intensity = (burst_ns as f64 / denominator as f64).clamp(0.0, 1.0) as f32;
 
-        // Slice usage in the most recent run (0..1).
+        // Secondary feature: burst relative to the *target* base slice.
+        // Useful as an additional signal for burst predictor and future KNN use.
         let runnable_ratio = if base_slice_ns > 0 {
             (burst_ns as f64 / base_slice_ns as f64).clamp(0.0, 1.0) as f32
         } else {
             0.0
         };
 
-        // Freshness of the last run relative to the current accumulated runtime (0..1).
-        // Near 1.0 -> task likely just woke up and ran briefly (interactive/IO).
-        // Near 0.0 -> task has a long continuous run streak (compute-heavy).
+        // Freshness: how fresh is this burst relative to accumulated CPU time?
+        // Near 1.0 → task just woke (interactive/IO); near 0.0 → never sleeps (compute).
         let exec_ratio = if task.exec_runtime > 0 {
             (burst_ns as f64 / task.exec_runtime as f64).clamp(0.0, 1.0) as f32
         } else {
@@ -383,18 +409,36 @@ impl<'a> Scheduler<'a> {
         }
     }
 
-    // SAFETY: We read this once at scheduler init from the BPF skel.
-    // Declared here as a thread-local rather than a global mutex to avoid
-    // contention on the hot path.
     fn ai_classify_and_enqueue(&mut self, task: &mut QueuedTask) -> (u64, u64, TaskLabel) {
         let t0 = Self::now_ns();
 
-        // Build features.
         let nr_cpus = (*self.bpf.nr_online_cpus_mut()).max(1) as i32;
-        let features = Self::compute_features(task, self.base_slice_ns, nr_cpus);
 
-        // KNN classification.
-        let label = self.classifier.classify_and_learn(task.pid, features);
+        // Use the slice assigned to this PID in the previous cycle as the
+        // denominator for cpu_intensity.  This gives the unambiguous
+        // "slice-usage fraction" without any global-constant normalisation
+        // artefacts.  On the very first event for a new PID, fall back to
+        // base_slice_ns so the value is at least reasonable.
+        let prev_slice_ns = self
+            .lifetimes
+            .get(&task.pid)
+            .filter(|lt| lt.last_slice_ns > 0)
+            .map(|lt| lt.last_slice_ns)
+            .unwrap_or(self.base_slice_ns);
+
+        // Build features.
+        let features = Self::compute_features(task, self.base_slice_ns, prev_slice_ns, nr_cpus);
+
+        // Classify using the deterministic heuristic only — no KNN voting.
+        //
+        // Why: KNN voting created a self-poisoning feedback loop.  The first
+        // few desktop idle tasks seed the 512-entry window with IoWait labels;
+        // once the window has ≥ k=5 samples, KNN votes IoWait for every
+        // subsequent task — including CPU-bound stress-ng workers — regardless
+        // of their actual features.  The heuristic is stateless, loop-free,
+        // and with cpu_intensity = burst_ns/prev_slice_ns it is accurate from
+        // the second scheduling event onward for any workload.
+        let label = self.classifier.heuristic_classify(&features);
         self.label_counts[label as usize] += 1;
 
         // Reputation-based slice factor.
@@ -470,6 +514,9 @@ impl<'a> Scheduler<'a> {
                     // Track lifetime for reputation updates.
                     let e = self.lifetimes.entry(task.pid).or_default();
                     e.slice_assigned_ns = slice_ns;
+                    // Store the assigned slice so the next scheduling event
+                    // for this PID can compute cpu_intensity = burst / last_slice.
+                    e.last_slice_ns = slice_ns;
                     e.slice_used_ns = task.stop_ts.saturating_sub(task.start_ts);
                     e.preempted = e.slice_used_ns >= slice_ns.saturating_sub(slice_ns / 8);
                     e.cheat_flagged = self.anti_cheat.is_flagged(task.pid);
@@ -478,7 +525,11 @@ impl<'a> Scheduler<'a> {
                     // Update burst predictor with observed burst.
                     let burst_ns = task.stop_ts.saturating_sub(task.start_ts);
                     let nr_cpus_exit = (*self.bpf.nr_online_cpus_mut()).max(1) as i32;
-                    let features = Self::compute_features(&task, self.base_slice_ns, nr_cpus_exit);
+                    // Use the newly-assigned slice_ns as prev_slice for the
+                    // burst predictor features (acceptable approximation here
+                    // since the predictor uses exec_ratio, not cpu_intensity).
+                    let features =
+                        Self::compute_features(&task, self.base_slice_ns, slice_ns, nr_cpus_exit);
                     self.burst_pred.observe_and_predict(
                         task.pid,
                         burst_ns,
@@ -682,10 +733,27 @@ impl<'a> Scheduler<'a> {
         // 1. Drain queued tasks (AI classify + enqueue).
         self.drain_queued_tasks();
 
-        // 2. Dispatch the next best task.
-        self.dispatch_task();
+        // 2. Batch-dispatch up to nr_cpus tasks in a single schedule() call.
+        //
+        // Previously only ONE task was dispatched per cycle.  With 16+ workers
+        // all runnable simultaneously, the remaining 15 had to wait for the
+        // next BPF dispatch callback.  Rather than waiting, the BPF fell back
+        // to its kernel-side fallback path, producing the k >> d→u symptom
+        // (kernel dispatches >> user-space dispatches) and leaving CPUs idle.
+        //
+        // By filling the BPF dispatch list with up to nr_cpus tasks at once,
+        // every runnable CPU gets a task in a single round-trip.
+        let nr_cpus = (*self.bpf.nr_online_cpus_mut()).max(1) as usize;
+        for _ in 0..nr_cpus {
+            if self.tasks.is_empty() {
+                break;
+            }
+            if !self.dispatch_task() {
+                break;
+            }
+        }
 
-        // 3. Notify BPF dispatcher of pending work.
+        // 3. Notify BPF dispatcher of remaining pending work.
         self.bpf.notify_complete(self.tasks.len() as u64);
 
         // 4. Periodic AI housekeeping.
