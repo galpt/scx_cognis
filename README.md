@@ -129,7 +129,9 @@ test result: ok. 16 passed; 0 failed; 0 ignored
 ## Features
 
 > [!TIP]
-> **What to expect from scx_cognis:** cognis is designed to keep interactive tasks (UI rendering, audio, input) responsive even when the system is under heavy CPU or I/O load. It does this by classifying tasks as Interactive, Compute, IoWait, or RealTime on every scheduling event and giving short, high-frequency slices to Interactive tasks (0.5× base) so they are never queued behind long-running CPU-bound workers. Fair-share throughput for batch workloads is preserved — just not maximised. If your goal is raw CPU throughput (compilers, encoders, benchmarks), the default EEVDF scheduler wins; cognis's advantage is consistent low scheduling latency for tasks that wake up, do a little work, and sleep again.
+> **What to expect from scx_cognis?**
+>
+> Cognis is designed to keep interactive tasks (UI rendering, audio, input) responsive even when the system is under heavy CPU or I/O load. It does this by classifying tasks as Interactive, Compute, IoWait, or RealTime on every scheduling event and giving short, high-frequency slices to Interactive tasks (0.5× base) so they are never queued behind long-running CPU-bound workers. Fair-share throughput for batch workloads is preserved — just not maximised. If your goal is raw CPU throughput (compilers, encoders, benchmarks), the default EEVDF scheduler wins; cognis's advantage is consistent low scheduling latency for tasks that wake up, do a little work, and sleep again.
 
 ### Pipeline Overview
 
