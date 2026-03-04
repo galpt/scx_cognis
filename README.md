@@ -543,6 +543,7 @@ The KNN classifier uses a **sliding window of 512 labelled samples** and 5 neare
 | **Compute** | 2.0× | high CPU intensity (> 70%) **and** low runnable wait (< 20%) |
 | **Unknown** | 1.0× | none of the above — classifier not yet warmed up |
 
+> [!TIP]
 > **Why does Interactive dominate?** Most desktop, service, and shell tasks have short, frequent scheduling bursts (`exec_ratio < 0.3`), so the heuristic naturally classifies them as Interactive. This is intentional: when in doubt, treat a task as latency-sensitive. The KNN refines this over time as it gathers more data.
 
 #### TLDR Message Reference

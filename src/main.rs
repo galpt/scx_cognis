@@ -588,8 +588,7 @@ impl<'a> Scheduler<'a> {
             .lifetimes
             .iter()
             .filter(|(_, lt)| {
-                lt.last_seen_ns > 0
-                    && now.saturating_sub(lt.last_seen_ns) >= stale_threshold_ns
+                lt.last_seen_ns > 0 && now.saturating_sub(lt.last_seen_ns) >= stale_threshold_ns
             })
             .map(|(&pid, _)| pid)
             .collect();
