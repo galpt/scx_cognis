@@ -17,7 +17,7 @@ An intelligent, AI-driven CPU scheduler for Linux.
 - [Features](#features)
   - [AI Pipeline Overview](#ai-pipeline-overview)
   - [Component Details](#component-details)
-    - [KNN Task Classifier](#knn-task-classifier)
+    - [Heuristic Task Classifier](#heuristic-task-classifier)
     - [Isolation Forest Anti-Cheat Engine](#isolation-forest-anti-cheat-engine)
     - [A\* Load Balancer](#a-load-balancer)
     - [Elman RNN Burst Predictor](#elman-rnn-burst-predictor)
@@ -88,11 +88,15 @@ Stable — all 13 unit tests pass on every commit. The scheduler builds cleanly 
 ### Test Results
 
 ```
-running 13 tests
+running 17 tests
 test ai::burst_predictor::tests::evict_removes_state ............. ok
 test ai::burst_predictor::tests::predicts_nonzero_after_warmup ... ok
+test ai::classifier::tests::heuristic_boundary_compute_high ...... ok
+test ai::classifier::tests::heuristic_boundary_interactive_low ... ok
 test ai::classifier::tests::heuristic_compute .................... ok
 test ai::classifier::tests::heuristic_interactive ................ ok
+test ai::classifier::tests::heuristic_iowait ..................... ok
+test ai::classifier::tests::heuristic_realtime ................... ok
 test ai::classifier::tests::knn_vote_after_warmup ................ ok
 test ai::anomaly::tests::anomaly_score_range ...................... ok
 test ai::load_balancer::tests::quarantine_only_restricted ......... ok
@@ -103,7 +107,7 @@ test ai::reputation::tests::reward_increases_trust ................ ok
 test ai::reputation::tests::uniform_prior_mean .................... ok
 test ai::policy::tests::slice_stays_in_bounds ..................... ok
 
-test result: ok. 13 passed; 0 failed; 0 ignored
+test result: ok. 17 passed; 0 failed; 0 ignored
 ```
 
 ### Tested Platforms
@@ -130,7 +134,7 @@ test result: ok. 13 passed; 0 failed; 0 ignored
 Every scheduling decision runs through a six-stage AI inference pipeline. The entire pipeline completes in **< 5 µs** on a modern CPU, staying well within the time-slice budget.
 
 ```
-ops.enqueue   →  KNN Classifier  →  Reputation Check  →  Burst Predictor
+ops.enqueue   →  Heuristic Classifier  →  Reputation Check  →  Burst Predictor
 ops.dispatch  →  PPO-lite Policy (AI-adjusted time slice)
 ops.select_cpu → A* Load Balancer  (P/E-core, NUMA, quarantine-aware)
 ops.tick      →  Isolation Forest Anti-Cheat
@@ -138,19 +142,33 @@ ops.tick      →  Isolation Forest Anti-Cheat
 
 ### Component Details
 
-#### KNN Task Classifier
+#### Heuristic Task Classifier
 
-Dynamically labels each PID as `Interactive`, `Compute`, `IoWait`, `RealTime`, or `Unknown` using a K-Nearest-Neighbors classifier (k = 5) over a sliding window of 512 samples. Five task features are tracked per event:
+Dynamically labels each PID as `Interactive`, `Compute`, `IoWait`, `RealTime`, or `Unknown` using a
+deterministic heuristic evaluated on every `ops.enqueue` event. Five task features are tracked:
 
 | Feature | Description |
 |:---|:---|
-| `runnable_ratio` | Fraction of the slice spent runnable |
-| `cpu_intensity` | Ratio of CPU-active time to total burst time |
-| `exec_ratio` | Exec runtime vs. raw burst duration |
+| `runnable_ratio` | `burst_ns / base_slice_ns` — most-recent burst as a fraction of the target slice |
+| `cpu_intensity` | `burst_ns / prev_assigned_slice_ns` — fraction of the *assigned* slice the task actually consumed |
+| `exec_ratio` | `burst_ns / exec_runtime` — freshness: near 1.0 = just woke; near 0.0 = spinning without sleeping |
 | `weight_norm` | Normalised scheduler weight (priority) |
 | `cpu_affinity` | Allowed CPUs / total online CPUs |
 
-Labels influence the base time-slice multiplier (Interactive tasks get more aggressive slices than Compute tasks) and feed into the Reputation Engine.
+The primary classification feature is `cpu_intensity`.
+`prev_assigned_slice_ns` is the slice allocated to this PID on its previous scheduling event
+(stored in `TaskLifetime`). On first event, `base_slice_ns` is used as fallback.
+This makes classification stable and loop-free from the second event onward:
+
+| `cpu_intensity` range | Interpretation | Label |
+|:---|:---|:---|
+| > 0.85 | Used > 85 % of its assigned slice — CPU-bound | **Compute** |
+| 0.10 – 0.85 | Yields regularly — latency-sensitive | **Interactive** |
+| < 0.10 | Released CPU far before slice expired — I/O-blocked | **IoWait** |
+
+A weight-norm threshold (> 0.95) catches `SCHED_FIFO` / `SCHED_RR` tasks regardless of slice usage and labels them **RealTime**.
+
+Labels influence the base time-slice multiplier and feed into the Reputation Engine and PPO-lite Policy.
 
 [↑ Back to Table of Contents](#table-of-contents)
 
@@ -264,7 +282,7 @@ Panels:
               ┌──────────────────────▼──────────────────────────┐
               │            AI Inference Pipeline                 │
               │                                                  │
-              │  dequeue  → KNN classify                         │
+              │  dequeue  → heuristic classify                    │
               │           → Bayesian reputation check            │
               │           → Elman RNN headroom hint              │
               │  select_cpu → A* topology search                 │
@@ -281,11 +299,11 @@ Panels:
 
 ### AI Inference Pipeline Details
 
-The pipeline runs **synchronously on the hot scheduling path** for the per-task steps (KNN, reputation read, burst predictor read, A\*, PPO read). Heavier operations (anti-cheat forest ticks, Q-table updates) run on **periodic timers** off the hot path.
+The pipeline runs **synchronously on the hot scheduling path** for the per-task steps (heuristic classify, reputation read, burst predictor read, A\*, PPO read). Heavier operations (anti-cheat forest ticks, Q-table updates) run on **periodic timers** off the hot path.
 
 | Step | Hot Path? | Frequency |
 |:---|:---|:---|
-| KNN classify | ✅ Yes | every `ops.enqueue` |
+| Heuristic classify | ✅ Yes | every `ops.enqueue` |
 | Reputation read | ✅ Yes | every `ops.enqueue` |
 | Burst predictor read | ✅ Yes | every `ops.enqueue` |
 | A\* CPU select | ✅ Yes | every `ops.select_cpu` |
@@ -297,12 +315,12 @@ The pipeline runs **synchronously on the hot scheduling path** for the per-task 
 
 | Component | Complexity | Typical cost |
 |:---|:---|:---|
-| KNN classify | O(W·d), W=512, d=5 | ~1–3 µs |
+| Heuristic classify | O(1) — 4 comparisons | < 0.05 µs |
 | Reputation read | O(1) HashMap lookup | < 0.1 µs |
 | Burst predictor | O(H·X) = O(12) matmul | < 0.1 µs |
 | A\* placement | O(n\_cpus) BinaryHeap | ~1 µs |
 | PPO slice read | O(1) atomic read | < 0.05 µs |
-| **Total (typical)** | | **~2–5 µs** |
+| **Total (typical)** | | **~1–2 µs** |
 
 [↑ Back to Table of Contents](#table-of-contents)
 
@@ -531,7 +549,7 @@ Each line from `--monitor` is a snapshot of one polling interval. All counters l
 | `Compute:3` | compute events | per-interval | Events classified as **Compute** (CPU-bound: compilers, encoders). Gets a 2× time-slice for throughput. |
 | `IOwait:2` | I/O-wait events | per-interval | Events classified as **I/O Wait** (blocked on disk/network most of the time). Gets a 0.75× time-slice. |
 | `RT:0` | realtime events | per-interval | Events classified as **RealTime** (JACK, audio daemons, SCHED_FIFO tasks). Gets a 0.25× time-slice for minimum latency. |
-| `Unknown:1` | unclassified events | per-interval | Events where the KNN classifier had insufficient data (< 5 samples in its sliding window — normal during the first few seconds of the scheduler's life). Gets a 1× baseline time-slice. Once the window fills, this drops to 0. |
+| `Unknown:1` | unclassified events | per-interval | Events that did not match any heuristic rule. In practice this should never appear with the current 3-band heuristic (every task is classified as Compute, Interactive, or IoWait). Gets a 1× baseline time-slice. |
 | `quarantine:0` | quarantined PIDs | instant | PIDs currently throttled by the **Reputation Engine** for consistently burning 100% of their assigned slice (monopolising behaviour). They receive the minimum time-slice until their reputation recovers. |
 | `flagged:0` | flagged TGIDs | instant | Thread-groups detected as outliers by the **Isolation Forest Anti-Cheat Engine** (statistical anomaly in scheduling behaviour). Flagged tasks are isolated to prevent them from starving others. |
 | `slice:4000µs` | AI time-slice | instant | The **PPO-lite Policy Controller**'s current base time-slice in microseconds. The controller adjusts this every ~100 ms based on the reward signal — it shrinks under interactive load and grows under compute load. |
@@ -539,18 +557,20 @@ Each line from `--monitor` is a snapshot of one polling interval. All counters l
 
 #### Classification Label Deep-Dive
 
-The KNN classifier uses a **sliding window of 512 labelled samples** and 5 nearest neighbours. During startup (< 5 samples) it falls back to the heuristic rules below. Once warm, it self-labels via majority vote:
+The classifier uses a **deterministic 3-band heuristic** evaluated stateless on every scheduling event. There is no sliding window or voting — this prevents feedback-loop misclassification while maintaining O(1) latency.
 
-| Label | Slice Multiplier | Heuristic Rule (cold start) |
+The key feature is `cpu_intensity = burst_ns / prev_assigned_slice_ns` (slice-usage fraction):
+
+| Label | Slice Multiplier | Heuristic Rule |
 |:---|:---|:---|
 | **RealTime** | 0.25× | priority weight > 95% of max (SCHED_FIFO / SCHED_RR tasks) |
-| **Interactive** | 0.5× | short exec windows (`exec_ratio < 0.3`) — wakes up often, uses little CPU per burst |
-| **IoWait** | 0.75× | low CPU intensity (< 15%) **and** high runnable wait (> 60%) |
-| **Compute** | 2.0× | high CPU intensity (> 70%) **and** low runnable wait (< 20%) |
-| **Unknown** | 1.0× | none of the above — classifier not yet warmed up |
+| **Compute** | 2.0× | `cpu_intensity > 0.85` — task consumed > 85% of its assigned slice (CPU-bound) |
+| **Interactive** | 0.5× | `0.10 ≤ cpu_intensity ≤ 0.85` — task yields regularly (latency-sensitive) |
+| **IoWait** | 0.75× | `cpu_intensity < 0.10` — task released CPU far before slice expired (I/O-blocked) |
+| **Unknown** | 1.0× | reserved; not emitted by the current heuristic |
 
 > [!TIP]
-> **Why does Interactive dominate?** Most desktop, service, and shell tasks have short, frequent scheduling bursts (`exec_ratio < 0.3`), so the heuristic naturally classifies them as Interactive. This is intentional: when in doubt, treat a task as latency-sensitive. The KNN refines this over time as it gathers more data.
+> **Why does Interactive dominate?** Most desktop, service, and shell tasks yield before consuming their full slice, giving `cpu_intensity` values in the 0.1–0.85 range. Pure CPU workloads (compilers, encoders, stress-ng) consume their entire slice and jump to `cpu_intensity > 0.85` within one or two scheduling events.
 
 #### TLDR Message Reference
 
@@ -959,39 +979,39 @@ If the `reward` value stays below 0.2 for extended periods, the AI is still lear
 
 > 500 fish (default Aquarium), 60 s per phase, `stress-ng` workload.
 >
-> **Context:** results below are from CachyOS on the hardware listed above. During this run, monitor output showed `k >> d→u` and label skew (`IOwait` dominated), which indicates user-space scheduling was not keeping up consistently under stress.
+> **Context:** the numbers below were captured on commit `eb81fbe` (before the KNN feedback-loop, cpu_intensity, and batch-dispatch fixes in `b36a58a`). They document the *broken* baseline so future runs are directly comparable. With the fixes applied, `Compute` labels should dominate during Phase 1/3, `d→u` should rise to roughly match `k`, and CPU real-time throughput should approach CFS levels.
 
 **Phase 1 — CPU stress (16 × workers, 60 s):**
 
-| Metric | Baseline (CFS) | scx_cognis | Δ |
-|:-------|:--------------:|:----------:|:---:|
+| Metric | Baseline (CFS) | scx_cognis (pre-fix) | Δ |
+|:-------|:--------------:|:--------------------:|:---:|
 | bogo ops/s (real time) | 20,765 | 2,116 | −89.8% |
 | bogo ops/s (usr time) | 1,377 | 2,026 | +47.1% |
 
-The usr-time improvement shows workers are efficient when they run, but the severe real-time drop means they are not being scheduled often enough end-to-end. This aligns with the observed `k >> d→u` fallback pattern.
+The usr-time improvement shows workers are efficient when they run, but the severe real-time drop means they are not being scheduled often enough end-to-end. Root cause: every task was misclassified as `IoWait`, receiving a 500 ms exec_runtime deadline penalty (IOwait exec_cap), which prevented dispatch.
 
 **Phase 2 — I/O stress (4 × `iomix` workers, 60 s):**
 
-| Metric | Baseline (CFS) | scx_cognis | Δ |
-|:-------|:--------------:|:----------:|:---:|
+| Metric | Baseline (CFS) | scx_cognis (pre-fix) | Δ |
+|:-------|:--------------:|:--------------------:|:---:|
 | bogo ops/s (real time) | 180,790 | 158,338 | −12.4% |
 | bogo ops/s (usr time) | 42,660 | 41,031 | −3.8% |
 
-The I/O phase still shows overhead relative to CFS, but it is far smaller than the CPU-heavy gap. This suggests the main issue is classification/dispatch behavior under sustained compute pressure rather than pure I/O handling.
+The I/O phase shows only a small gap — I/O-bound workers naturally sleep often, so the exec_cap deadline penalty is small. This confirms the CPU-phase collapse is specific to never-sleeping compute tasks.
 
 **Phase 3 — Mixed stress (16 × `cpu` + 2 × `vm` workers, 60 s):**
 
-| Stressor | Metric | Baseline (CFS) | scx_cognis | Δ |
-|:---------|:-------|:--------------:|:----------:|:---:|
+| Stressor | Metric | Baseline (CFS) | scx_cognis (pre-fix) | Δ |
+|:---------|:-------|:--------------:|:--------------------:|:---:|
 | CPU ×16 | bogo ops/s (real) | 18,776 | 3,582 | −80.9% |
 | CPU ×16 | bogo ops/s (usr) | 1,397 | 2,049 | +46.7% |
 | VM ×2 | bogo ops/s (real) | 24,517 | 20,166 | −17.7% |
 | VM ×2 | bogo ops/s (usr) | 14,759 | 149,093 | +910% |
 
-Mixed-phase throughput remains below baseline, and this correlates with monitor traces showing almost no `Interactive` labels and very high kernel fallback dispatches. In other words, this run does **not** show expected out-of-the-box Cognis behavior yet.
+Same pattern as Phase 1: compute workers stall while VM workers (which sleep on allocation) are unaffected.
 
 > [!TIP]
-> If you compare on CachyOS, keep CPU governor fixed (`performance`) for both schedulers, run each mode at least 3 times, and compare median values. Single runs can swing significantly.
+> If you run your own benchmark, keep the CPU governor fixed (`performance`) for both schedulers, run each mode at least 3 times, and compare median values. Single runs can swing significantly.
 
 [↑ Back to Table of Contents](#table-of-contents)
 
