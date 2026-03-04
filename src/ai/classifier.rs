@@ -35,14 +35,25 @@ impl TaskLabel {
     /// Returns the time-slice multiplier hint for this label (relative to base slice).
     ///
     /// Values < 1.0 mean shorter slices (better for interactive).
-    /// Values > 1.0 mean longer slices (better for throughput).
+    /// Values = 1.0 are neutral (throughput parity).
+    ///
+    /// CPU-bound (Compute) tasks are intentionally kept at 1.0 — NOT given a
+    /// longer slice.  Giving Compute tasks a 2× slice was the single biggest
+    /// interactivity regression: 16 stress-ng workers × 2× slice = no CPU
+    /// left for the browser.  These tasks are already deprioritised by their
+    /// label_priority=0 position at the back of the BTreeSet; doubling their
+    /// slice on top of that compounds the starvation.
+    ///
+    /// Production schedulers (scx_rustland, scx_flash) do not apply per-label
+    /// slice multipliers for CPU-bound tasks.  They rely on vruntime fairness
+    /// and deadline ordering, which we already have.
     pub fn slice_multiplier(self) -> f64 {
         match self {
             TaskLabel::Interactive => 0.5,
-            TaskLabel::RealTime => 0.25,
-            TaskLabel::IoWait => 0.75,
-            TaskLabel::Compute => 2.0,
-            TaskLabel::Unknown => 1.0,
+            TaskLabel::RealTime    => 0.25,
+            TaskLabel::IoWait      => 0.75,
+            TaskLabel::Compute     => 1.0,   // was 2.0 — see comment above
+            TaskLabel::Unknown     => 1.0,
         }
     }
 

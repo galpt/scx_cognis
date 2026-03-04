@@ -184,12 +184,16 @@ impl ReputationEngine {
 
     /// Time-slice multiplier derived from trust score.
     ///
-    /// Trusted tasks get full or boosted slices.
-    /// Quarantined tasks get shrunk slices.
+    /// Trusted tasks (t = 1.0) receive a 1.0× multiplier — no boost.
+    /// Adversarial tasks (t ≈ 0) receive a 0.25× multiplier (quarantine sand-
+    /// boxing).  Prior to this fix the range was [0.25, 1.5], boosting every
+    /// new task by 1.5× on top of the label multiplier.  Combined with the
+    /// Compute 2× multiplier and PPO 4× inflation that produced slices of
+    /// 240 ms (clamped to 160 ms) for ordinary stress-ng workers.
     pub fn slice_factor(&self, pid: i32) -> f64 {
         let t = self.trust_score(pid);
-        // Map trust (0..1) → slice_factor (0.25 .. 1.5).
-        0.25 + t * 1.25
+        // [0.25, 1.0]: trusted → 1.0×, adversarial → 0.25×.
+        0.25 + t * 0.75
     }
 
     /// Evict a PID's prior (called after a process fully exits).

@@ -223,7 +223,7 @@ Trust score E[T] = α / (α + β). Tasks below the 0.35 threshold are quarantine
 
 #### PPO-lite Policy Controller
 
-Continuously tunes the global base time-slice using tabular Q-learning (TABLE_SIZE = 625 = 5⁴ states, 3 actions: shrink × 0.80 | keep × 1.00 | grow × 1.25). The four-dimensional state is:
+Continuously tunes the global base time-slice using tabular Q-learning (TABLE_SIZE = 625 = 5⁴ states, 3 actions: shrink × 0.80 | keep × 1.00 | grow × 1.15). The four-dimensional state is:
 
 | Dimension | Bins | Description |
 |:---|:---|:---|
@@ -235,8 +235,11 @@ Continuously tunes the global base time-slice using tabular Q-learning (TABLE_SI
 The reward signal is:
 
 ```
-R = 0.4 × throughput − 0.4 × latency − 0.2 × congestion
+R = (interactive_frac × load_norm) × 0.7 − congestion × 0.2 − latency × 0.1
+  clamped to [−1.0, +1.0]
 ```
+
+where `interactive_frac` is the fraction of currently-queued Interactive tasks and `load_norm` is CPU utilisation (0–1). This produces a meaningful gradient: the policy learns to **shrink** when Compute tasks dominate (low `interactive_frac`) and **keep/grow** only when Interactive tasks are well-served.
 
 ε-greedy exploration decays from 0.30 → 0.02 with each update. The current slice is published to an `AtomicU64` so the dispatch hot-path reads it without locking.
 
@@ -333,15 +336,19 @@ If the user-space daemon crashes or stops responding, `scx_rustland_core`'s buil
 
 The PPO-lite controller optimises the global base time-slice using the following reward signal computed every 250 ms:
 
-$$R = w_1 \cdot \text{Throughput} - w_2 \cdot \text{Latency} - w_3 \cdot \text{Congestion}$$
+$$R = (\text{interactive\_frac} \times \text{load\_norm}) \times 0.7 - \text{congestion} \times 0.2 - \text{latency} \times 0.1$$
 
-| Weight | Default | Controls |
+Clamped to **[−1.0, +1.0]**.
+
+| Term | Weight | Description |
 |:---|:---|:---|
-| w₁ | 0.4 | Reward for high task throughput |
-| w₂ | 0.4 | Penalty for scheduling latency |
-| w₃ | 0.2 | Penalty for scheduler queue congestion |
+| `interactive_frac × load_norm` | **0.7** | Reward for serving Interactive tasks under load |
+| `congestion` | 0.2 | Penalty for scheduler queue congestion |
+| `latency` | 0.1 | Penalty for estimated scheduling latency |
 
-The slice action space is: { shrink × 0.80, keep × 1.00, grow × 1.25 }.
+The slice action space is: { shrink × 0.80, keep × 1.00, grow × **1.15** }.
+
+The PPO controller's maximum output is capped at `base_slice_ns` (the user's `--slice-us` setting), preventing any inflation beyond the configured budget.
 
 [↑ Back to Table of Contents](#table-of-contents)
 
@@ -352,8 +359,8 @@ For each dispatched task, the final slice is:
 ```
 slice = base_slice_ns
       × ai_policy_factor        (from PPO-lite AtomicU64)
-      × label_multiplier        (Interactive=0.5, Compute=2.0, IoWait=0.75, RT=0.25)
-      × reputation_factor       (Bayesian trust ∈ [0.5, 1.5])
+      × label_multiplier        (Interactive=0.5, Compute=1.0, IoWait=0.75, RT=0.25)
+      × reputation_factor       (Bayesian trust ∈ [0.25, 1.0])
       × (weight / 100)          (scheduler priority)
       clamped to [slice_ns_min, base_slice × 8]
 ```
@@ -474,7 +481,7 @@ Usage: scx_cognis [OPTIONS]
 
 Options:
   -s, --slice-us <SLICE_US>
-          Base scheduling slice duration in microseconds [default: 20000]
+          Base scheduling slice duration in microseconds [default: 5000]
   -S, --slice-us-min <SLICE_US_MIN>
           Minimum scheduling slice duration in microseconds [default: 1000]
   -l, --percpu-local
@@ -552,7 +559,7 @@ Each line from `--monitor` is a snapshot of one polling interval. All counters l
 | `quarantine:0` | quarantined PIDs | instant | PIDs currently throttled by the **Reputation Engine** for consistently burning 100% of their assigned slice (monopolising behaviour). They receive the minimum time-slice until their reputation recovers. |
 | `flagged:0` | flagged TGIDs | instant | Thread-groups detected as outliers by the **Isolation Forest Anti-Cheat Engine** (statistical anomaly in scheduling behaviour). Flagged tasks are isolated to prevent them from starving others. |
 | `slice:4000µs` | AI time-slice | instant | The **PPO-lite Policy Controller**'s current base time-slice in microseconds. The controller adjusts this every ~100 ms based on the reward signal — it shrinks under interactive load and grows under compute load. |
-| `reward:0.42` | reward EMA | instant | Exponential moving average of the scheduler's **reward function**: $R = w_1 \cdot \text{Throughput} - w_2 \cdot \text{Latency} - w_3 \cdot \text{Congestion}$. Values near **1.0** are ideal; near **0** means the scheduler is under stress; negative values are extremely rare and indicate sustained congestion. |
+| `reward:0.42` | reward EMA | instant | Exponential moving average of the scheduler's **reward function**: $R = (\text{interactive\_frac} \times \text{load\_norm}) \times 0.7 - \text{congestion} \times 0.2 - \text{latency} \times 0.1$. Values near **1.0** are ideal (Interactive tasks served under load); near **0** means mostly Compute tasks dominating; negative values indicate sustained high congestion. |
 
 #### Classification Label Deep-Dive
 

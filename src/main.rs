@@ -71,7 +71,7 @@ const NSEC_PER_SEC: u64 = 1_000_000_000;
 #[derive(Debug, Parser)]
 struct Opts {
     /// Base scheduling slice duration in microseconds (PPO-lite adjusts this dynamically).
-    #[clap(short = 's', long, default_value = "20000")]
+    #[clap(short = 's', long, default_value = "5000")]
     slice_us: u64,
 
     /// Minimum scheduling slice duration in microseconds.
@@ -650,7 +650,6 @@ impl<'a> Scheduler<'a> {
             compute_frac,
             // Normalise by 10 ms.
             latency_p99_norm: (avg_inference_us / 10_000.0).min(1.0),
-            dispatch_rate: *self.bpf.nr_user_dispatches_mut() as f64,
             congestion_rate: *self.bpf.nr_sched_congested_mut() as f64,
         };
         self.policy.update(&sig);

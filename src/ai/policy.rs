@@ -35,7 +35,11 @@ enum Action {
 const N_ACTIONS: usize = 3;
 
 // Adjustment ratios per action (applied to current slice).
-const ACTION_RATIO: [f64; N_ACTIONS] = [0.80, 1.00, 1.25];
+// Grow is kept in the action space so the Q-table can choose it when the
+// system is I/O-bound and the slice is already at its minimum.  However,
+// the hard cap (max_slice = base_slice_ns) prevents it from ever inflating
+// above the user's chosen base — growth only cancels a previous shrink.
+const ACTION_RATIO: [f64; N_ACTIONS] = [0.80, 1.00, 1.15];
 
 // ── State discretisation ─────────────────────────────────────────────────────
 
@@ -118,27 +122,6 @@ impl QTable {
     }
 }
 
-// ── Reward weights ────────────────────────────────────────────────────────────
-
-pub struct RewardWeights {
-    /// How much we care about throughput (dispatch rate).
-    pub w_throughput: f64,
-    /// How much we penalise scheduling latency.
-    pub w_latency: f64,
-    /// How much we reward low congestion.
-    pub w_congestion: f64,
-}
-
-impl Default for RewardWeights {
-    fn default() -> Self {
-        Self {
-            w_throughput: 0.4,
-            w_latency: 0.4,
-            w_congestion: 0.2,
-        }
-    }
-}
-
 // ── Observable signal from the scheduler ─────────────────────────────────────
 
 /// Snapshot of observable metrics passed to the policy on each update.
@@ -152,8 +135,6 @@ pub struct SchedulerSignal {
     pub compute_frac: f64,
     /// P99 scheduling latency EMA (ns), normalised to [0, 1] by dividing by 10 ms.
     pub latency_p99_norm: f64,
-    /// Number of user-space dispatches per second (raw).
-    pub dispatch_rate: f64,
     /// Number of congestion events per second.
     pub congestion_rate: f64,
 }
@@ -166,7 +147,6 @@ pub struct SchedulerSignal {
 /// scheduling loop reads atomically.
 pub struct PolicyController {
     q: QTable,
-    weights: RewardWeights,
     /// ε-greedy exploration rate (decays over time).
     epsilon: f64,
     /// Learning rate.
@@ -192,7 +172,6 @@ impl PolicyController {
         let shared = Arc::new(AtomicU64::new(base_slice_ns));
         Self {
             q: QTable::new(),
-            weights: RewardWeights::default(),
             epsilon: 0.15,
             alpha: 0.01,
             gamma: 0.95,
@@ -249,7 +228,13 @@ impl PolicyController {
         // Apply action to current slice.
         let ratio = ACTION_RATIO[action as usize];
         let min_slice = self.base_slice_ns / 4;
-        let max_slice = self.base_slice_ns * 4;
+        // Hard cap at base_slice_ns.  The PPO may only CONTRACT the slice for
+        // interactive-heavy phases, never inflate above the user's --slice-us.
+        // Benchmark analysis: policy inflated to 4× base (80 ms), then the
+        // Compute 2× multiplier pushed actual Compute slices to 160 ms —
+        // completely starving interactive tasks.  Production schedulers
+        // (scx_rustland, scx_flash) never inflate above their configured base.
+        let max_slice = self.base_slice_ns;
         let new_slice = ((self.current_slice_ns as f64 * ratio) as u64).clamp(min_slice, max_slice);
 
         self.current_slice_ns = new_slice;
@@ -262,16 +247,33 @@ impl PolicyController {
     }
 
     /// Compute the reward signal from the current scheduler state.
+    ///
+    /// # Design rationale
+    ///
+    /// The original reward `dispatch_rate / 1_000_000 × 0.4` produced values
+    /// of ~0.0002 (573 dispatches/s × 0.4/1M), which is so close to zero that
+    /// Q-table updates had no gradient and the policy random-walked to the
+    /// max-slice corner.  The fix: reward interactivity directly.
+    ///
+    /// Reward signal (range ≈ −0.3 … +0.7):
+    ///
+    ///   +  interactive_fraction × load_norm  ← primary goal: keep interactive
+    ///                                           tasks running under load
+    ///   −  congestion_rate / 100             ← penalise dispatch backlog
+    ///   −  latency_p99_norm                  ← penalise inference overhead
     fn compute_reward(&self, sig: &SchedulerSignal) -> f64 {
-        let w = &self.weights;
-        // Throughput term: more dispatches = better.
-        let throughput_reward = (sig.dispatch_rate / 1_000_000.0).min(1.0) * w.w_throughput;
-        // Latency term: lower latency = better (invert).
-        let latency_penalty = sig.latency_p99_norm * w.w_latency;
-        // Congestion term: lower congestion = better.
-        let congestion_penalty = (sig.congestion_rate / 1000.0).min(1.0) * w.w_congestion;
+        // Primary term: are interactive tasks actually getting CPU time?
+        // Multiplied by load_norm so an idle system (load≈0) contributes ~0
+        // — the policy should not try to optimise when nothing is running.
+        let interactivity = sig.interactive_frac * sig.load_norm.min(1.0);
 
-        throughput_reward - latency_penalty - congestion_penalty
+        // Congestion: high queue depth means scheduler is falling behind.
+        let congestion = (sig.congestion_rate / 100.0).min(1.0);
+
+        // Latency: scheduling overhead eating into the slice budget.
+        let latency = sig.latency_p99_norm;
+
+        (interactivity * 0.7 - congestion * 0.2 - latency * 0.1).clamp(-1.0, 1.0)
     }
 
     /// Read the current slice recommendation from the shared atomic.
@@ -304,14 +306,14 @@ mod tests {
             interactive_frac: 0.3,
             compute_frac: 0.5,
             latency_p99_norm: 0.6,
-            dispatch_rate: 50_000.0,
             congestion_rate: 100.0,
         };
         for _ in 0..1000 {
             ctrl.update(&sig);
         }
         let slice = ctrl.read_slice_ns();
+        // Min is base/4 = 5 ms; max is base = 20 ms (no inflation allowed).
         assert!(slice >= 20_000_000 / 4);
-        assert!(slice <= 20_000_000 * 4);
+        assert!(slice <= 20_000_000);
     }
 }
