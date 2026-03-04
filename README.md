@@ -1,8 +1,8 @@
 # scx_cognis
 
-An intelligent, AI-driven CPU scheduler for Linux.
+A Linux CPU scheduler with adaptive scheduling policy, built on established statistical and machine-learning algorithms.
 
-`scx_cognis` is a production-ready Linux CPU scheduler built on the [`sched_ext`](https://www.kernel.org/doc/html/latest/scheduler/sched-ext.html) framework and [`scx_rustland_core`](https://crates.io/crates/scx_rustland_core). It replaces static heuristics with a live **AI inference pipeline** that runs entirely in user-space Rust — with a sub-5 µs total inference latency target per scheduling event.
+`scx_cognis` is a Linux CPU scheduler built on the [`sched_ext`](https://www.kernel.org/doc/html/latest/scheduler/sched-ext.html) framework and [`scx_rustland_core`](https://crates.io/crates/scx_rustland_core). It combines a deterministic task classifier, Bayesian reputation tracking, tabular Q-learning, Isolation Forest anomaly detection, and an Elman RNN burst predictor — all running in user-space Rust with a sub-5 µs per-event inference target.
 
 > "Cognis" (from Latin *cognōscere*) — to learn, to know.
 
@@ -22,7 +22,7 @@ An intelligent, AI-driven CPU scheduler for Linux.
     - [A\* Load Balancer](#a-load-balancer)
     - [Elman RNN Burst Predictor](#elman-rnn-burst-predictor)
     - [Bayesian Reputation Engine](#bayesian-reputation-engine)
-    - [PPO-lite Policy Controller](#ppo-lite-policy-controller)
+    - [Q-learning Policy Controller](#q-learning-policy-controller)
     - [ratatui TUI Dashboard](#ratatui-tui-dashboard)
 - [Design Notes](#design-notes)
   - [Architecture](#architecture)
@@ -128,13 +128,16 @@ test result: ok. 16 passed; 0 failed; 0 ignored
 
 ## Features
 
+> [!TIP]
+> **What to expect from scx_cognis:** cognis is designed to keep interactive tasks (UI rendering, audio, input) responsive even when the system is under heavy CPU or I/O load. It does this by classifying tasks as Interactive, Compute, IoWait, or RealTime on every scheduling event and giving short, high-frequency slices to Interactive tasks (0.5× base) so they are never queued behind long-running CPU-bound workers. Fair-share throughput for batch workloads is preserved — just not maximised. If your goal is raw CPU throughput (compilers, encoders, benchmarks), the default EEVDF scheduler wins; cognis's advantage is consistent low scheduling latency for tasks that wake up, do a little work, and sleep again.
+
 ### AI Pipeline Overview
 
-Every scheduling decision runs through a six-stage AI inference pipeline. The entire pipeline completes in **< 5 µs** on a modern CPU, staying well within the time-slice budget.
+Every scheduling decision passes through a multi-stage inference pipeline. The entire pipeline completes in **< 5 µs** on a modern CPU, staying well within the time-slice budget.
 
 ```
 ops.enqueue   →  Heuristic Classifier  →  Reputation Check  →  Burst Predictor
-ops.dispatch  →  PPO-lite Policy (AI-adjusted time slice)
+ops.dispatch  →  Q-learning Policy (adaptive time slice)
 ops.select_cpu → A* Load Balancer  (P/E-core, NUMA, quarantine-aware)
 ops.tick      →  Isolation Forest Anti-Cheat
 ```
@@ -167,7 +170,7 @@ This makes classification stable and loop-free from the second event onward:
 
 A weight-norm threshold (> 0.95) catches `SCHED_FIFO` / `SCHED_RR` tasks regardless of slice usage and labels them **RealTime**.
 
-Labels influence the base time-slice multiplier and feed into the Reputation Engine and PPO-lite Policy.
+Labels influence the base time-slice multiplier and feed into the Reputation Engine and Q-learning Policy.
 
 [↑ Back to Table of Contents](#table-of-contents)
 
@@ -204,7 +207,7 @@ Falls back to `RL_CPU_ANY` (kernel-side placement) when no CPU is a clear winner
 
 #### Elman RNN Burst Predictor
 
-Predicts each PID's next CPU burst duration using a compact Elman RNN: H = 4 hidden units, X = 3 inputs (`burst_norm`, `exec_ratio`, `cpu_intensity`). Weights are hardcoded compile-time constants; the model runs in O(H·X) = O(12) multiplications. Per-PID hidden state is maintained in a `HashMap<i32, PidState>`.
+Predicts each PID's next CPU burst duration using a compact Elman RNN: H = 4 hidden units, X = 3 inputs (`burst_norm`, `exec_ratio`, `cpu_intensity`). The architecture is a standard single-layer Elman RNN (`h[t] = tanh(W_h·h[t-1] + W_x·x[t] + b)`); weights are compile-time constants derived from offline analysis of synthetic scheduler traces and have not been validated on real production workloads. The forward pass runs in O(H·X) = O(12) multiplications with per-PID hidden state in a `HashMap<i32, PidState>`.
 
 Predictions are EMA-smoothed (α = 0.15) to reduce jitter. If the predictor forecasts a short burst, the scheduler preemptively shortens the assigned slice, reclaiming CPU time for other tasks.
 
@@ -221,7 +224,7 @@ Trust score E[T] = α / (α + β). Tasks below the 0.35 threshold are quarantine
 
 [↑ Back to Table of Contents](#table-of-contents)
 
-#### PPO-lite Policy Controller
+#### Q-learning Policy Controller
 
 Continuously tunes the global base time-slice using tabular Q-learning (TABLE_SIZE = 625 = 5⁴ states, 3 actions: shrink × 0.80 | keep × 1.00 | grow × 1.15). The four-dimensional state is:
 
@@ -258,7 +261,7 @@ Panels:
 | Header | Scheduler name, uptime, kernel version |
 | Overview | Running / queued / scheduled task counts, CPU count |
 | Classification | Live bar gauges for Interactive / Compute / IoWait / RealTime |
-| AI Policy | Current slice, reward EMA, ε value |
+| Q-learning Policy | Current slice, reward EMA, ε value |
 | Latency Sparkline | Rolling 120-sample chart of average per-event inference (µs) |
 | Wall of Shame | Top 10 quarantined or anti-cheat-flagged PIDs |
 
@@ -288,7 +291,7 @@ Panels:
               │           → Bayesian reputation check            │
               │           → Elman RNN headroom hint              │
               │  select_cpu → A* topology search                 │
-              │  dispatch → PPO-lite time-slice read             │
+              │  dispatch → Q-learning policy slice read         │
               │  tick     → Isolation Forest anti-cheat          │
               └──────────────────────────────────────────────────┘
                                      │
@@ -301,7 +304,7 @@ Panels:
 
 ### AI Inference Pipeline Details
 
-The pipeline runs **synchronously on the hot scheduling path** for the per-task steps (heuristic classify, reputation read, burst predictor read, A\*, PPO read). Heavier operations (anti-cheat forest ticks, Q-table updates) run on **periodic timers** off the hot path.
+The pipeline runs **synchronously on the hot scheduling path** for the per-task steps (heuristic classify, reputation read, burst predictor read, A\*, Q-learning slice read). Heavier operations (anti-cheat forest ticks, Q-table updates) run on **periodic timers** off the hot path.
 
 | Step | Hot Path? | Frequency |
 |:---|:---|:---|
@@ -309,9 +312,9 @@ The pipeline runs **synchronously on the hot scheduling path** for the per-task 
 | Reputation read | ✅ Yes | every `ops.enqueue` |
 | Burst predictor read | ✅ Yes | every `ops.enqueue` |
 | A\* CPU select | ✅ Yes | every `ops.select_cpu` |
-| PPO slice read | ✅ Yes | every `ops.dispatch` (atomic read) |
+| Q-learning slice read | ✅ Yes | every `ops.dispatch` (atomic read) |
 | Anti-cheat tick | ❌ No | every 100 ms |
-| Q-table update (PPO) | ❌ No | every 250 ms |
+| Q-table update | ❌ No | every 250 ms |
 
 ### Latency Budget
 
@@ -321,7 +324,7 @@ The pipeline runs **synchronously on the hot scheduling path** for the per-task 
 | Reputation read | O(1) HashMap lookup | < 0.1 µs |
 | Burst predictor | O(H·X) = O(12) matmul | < 0.1 µs |
 | A\* placement | O(n\_cpus) BinaryHeap | ~1 µs |
-| PPO slice read | O(1) atomic read | < 0.05 µs |
+| Q-learning slice read | O(1) atomic read | < 0.05 µs |
 | **Total (typical)** | | **~1–2 µs** |
 
 [↑ Back to Table of Contents](#table-of-contents)
@@ -334,7 +337,7 @@ If the user-space daemon crashes or stops responding, `scx_rustland_core`'s buil
 
 ### Reward Function
 
-The PPO-lite controller optimises the global base time-slice using the following reward signal computed every 250 ms:
+The Q-learning controller optimises the global base time-slice using the following reward signal computed every 250 ms:
 
 $$R = (\text{interactive\_frac} \times \text{load\_norm}) \times 0.7 - \text{congestion} \times 0.2 - \text{latency} \times 0.1$$
 
@@ -348,7 +351,7 @@ Clamped to **[−1.0, +1.0]**.
 
 The slice action space is: { shrink × 0.80, keep × 1.00, grow × **1.15** }.
 
-The PPO controller's maximum output is capped at `base_slice_ns` (the user's `--slice-us` setting), preventing any inflation beyond the configured budget.
+The Q-learning controller's maximum output is capped at `base_slice_ns` (the user's `--slice-us` setting), preventing any inflation beyond the configured budget.
 
 [↑ Back to Table of Contents](#table-of-contents)
 
@@ -358,7 +361,7 @@ For each dispatched task, the final slice is:
 
 ```
 slice = base_slice_ns
-      × ai_policy_factor        (from PPO-lite AtomicU64)
+      × ai_policy_factor        (from Q-learning policy AtomicU64)
       × label_multiplier        (Interactive=0.5, Compute=1.0, IoWait=0.75, RT=0.25)
       × reputation_factor       (Bayesian trust ∈ [0.25, 1.0])
       × (weight / 100)          (scheduler priority)
@@ -558,7 +561,7 @@ Each line from `--monitor` is a snapshot of one polling interval. All counters l
 | `Unknown:1` | unclassified events | per-interval | Events that did not match any heuristic rule. In practice this should never appear with the current 3-band heuristic (every task is classified as Compute, Interactive, or IoWait). Gets a 1× baseline time-slice. |
 | `quarantine:0` | quarantined PIDs | instant | PIDs currently throttled by the **Reputation Engine** for consistently burning 100% of their assigned slice (monopolising behaviour). They receive the minimum time-slice until their reputation recovers. |
 | `flagged:0` | flagged TGIDs | instant | Thread-groups detected as outliers by the **Isolation Forest Anti-Cheat Engine** (statistical anomaly in scheduling behaviour). Flagged tasks are isolated to prevent them from starving others. |
-| `slice:4000µs` | AI time-slice | instant | The **PPO-lite Policy Controller**'s current base time-slice in microseconds. The controller adjusts this every ~100 ms based on the reward signal — it shrinks under interactive load and grows under compute load. |
+| `slice:4000µs` | policy time-slice | instant | The **Q-learning Policy Controller**'s current base time-slice in microseconds. The controller adjusts this every ~250 ms based on the reward signal — it shrinks when Interactive tasks are well-served and grows when the system is I/O-bound. |
 | `reward:0.42` | reward EMA | instant | Exponential moving average of the scheduler's **reward function**: $R = (\text{interactive\_frac} \times \text{load\_norm}) \times 0.7 - \text{congestion} \times 0.2 - \text{latency} \times 0.1$. Values near **1.0** are ideal (Interactive tasks served under load); near **0** means mostly Compute tasks dominating; negative values indicate sustained high congestion. |
 
 #### Classification Label Deep-Dive
@@ -887,7 +890,7 @@ Create `/etc/systemd/system/scx_cognis.service`:
 
 ```ini
 [Unit]
-Description=scx_cognis AI-driven CPU scheduler
+Description=scx_cognis adaptive CPU scheduler
 Documentation=https://github.com/galpt/scx_cognis
 After=local-fs.target
 ConditionKernelVersion=>=6.12
@@ -1025,7 +1028,7 @@ Same pattern as Phase 1: compute workers stall while VM workers (which sleep on 
 
 ## Limitations and Next Steps
 
-- **Reward signal is estimated** — scheduling latency is derived from inference timestamps rather than a true per-task P99 measurement. A `BPF_MAP_TYPE_RINGBUF` exporting precise per-task exit latencies would improve the PPO reward signal significantly.
+- **Reward signal is estimated** — scheduling latency is derived from inference timestamps rather than a true per-task P99 measurement. A `BPF_MAP_TYPE_RINGBUF` exporting precise per-task exit latencies would improve the Q-learning reward signal significantly.
 - **Elman RNN vs. true LSTM** — the burst predictor uses a small Elman RNN (H=4) with hardcoded weights for latency reasons. A true LSTM using `burn` or `onnxruntime-rs` would provide better predictions at the cost of higher inference latency.
 - **Task exit hook is heuristic** — reputation updates are triggered by a lifecycle heuristic (stale lifetime entries) rather than a BPF ringbuf exit event. A dedicated BPF program exporting `task_dead` events would make this precise.
 

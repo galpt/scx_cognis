@@ -8,7 +8,7 @@
 //
 //   ┌─────────────────────────────────────────────────────────────────┐
 //   │  ops.enqueue  → Heuristic classifier + Reputation check          │
-//   │  ops.dispatch → PPO-lite policy (AI-adjusted time slice)        │
+//   │  ops.dispatch → Q-learning policy (adaptive time slice)           │
 //   │  ops.select_cpu → A* load balancer (P/E-core aware)             │
 //   │  ops.tick     → Isolation Forest anti-cheat                     │
 //   │  ops.exit     → Bayesian reputation update                      │
@@ -66,11 +66,11 @@ const NSEC_PER_SEC: u64 = 1_000_000_000;
 ///
 /// scx_cognis uses an ensemble of AI algorithms to make scheduling decisions:
 /// heuristic task classification, Isolation Forest anti-cheat, A* CPU placement,
-/// LSTM-lite burst prediction, Bayesian reputation tracking, and a PPO-lite
+/// Elman-RNN burst prediction, Bayesian reputation tracking, and a tabular Q-learning
 /// policy controller — all with a sub-10µs inference latency target.
 #[derive(Debug, Parser)]
 struct Opts {
-    /// Base scheduling slice duration in microseconds (PPO-lite adjusts this dynamically).
+    /// Base scheduling slice duration in microseconds (Q-learning policy adjusts this dynamically).
     #[clap(short = 's', long, default_value = "5000")]
     slice_us: u64,
 
@@ -447,7 +447,7 @@ impl<'a> Scheduler<'a> {
         // Burst predictor — read prediction for this PID (updated on exit path).
         let predicted_burst = self.burst_pred.prediction_for(task.pid);
 
-        // PPO-adjusted base slice.
+        // Q-learning-adjusted base slice.
         let ai_slice = self.policy.read_slice_ns();
 
         // Final time-slice:
@@ -624,7 +624,7 @@ impl<'a> Scheduler<'a> {
         }
     }
 
-    /// PPO policy update (every 250 ms).
+    /// Q-learning policy update (every 250 ms).
     fn tick_policy(&mut self) {
         if self.last_policy_tick.elapsed() < Duration::from_millis(250) {
             return;

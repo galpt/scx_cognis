@@ -6,7 +6,7 @@
 // Renders four panels:
 //   1. System overview (running/queued tasks, CPUs, slice).
 //   2. Task classification breakdown (interactive/compute/io/rt).
-//   3. AI policy state (PPO reward EMA, predicted vs actual burst).
+//   3. AI policy state (Q-learning reward EMA, predicted vs actual burst).
 //   4. Reputation "Wall of Shame" — flagged/quarantined processes.
 
 use std::collections::VecDeque;
@@ -254,11 +254,11 @@ fn draw_ai_policy(f: &mut Frame, area: Rect, state: &DashboardState) {
 
     let items: Vec<Line> = vec![
         Line::from(vec![
-            Span::raw("  PPO Reward EMA:   "),
+            Span::raw("  Q-learning Reward: "),
             Span::styled(format!("{:+.4}", reward), Style::default().fg(reward_color)),
         ]),
         Line::from(format!(
-            "  AI Time Slice:    {}µs  (base + PPO adjustment)",
+            "  AI Time Slice:    {}µs  (base + Q-learning adjustment)",
             state.metrics.ai_slice_us
         )),
         Line::from(format!("  Inference:        {:.2}µs", state.inference_us)),
@@ -279,7 +279,7 @@ fn draw_ai_policy(f: &mut Frame, area: Rect, state: &DashboardState) {
         ]),
     ];
     let block = Block::default().borders(Borders::ALL).title(Span::styled(
-        " AI Policy (PPO-lite) ",
+        " Q-learning Policy ",
         Style::default()
             .fg(Color::Yellow)
             .add_modifier(Modifier::BOLD),

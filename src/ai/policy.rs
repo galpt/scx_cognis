@@ -1,18 +1,19 @@
 // Copyright (c) scx_cognis contributors
 // SPDX-License-Identifier: GPL-2.0-only
 //
-// AI Module: PPO-lite Policy Controller
+// AI Module: Q-learning Policy Controller
 //
-// Implements a simplified Proximal Policy Optimisation-inspired controller
-// that dynamically adjusts the global time-slice parameter to maximise a
+// Implements a tabular Q-learning reinforcement learning controller that
+// dynamically adjusts the global time-slice parameter to maximise a
 // composite reward signal:
 //
-//   R = w1 * fps_approx  +  w2 * throughput  −  w3 * latency_p99
+//   R = interactive_frac * load_norm * 0.7  −  congestion * 0.2  −  latency * 0.1
 //
-// Because true PPO requires neural networks and gradient computation (which
-// would blow our latency budget), we approximate the policy with a discrete
-// action space and a value function implemented as an exponential moving
-// average table over (state, action) pairs.
+// This is standard off-policy Q-learning with a discrete (state, action) table
+// and the Bellman update rule.  It is NOT PPO (Proximal Policy Optimization) —
+// PPO is an on-policy policy-gradient algorithm.  Q-learning and PPO are
+// distinct RL paradigms; we use Q-learning because it is simpler, stationary,
+// and has a bounded update cost suitable for a scheduling hot-path adjunct.
 //
 // State:  [load_avg, interactive_fraction, compute_fraction, latency_ema_ns]
 // Action: {shrink_slice, keep_slice, grow_slice}
@@ -141,7 +142,7 @@ pub struct SchedulerSignal {
 
 // ── Policy Controller ─────────────────────────────────────────────────────────
 
-/// PPO-lite policy controller.
+/// Tabular Q-learning policy controller.
 ///
 /// Runs in a background thread; updates `shared_slice_ns` which the main
 /// scheduling loop reads atomically.
@@ -228,7 +229,7 @@ impl PolicyController {
         // Apply action to current slice.
         let ratio = ACTION_RATIO[action as usize];
         let min_slice = self.base_slice_ns / 4;
-        // Hard cap at base_slice_ns.  The PPO may only CONTRACT the slice for
+        // Hard cap at base_slice_ns.  The Q-learning policy may only CONTRACT the slice for
         // interactive-heavy phases, never inflate above the user's --slice-us.
         // Benchmark analysis: policy inflated to 4× base (80 ms), then the
         // Compute 2× multiplier pushed actual Compute slices to 160 ms —
