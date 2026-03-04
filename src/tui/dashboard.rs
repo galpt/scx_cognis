@@ -441,8 +441,9 @@ pub fn run_tui(state: SharedState, shutdown: Arc<std::sync::atomic::AtomicBool>)
 pub fn tick_tui(state: &SharedState, terminal: &mut Term, last_hist: &mut Instant) -> bool {
     use crossterm::event::{self, Event, KeyCode};
 
-    // Non-blocking key poll.
-    if event::poll(Duration::from_millis(0)).unwrap_or(false) {
+    // Drain all pending events so a queued 'q' is never skipped because
+    // an earlier mouse-move, resize, or key-repeat event consumed the slot.
+    while event::poll(Duration::from_millis(0)).unwrap_or(false) {
         if let Ok(Event::Key(key)) = event::read() {
             if key.code == KeyCode::Char('q') || key.code == KeyCode::Esc {
                 return true;
