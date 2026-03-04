@@ -65,7 +65,7 @@ const NSEC_PER_SEC: u64 = 1_000_000_000;
 /// scx_cognis: an intelligent, AI-driven CPU scheduler.
 ///
 /// scx_cognis uses an ensemble of AI algorithms to make scheduling decisions:
-/// KNN task classification, Isolation Forest anti-cheat, A* CPU placement,
+/// heuristic task classification, Isolation Forest anti-cheat, A* CPU placement,
 /// LSTM-lite burst prediction, Bayesian reputation tracking, and a PPO-lite
 /// policy controller — all with a sub-10µs inference latency target.
 #[derive(Debug, Parser)]
@@ -435,10 +435,8 @@ impl<'a> Scheduler<'a> {
         // Build features.
         let features = Self::compute_features(task, self.base_slice_ns, prev_slice_ns, nr_cpus);
 
-        // Classify using the deterministic heuristic only — no KNN voting.
-        //
-        // Why: KNN voting created a self-poisoning feedback loop.  The first
-        // Heuristic classifier: stateless, O(1) — no feedback loop.
+        // Classify using the deterministic heuristic only.
+        // Stateless, O(1), no feedback loop — see src/ai/classifier.rs.
         let label = self.classifier.classify(&features);
         self.label_counts[label as usize] += 1;
 
@@ -466,7 +464,9 @@ impl<'a> Scheduler<'a> {
             slice = slice.min(predicted_burst * 2);
         }
 
-        slice = slice.clamp(self.slice_ns_min, self.base_slice_ns * 8);
+        // Ensure clamp min ≤ max even if user passes large --slice-us-min.
+        let clamp_max = (self.base_slice_ns * 8).max(self.slice_ns_min);
+        slice = slice.clamp(self.slice_ns_min, clamp_max);
         if quarantined {
             slice = self.slice_ns_min;
         }
@@ -480,7 +480,7 @@ impl<'a> Scheduler<'a> {
         };
         let slice_ns_actual = task.stop_ts.saturating_sub(task.start_ts);
         let vslice = Self::scale_by_weight_inverse(task, slice_ns_actual);
-        task.vtime += vslice;
+        task.vtime = task.vtime.saturating_add(vslice);
         self.vruntime_now = self.vruntime_now.saturating_add(vslice / 8);
 
         // Compute tasks must not accumulate an exec_runtime deadline penalty.
@@ -493,7 +493,7 @@ impl<'a> Scheduler<'a> {
         } else {
             self.base_slice_ns.saturating_mul(100)
         };
-        let deadline = task.vtime + task.exec_runtime.min(exec_cap);
+        let deadline = task.vtime.saturating_add(task.exec_runtime.min(exec_cap));
 
         // Track inference latency.
         let elapsed = Self::now_ns().saturating_sub(t0);
@@ -653,6 +653,22 @@ impl<'a> Scheduler<'a> {
         // Tasks not seen for >2 seconds are assumed to have exited.
         let stale_threshold_ns = 2 * NSEC_PER_SEC;
         let now = Self::now_ns();
+
+        // Hard cap: if the lifetimes map grows beyond 8192 entries (e.g., from
+        // a heavy benchmark with many short-lived browser sub-processes), evict
+        // the oldest entries first so the per-second flush stays O(1) bounded.
+        const LIFETIMES_MAX: usize = 8192;
+        if self.lifetimes.len() > LIFETIMES_MAX {
+            let mut entries: Vec<(i32, u64)> = self
+                .lifetimes
+                .iter()
+                .map(|(&pid, lt)| (pid, lt.last_seen_ns))
+                .collect();
+            entries.sort_unstable_by_key(|(_, ts)| *ts);
+            for (pid, _) in entries.iter().take(self.lifetimes.len() - LIFETIMES_MAX) {
+                self.lifetimes.remove(pid);
+            }
+        }
 
         let stale: Vec<i32> = self
             .lifetimes
