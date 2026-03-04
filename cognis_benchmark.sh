@@ -14,12 +14,14 @@
 set -e
 
 # ── Colour helpers ────────────────────────────────────────────────────────────
-RED='\033[0;31m'
-GRN='\033[0;32m'
-YLW='\033[1;33m'
-CYN='\033[0;36m'
-BLD='\033[1m'
-RST='\033[0m'
+# Use $(printf ...) so POSIX sh expands the ESC byte rather than storing the
+# literal backslash-escaped string that single-quoted assignments would give.
+RED=$(printf '\033[0;31m')
+GRN=$(printf '\033[0;32m')
+YLW=$(printf '\033[1;33m')
+CYN=$(printf '\033[0;36m')
+BLD=$(printf '\033[1m')
+RST=$(printf '\033[0m')
 
 say()  { printf "${BLD}${CYN}[cognis-bench]${RST} %s\n" "$1"; }
 ok()   { printf "${BLD}${GRN}[  OK  ]${RST} %s\n" "$1"; }
