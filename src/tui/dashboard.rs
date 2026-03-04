@@ -258,7 +258,7 @@ fn draw_ai_policy(f: &mut Frame, area: Rect, state: &DashboardState) {
             Span::styled(format!("{:+.4}", reward), Style::default().fg(reward_color)),
         ]),
         Line::from(format!(
-            "  AI Time Slice:    {}µs  (base + Q-learning adjustment)",
+            "  Q-learning Slice: {}µs  (base × policy factor)",
             state.metrics.ai_slice_us
         )),
         Line::from(format!("  Inference:        {:.2}µs", state.inference_us)),
