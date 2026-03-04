@@ -26,7 +26,7 @@ A Linux CPU scheduler with adaptive scheduling policy, built on established stat
     - [ratatui TUI Dashboard](#ratatui-tui-dashboard)
 - [Design Notes](#design-notes)
   - [Architecture](#architecture)
-  - [AI Inference Pipeline Details](#ai-inference-pipeline-details)
+  - [Pipeline Details](#pipeline-details)
   - [Latency Budget](#latency-budget)
   - [Scheduler Fail-Safe](#scheduler-fail-safe)
   - [Reward Function](#reward-function)
@@ -76,7 +76,7 @@ A Linux CPU scheduler with adaptive scheduling policy, built on established stat
 - [Limitations and Next Steps](#limitations-and-next-steps)
 - [Contributing](#contributing)
   - [Running Tests](#running-tests)
-  - [Adding a New AI Module](#adding-a-new-ai-module)
+  - [Adding a New Module](#adding-a-new-module)
 - [License](#license)
 
 ---
@@ -291,7 +291,7 @@ Panels:
 └───────────────────────────────────────────────────────────────────┘
                                      │
               ┌──────────────────────▼──────────────────────────┐
-              │            AI Inference Pipeline                 │
+              │              Scheduling Pipeline                 │
               │                                                  │
               │  dequeue  → heuristic classify                    │
               │           → Bayesian reputation check            │
@@ -308,7 +308,7 @@ Panels:
               └──────────────────────────────────────────────────┘
 ```
 
-### AI Inference Pipeline Details
+### Pipeline Details
 
 The pipeline runs **synchronously on the hot scheduling path** for the per-task steps (heuristic classify, reputation read, burst predictor read, A\*, Q-learning slice read). Heavier operations (anti-cheat forest ticks, Q-table updates) run on **periodic timers** off the hot path.
 
@@ -1045,7 +1045,7 @@ Same pattern as Phase 1: compute workers stall while VM workers (which sleep on 
 
 ### Running Tests
 
-Unit tests for all AI modules run without root or BPF kernel support:
+Unit tests for all modules run without root or BPF kernel support:
 
 ```bash
 cargo test
@@ -1058,9 +1058,9 @@ cargo fmt --check
 cargo clippy -- -D warnings
 ```
 
-### Adding a New AI Module
+### Adding a New Module
 
-All AI components live in `src/ai/`. Each module is self-contained (no external AI framework dependencies — only `rand` for modules that need randomness):
+All components live in `src/ai/`. Each module is self-contained (no external framework dependencies — only `rand` for modules that need randomness):
 
 1. Create `src/ai/my_module.rs` with your struct and unit tests.
 2. Add `pub mod my_module;` and a `pub use` re-export to `src/ai/mod.rs`.
