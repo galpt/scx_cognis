@@ -46,6 +46,10 @@ jobs:
           MAJOR=${PARTS[0]:-1}
           MINOR=${PARTS[1]:-0}
           PATCH=${PARTS[2]:-0}
+          # Enforce v1.x.x floor — existing v0.x.x tags must not carry forward
+          if [ "$MAJOR" -lt 1 ]; then
+            MAJOR=1; MINOR=0; PATCH=0
+          fi
           PATCH=$((PATCH + 1))
           # base semantic version
           NEW="v$MAJOR.$MINOR.$PATCH"
