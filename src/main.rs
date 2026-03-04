@@ -893,8 +893,7 @@ impl<'a> Scheduler<'a> {
 
             // Inline TUI rendering (no separate thread — avoids EPERM under sudo).
             if self.tui_term.is_some() {
-                let should_render =
-                    self.last_tui_render.elapsed() >= Duration::from_millis(50);
+                let should_render = self.last_tui_render.elapsed() >= Duration::from_millis(50);
                 if should_render {
                     self.last_tui_render = Instant::now();
                     if let (Some(ref state), Some(ref mut term)) =
