@@ -290,6 +290,13 @@ RestartSec=5
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=scx
+# Pre-create /run/scx/root with world-traversable permissions so that
+# non-root users can connect to the stats socket at /run/scx/root/stats.
+RuntimeDirectory=scx/root
+RuntimeDirectoryMode=0755
+# UMask=0111 means socket files are created as 0666 (rw-rw-rw-),
+# allowing any user to run: scx_cognis --monitor 1.0
+UMask=0111
 
 [Install]
 WantedBy=multi-user.target
@@ -456,7 +463,7 @@ main() {
     echo ""
     log_info "── Live stats (while service is running) ──────────────────────────────────"
     log_info "  Stats monitor  : scx_cognis --monitor 1.0"
-    log_info "  (--monitor reads stats from the running service; no root needed)"
+    log_info "  (connects to the stats socket at /run/scx/root/stats; no root needed)"
     echo ""
     log_info "── TUI dashboard ──────────────────────────────────────────────────────────"
     log_info "  The TUI starts its own scheduler instance, so the systemd service"

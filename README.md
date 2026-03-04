@@ -463,15 +463,18 @@ Options:
 
 ### Stats Monitoring
 
-Monitor live statistics from a second terminal while the scheduler runs:
+Monitor live statistics from a second terminal while the scheduler runs. `--monitor` connects to the stats socket at `/run/scx/root/stats` — no root required (the service file sets `UMask=0111` so the socket is world-accessible):
 
 ```bash
 # Monitor stats every second:
-./target/release/scx_cognis --monitor 1.0
+scx_cognis --monitor 1.0
 
 # Monitor every 500 ms:
-./target/release/scx_cognis --monitor 0.5
+scx_cognis --monitor 0.5
 ```
+
+> [!NOTE]
+> If the scheduler was started **without** the provided service file (e.g. a manually launched instance), the socket may be root-only. In that case prefix with `sudo`.
 
 [↑ Back to Table of Contents](#table-of-contents)
 
@@ -533,7 +536,7 @@ sudo sh install.sh --build-from-source
 > ```bash
 > sudo systemctl stop scx && sudo scx_cognis --tui
 > ```
-> For live stats *without* stopping the service, use `--monitor` instead (no root needed):
+> For live stats *without* stopping the service, use `--monitor` (the service file sets socket permissions so no root is needed):
 > ```bash
 > scx_cognis --monitor 1.0
 > ```
