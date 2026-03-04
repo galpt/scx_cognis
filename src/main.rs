@@ -7,7 +7,7 @@
 // heuristics with a live AI inference pipeline:
 //
 //   ┌─────────────────────────────────────────────────────────────────┐
-//   │  ops.enqueue  → KNN classifier  + Reputation check             │
+//   │  ops.enqueue  → Heuristic classifier + Reputation check          │
 //   │  ops.dispatch → PPO-lite policy (AI-adjusted time slice)        │
 //   │  ops.select_cpu → A* load balancer (P/E-core aware)             │
 //   │  ops.tick     → Isolation Forest anti-cheat                     │
@@ -50,7 +50,8 @@ use scx_utils::UserExitInfo;
 
 use ai::{
     AStarLoadBalancer, AntiCheatEngine, BurstPredictor, CoreType, CpuState, ExitObservation,
-    KnnClassifier, PolicyController, ReputationEngine, SchedulerSignal, TaskFeatures, TaskLabel,
+    HeuristicClassifier, PolicyController, ReputationEngine, SchedulerSignal, TaskFeatures,
+    TaskLabel,
 };
 use stats::Metrics;
 use tui::SharedState;
@@ -205,7 +206,7 @@ struct Scheduler<'a> {
     slice_ns_min: u64,
 
     // AI components.
-    classifier: KnnClassifier,
+    classifier: HeuristicClassifier,
     anti_cheat: AntiCheatEngine,
     load_bal: AStarLoadBalancer,
     burst_pred: BurstPredictor,
@@ -312,7 +313,7 @@ impl<'a> Scheduler<'a> {
             init_page_faults: 0,
             base_slice_ns,
             slice_ns_min,
-            classifier: KnnClassifier::new(),
+            classifier: HeuristicClassifier::new(),
             anti_cheat: AntiCheatEngine::new(),
             load_bal,
             burst_pred: BurstPredictor::new(),
@@ -432,13 +433,8 @@ impl<'a> Scheduler<'a> {
         // Classify using the deterministic heuristic only — no KNN voting.
         //
         // Why: KNN voting created a self-poisoning feedback loop.  The first
-        // few desktop idle tasks seed the 512-entry window with IoWait labels;
-        // once the window has ≥ k=5 samples, KNN votes IoWait for every
-        // subsequent task — including CPU-bound stress-ng workers — regardless
-        // of their actual features.  The heuristic is stateless, loop-free,
-        // and with cpu_intensity = burst_ns/prev_slice_ns it is accurate from
-        // the second scheduling event onward for any workload.
-        let label = self.classifier.heuristic_classify(&features);
+        // Heuristic classifier: stateless, O(1) — no feedback loop.
+        let label = self.classifier.classify(&features);
         self.label_counts[label as usize] += 1;
 
         // Reputation-based slice factor.
@@ -674,7 +670,6 @@ impl<'a> Scheduler<'a> {
                 };
                 self.reputation.update_on_exit(pid, pid, &obs, "");
                 self.burst_pred.evict(pid);
-                self.classifier.evict(pid);
                 self.anti_cheat.evict(pid);
             }
         }

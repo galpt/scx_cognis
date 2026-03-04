@@ -97,7 +97,6 @@ test ai::classifier::tests::heuristic_compute .................... ok
 test ai::classifier::tests::heuristic_interactive ................ ok
 test ai::classifier::tests::heuristic_iowait ..................... ok
 test ai::classifier::tests::heuristic_realtime ................... ok
-test ai::classifier::tests::knn_vote_after_warmup ................ ok
 test ai::anomaly::tests::anomaly_score_range ...................... ok
 test ai::load_balancer::tests::quarantine_only_restricted ......... ok
 test ai::load_balancer::tests::selects_idle_cpu ................... ok
@@ -107,7 +106,7 @@ test ai::reputation::tests::reward_increases_trust ................ ok
 test ai::reputation::tests::uniform_prior_mean .................... ok
 test ai::policy::tests::slice_stays_in_bounds ..................... ok
 
-test result: ok. 17 passed; 0 failed; 0 ignored
+test result: ok. 16 passed; 0 failed; 0 ignored
 ```
 
 ### Tested Platforms
@@ -979,7 +978,7 @@ If the `reward` value stays below 0.2 for extended periods, the AI is still lear
 
 > 500 fish (default Aquarium), 60 s per phase, `stress-ng` workload.
 >
-> **Context:** the numbers below were captured on commit `eb81fbe` (before the KNN feedback-loop, cpu_intensity, and batch-dispatch fixes in `b36a58a`). They document the *broken* baseline so future runs are directly comparable. With the fixes applied, `Compute` labels should dominate during Phase 1/3, `d→u` should rise to roughly match `k`, and CPU real-time throughput should approach CFS levels.
+> **Context:** the numbers below were captured on commit `eb81fbe` (before the classifier cpu_intensity and batch-dispatch fixes in `b36a58a`). They document the *broken* baseline so future runs are directly comparable. With the fixes applied, `Compute` labels should dominate during Phase 1/3, `d→u` should rise to roughly match `k`, and CPU real-time throughput should approach CFS levels.
 
 **Phase 1 — CPU stress (16 × workers, 60 s):**
 
