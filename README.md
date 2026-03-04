@@ -993,9 +993,11 @@ If the `reward` value stays low (near 0) during CPU-heavy phases, this is normal
 
 ### Reference Benchmark Results
 
+> [!NOTE]
 > 500 fish (default Aquarium), 60 s per phase, `stress-ng` workload. CPU governor left at system default (`powersave`) for both runs.
 >
-> **Context:** these numbers reflect the current implementation. The real-time throughput gap for CPU-bound phases is expected and by design — scx_cognis pre-empts compute workers more frequently to keep interactive tasks (browser compositor, input handling) responsive. The `usr time` metric, which measures only the CPU time workers were actually executing, stays close to or above baseline, confirming that no CPU cycles are wasted. The tradeoff is intentional: lower raw compute throughput in exchange for sustained frame-rate smoothness under full CPU load.
+> **Context:**
+> These numbers reflect the current implementation. The real-time throughput gap for CPU-bound phases is expected and by design — scx_cognis pre-empts compute workers more frequently to keep interactive tasks (browser compositor, input handling) responsive. The `usr time` metric, which measures only the CPU time workers were actually executing, stays close to or above baseline, confirming that no CPU cycles are wasted. The tradeoff is intentional: lower raw compute throughput in exchange for sustained frame-rate smoothness under full CPU load.
 
 **Phase 1 — CPU stress (16 × workers, 60 s):**
 
@@ -1029,9 +1031,9 @@ The CPU stressor shows the same pattern as Phase 1. The VM stressor's exceptiona
 > [!TIP]
 > If you run your own benchmark, keep the CPU governor fixed (`performance`) for both schedulers, run each mode at least 3 times, and compare median values. Single runs can swing significantly.
 
-**Comparison between Cognis and CachyOS Default CPU Scheduler**
+**Cognis vs. CachyOS Default Scheduler**
 
-Both images show what happened when transitioning from Phase 2 to Phase 3 using the benchmark script.
+Both screenshots show CPU usage during the transition from Phase 2 to Phase 3 of the benchmark.
 
 <p align="center">
 	<img src="https://github.com/galpt/scx_cognis/blob/main/img/baseline-cpu-usage.png" alt="With Cognis Disabled" style="max-width:100%;height:auto;" />
