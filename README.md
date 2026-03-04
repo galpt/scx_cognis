@@ -81,7 +81,7 @@
 
 ## Status
 
-Stable — all 13 unit tests pass on every commit. The scheduler builds cleanly from crates.io with no external SCM dependencies, and has been run successfully on production workloads on `sched_ext`-enabled kernels (≥ 6.12).
+Stable — all 17 unit tests pass on every commit. The scheduler builds cleanly from crates.io with no external SCM dependencies, and has been run successfully on production workloads on `sched_ext`-enabled kernels (≥ 6.12).
 
 ### Test Results
 
@@ -95,6 +95,7 @@ test ai::classifier::tests::heuristic_compute .................... ok
 test ai::classifier::tests::heuristic_interactive ................ ok
 test ai::classifier::tests::heuristic_iowait ..................... ok
 test ai::classifier::tests::heuristic_realtime ................... ok
+test ai::classifier::tests::high_cpu_fresh_wakeup_is_interactive ... ok
 test ai::anomaly::tests::anomaly_score_range ...................... ok
 test ai::load_balancer::tests::quarantine_only_restricted ......... ok
 test ai::load_balancer::tests::selects_idle_cpu ................... ok
@@ -104,7 +105,7 @@ test ai::reputation::tests::reward_increases_trust ................ ok
 test ai::reputation::tests::uniform_prior_mean .................... ok
 test ai::policy::tests::slice_stays_in_bounds ..................... ok
 
-test result: ok. 16 passed; 0 failed; 0 ignored
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
 ```
 
 ### Tested Platforms
@@ -140,7 +141,7 @@ ops.enqueue   →  Heuristic Classifier  →  Reputation Check  →  Burst Predi
 ops.dispatch  →  Q-learning Policy (adaptive time slice)
 ops.select_cpu → A* Load Balancer  (P/E-core, NUMA, quarantine-aware)
 ops.tick      →  Isolation Forest Anti-Cheat
-ops.disable   →  Bayesian Reputation Engine (precise task-exit hook)
+schedule loop →  Reputation Engine          (staleness-based, every 1 s)
 ```
 
 ### Component Details
@@ -288,22 +289,22 @@ Panels:
 │                                             └──────────────────┘  │
 └───────────────────────────────────────────────────────────────────┘
                                      │
-              ┌──────────────────────▼───────────────────────────┐
-              │              Scheduling Pipeline                 │
-              │                                                  │
-              │  dequeue  → heuristic classify                   │
-              │           → Bayesian reputation check            │
-              │           → Elman RNN headroom hint              │
-              │  select_cpu → A* topology search                 │
-              │  dispatch → Q-learning policy slice read         │
-              │  tick     → Isolation Forest anti-cheat          │
-              └──────────────────────────────────────────────────┘
+┌────────────────────────────────────▼──────────────────────────────┐
+│                        Scheduling Pipeline                        │
+│                                                                   │
+│  dequeue     → heuristic classify                                 │
+│              → Bayesian reputation check                          │
+│              → Elman RNN headroom hint                            │
+│  select_cpu  → A* topology search                                 │
+│  dispatch    → Q-learning policy slice read                       │
+│  tick        → Isolation Forest anti-cheat                        │
+└───────────────────────────────────────────────────────────────────┘
                                      │
-              ┌──────────────────────▼───────────────────────────┐
-              │              ratatui TUI Dashboard               │
-              │  Arc<Mutex<DashboardState>>  (lock-free reads    │
-              │  on hot path via AtomicU64 slice)                │
-              └──────────────────────────────────────────────────┘
+┌────────────────────────────────────▼──────────────────────────────┐
+│                       ratatui TUI Dashboard                       │
+│  Arc<Mutex<DashboardState>>  (lock-free reads                     │
+│  on hot path via AtomicU64 slice)                                 │
+└───────────────────────────────────────────────────────────────────┘
 ```
 
 ### Pipeline Details
@@ -319,6 +320,7 @@ The pipeline runs **synchronously on the hot scheduling path** for the per-task 
 | Q-learning slice read | ✅ Yes | every `ops.dispatch` (atomic read) |
 | Anti-cheat tick | ❌ No | every 100 ms |
 | Q-table update | ❌ No | every 250 ms |
+| Reputation update | ❌ No | every 1 s (staleness heuristic) |
 
 ### Latency Budget
 
@@ -560,7 +562,7 @@ Each line from `--monitor` is a snapshot of one polling interval. All counters l
 | `f:0` | failed dispatches | per-interval | Dispatches that errored out entirely. Should always be **0**. |
 | `cong:0` | congestion events | per-interval | Times the scheduler's internal queue was full and had to drop or defer work. Sustained non-zero values indicate scheduler overload. |
 | `Interactive:18` | interactive events | per-interval | Scheduling events classified as **Interactive** (latency-sensitive: games, HID, GUI). Gets a 0.5× time-slice to stay responsive. |
-| `Compute:3` | compute events | per-interval | Events classified as **Compute** (CPU-bound: compilers, encoders). Gets a 2× time-slice for throughput. |
+| `Compute:3` | compute events | per-interval | Events classified as **Compute** (CPU-bound: compilers, encoders). Gets a 1× baseline time-slice (CPU-bound; pre-empted less often by design). |
 | `IOwait:2` | I/O-wait events | per-interval | Events classified as **I/O Wait** (blocked on disk/network most of the time). Gets a 0.75× time-slice. |
 | `RT:0` | realtime events | per-interval | Events classified as **RealTime** (JACK, audio daemons, SCHED_FIFO tasks). Gets a 0.25× time-slice for minimum latency. |
 | `Unknown:1` | unclassified events | per-interval | Events that did not match any heuristic rule. In practice this should never appear with the current 3-band heuristic (every task is classified as Compute, Interactive, or IoWait). Gets a 1× baseline time-slice. |
@@ -578,7 +580,7 @@ The key feature is `cpu_intensity = burst_ns / prev_assigned_slice_ns` (slice-us
 | Label | Slice Multiplier | Heuristic Rule |
 |:---|:---|:---|
 | **RealTime** | 0.25× | priority weight > 95% of max (SCHED_FIFO / SCHED_RR tasks) |
-| **Compute** | 2.0× | `cpu_intensity > 0.85` — task consumed > 85% of its assigned slice (CPU-bound) |
+| **Compute** | 1.0× | `cpu_intensity > 0.85` — task consumed > 85% of its assigned slice (CPU-bound) |
 | **Interactive** | 0.5× | `0.10 ≤ cpu_intensity ≤ 0.85` — task yields regularly (latency-sensitive) |
 | **IoWait** | 0.75× | `cpu_intensity < 0.10` — task released CPU far before slice expired (I/O-blocked) |
 | **Unknown** | 1.0× | reserved; not emitted by the current heuristic |

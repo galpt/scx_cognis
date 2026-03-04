@@ -11,8 +11,6 @@
 //   │  ops.dispatch → Q-learning policy (adaptive time slice)           │
 //   │  ops.select_cpu → A* load balancer (P/E-core aware)             │
 //   │  ops.tick     → Isolation Forest anti-cheat                     │
-//   │  ops.disable  → Bayesian reputation update (precise task exit)  │
-//   │  ops.update_idle → Elman RNN burst predictor (headroom signal)  │
 //   └─────────────────────────────────────────────────────────────────┘
 //
 // The BPF dispatcher (provided by scx_rustland_core) is completely agnostic
