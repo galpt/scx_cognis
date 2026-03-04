@@ -302,14 +302,32 @@ configure_scx_defaults() {
     _flags="${SCX_FLAGS:-}"
     log_info "Configuring ${SCX_DEFAULTS} ..."
 
+    # Already configured by us — just refresh the flags line in-place, no backup.
     if [ -f "$SCX_DEFAULTS" ] && grep -q "SCX_SCHEDULER=${BINARY_NAME}" "$SCX_DEFAULTS" 2>/dev/null; then
-        log_ok "${SCX_DEFAULTS} already points to ${BINARY_NAME}"
+        log_ok "${SCX_DEFAULTS} already points to ${BINARY_NAME} — refreshing flags"
+        if [ -n "$DRY_RUN" ]; then
+            log_info "(dry-run) Would refresh SCX_FLAGS in ${SCX_DEFAULTS}"
+            return 0
+        fi
+        _tmp_cfg=$(mktemp)
+        grep -v "^SCX_FLAGS=" "$SCX_DEFAULTS" > "$_tmp_cfg" || true
+        printf "SCX_FLAGS='%s'\n" "${_flags}" >> "$_tmp_cfg"
+        cp "$_tmp_cfg" "$SCX_DEFAULTS"
+        rm -f "$_tmp_cfg"
+        log_ok "${SCX_DEFAULTS} flags refreshed (no backup created)"
         return 0
     fi
 
+    # File exists but belongs to another scheduler — back it up exactly once.
+    # On reinstall the file already has SCX_SCHEDULER=scx_cognis (caught above),
+    # so this branch only fires on a true first-time install over a foreign config.
     if [ -f "$SCX_DEFAULTS" ]; then
-        log_info "Backing up existing ${SCX_DEFAULTS} → ${SCX_DEFAULTS}.bak"
-        run "cp \"${SCX_DEFAULTS}\" \"${SCX_DEFAULTS}.bak\""
+        if [ ! -f "${SCX_DEFAULTS}.bak" ]; then
+            log_info "Backing up existing ${SCX_DEFAULTS} → ${SCX_DEFAULTS}.bak"
+            run "cp \"${SCX_DEFAULTS}\" \"${SCX_DEFAULTS}.bak\""
+        else
+            log_info "${SCX_DEFAULTS}.bak already exists — skipping backup to avoid overwriting it"
+        fi
     fi
 
     if [ -n "$DRY_RUN" ]; then
@@ -427,11 +445,19 @@ main() {
     log_step "Done"
     log_ok "scx_cognis has been installed."
     echo ""
-    log_info "Binary      : ${BINARY_PATH}"
-    log_info "Defaults    : ${SCX_DEFAULTS}"
-    log_info "Service     : systemctl status scx"
-    log_info "Logs        : journalctl -u scx -f"
-    log_info "Switch back : sudo systemctl stop scx    (reverts to default kernel scheduler)"
+    log_info "Binary        : ${BINARY_PATH}"
+    log_info "Defaults      : ${SCX_DEFAULTS}"
+    echo ""
+    log_info "── Verify it is running ──────────────────────────────────────"
+    log_info "  Service status : systemctl status scx"
+    log_info "  Live logs      : journalctl -u scx -f"
+    log_info "  Confirm active : cat /sys/kernel/sched_ext/root/ops"
+    log_info "                   (should print: scx_cognis)"
+    log_info "  TUI dashboard  : sudo scx_cognis --tui"
+    log_info "  Stats monitor  : scx_cognis --monitor 1.0"
+    echo ""
+    log_info "── Stop / switch back ────────────────────────────────────────"
+    log_info "  sudo systemctl stop scx   (reverts immediately to CFS/EEVDF)"
     echo ""
 }
 
