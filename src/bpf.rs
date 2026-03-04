@@ -197,11 +197,10 @@ static SET_HANDLER: Once = Once::new();
 fn set_ctrlc_handler(shutdown: Arc<AtomicBool>) -> Result<(), anyhow::Error> {
     SET_HANDLER.call_once(|| {
         let shutdown_clone = shutdown.clone();
-        if let Err(err) = ctrlc::set_handler(move || {
+        ctrlc::set_handler(move || {
             shutdown_clone.store(true, Ordering::Relaxed);
-        }) {
-            eprintln!("[WARN] Failed to set Ctrl-C handler: {err}");
-        }
+        })
+        .expect("Error setting Ctrl-C handler");
     });
     Ok(())
 }
@@ -238,9 +237,6 @@ impl<'cb> BpfScheduler<'cb> {
         fn callback(data: &[u8]) -> i32 {
             #[allow(static_mut_refs)]
             unsafe {
-                if data.len() != BUF.0.len() {
-                    return -libc::EINVAL;
-                }
                 // SAFETY: copying from the BPF ring buffer to BUF is safe, since the size of BUF
                 // is exactly the size of QueuedTask and the callback operates in chunks of
                 // QueuedTask items. It also copies exactly one QueuedTask at a time, this is
@@ -255,14 +251,8 @@ impl<'cb> BpfScheduler<'cb> {
         }
 
         // Check host topology to determine if we need to enable SMT capabilities.
-        let smt_enabled = match Topology::new() {
-            Ok(topo) => topo.smt_enabled,
-            Err(err) => {
-                eprintln!("[WARN] Failed to read topology: {err}; assuming SMT disabled");
-                false
-            }
-        };
-        skel.maps.rodata_data.as_mut().unwrap().smt_enabled = smt_enabled;
+        let topo = Topology::new().unwrap();
+        skel.maps.rodata_data.as_mut().unwrap().smt_enabled = topo.smt_enabled;
 
         // Enable scheduler flags.
         skel.struct_ops.rustland_mut().flags =
@@ -288,19 +278,17 @@ impl<'cb> BpfScheduler<'cb> {
         let queued_ring_buffer = &maps.queued;
         let mut rbb = libbpf_rs::RingBufferBuilder::new();
         rbb.add(queued_ring_buffer, callback)
-            .context("failed to add ringbuf callback")?;
-        let queued = rbb.build().context("failed to build ringbuf")?;
+            .expect("failed to add ringbuf callback");
+        let queued = rbb.build().expect("failed to build ringbuf");
 
         // Build the user ring buffer of dispatched tasks.
         let dispatched = libbpf_rs::UserRingBuffer::new(&maps.dispatched)
-            .context("failed to create user ringbuf")?;
+            .expect("failed to create user ringbuf");
 
         // Lock all the memory to prevent page faults that could trigger potential deadlocks during
         // scheduling.
         ALLOCATOR.lock_memory();
-        ALLOCATOR
-            .disable_mmap()
-            .map_err(|err| anyhow::anyhow!("Failed to disable mmap: {:?}", err))?;
+        ALLOCATOR.disable_mmap().expect("Failed to disable mmap");
 
         // Make sure to use the SCHED_EXT class at least for the scheduler itself.
         if partial {
@@ -544,19 +532,19 @@ impl<'cb> BpfScheduler<'cb> {
                 Ok(Some(task))
             }
             res if res < 0 => Err(res),
-            _ => Err(-libc::EIO),
+            res => panic!("Unexpected return value from libbpf-rs::consume_raw(): {res}"),
         }
     }
 
     // Send a task to the dispatcher.
-    pub fn dispatch_task(&mut self, task: &DispatchedTask) -> Result<()> {
+    pub fn dispatch_task(&mut self, task: &DispatchedTask) -> Result<(), libbpf_rs::Error> {
         // Reserve a slot in the user ring buffer.
         let mut urb_sample = self
             .dispatched
             .reserve(std::mem::size_of::<bpf_intf::dispatched_task_ctx>())?;
         let bytes = urb_sample.as_mut();
         let dispatched_task = plain::from_mut_bytes::<bpf_intf::dispatched_task_ctx>(bytes)
-            .map_err(|err| anyhow::anyhow!("failed to convert bytes: {:?}", err))?;
+            .expect("failed to convert bytes");
 
         // Convert the dispatched task into the low-level dispatched task context.
         let bpf_intf::dispatched_task_ctx {
@@ -582,7 +570,7 @@ impl<'cb> BpfScheduler<'cb> {
         // expected to fail.
         self.dispatched
             .submit(urb_sample)
-            .map_err(|err| anyhow::anyhow!("failed to submit task: {err}"))?;
+            .expect("failed to submit task");
 
         Ok(())
     }

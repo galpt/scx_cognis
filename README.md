@@ -15,7 +15,7 @@ A Linux CPU scheduler with adaptive scheduling policy, built on established stat
   - [Test Results](#test-results)
   - [Tested Platforms](#tested-platforms)
 - [Features](#features)
-  - [AI Pipeline Overview](#ai-pipeline-overview)
+  - [Pipeline Overview](#pipeline-overview)
   - [Component Details](#component-details)
     - [Heuristic Task Classifier](#heuristic-task-classifier)
     - [Isolation Forest Anti-Cheat Engine](#isolation-forest-anti-cheat-engine)
@@ -131,7 +131,7 @@ test result: ok. 16 passed; 0 failed; 0 ignored
 > [!TIP]
 > **What to expect from scx_cognis:** cognis is designed to keep interactive tasks (UI rendering, audio, input) responsive even when the system is under heavy CPU or I/O load. It does this by classifying tasks as Interactive, Compute, IoWait, or RealTime on every scheduling event and giving short, high-frequency slices to Interactive tasks (0.5× base) so they are never queued behind long-running CPU-bound workers. Fair-share throughput for batch workloads is preserved — just not maximised. If your goal is raw CPU throughput (compilers, encoders, benchmarks), the default EEVDF scheduler wins; cognis's advantage is consistent low scheduling latency for tasks that wake up, do a little work, and sleep again.
 
-### AI Pipeline Overview
+### Pipeline Overview
 
 Every scheduling decision passes through a multi-stage inference pipeline. The entire pipeline completes in **< 5 µs** on a modern CPU, staying well within the time-slice budget.
 
@@ -140,6 +140,7 @@ ops.enqueue   →  Heuristic Classifier  →  Reputation Check  →  Burst Predi
 ops.dispatch  →  Q-learning Policy (adaptive time slice)
 ops.select_cpu → A* Load Balancer  (P/E-core, NUMA, quarantine-aware)
 ops.tick      →  Isolation Forest Anti-Cheat
+ops.disable   →  Bayesian Reputation Engine (precise task-exit hook)
 ```
 
 ### Component Details
@@ -162,11 +163,19 @@ The primary classification feature is `cpu_intensity`.
 (stored in `TaskLifetime`). On first event, `base_slice_ns` is used as fallback.
 This makes classification stable and loop-free from the second event onward:
 
-| `cpu_intensity` range | Interpretation | Label |
+| `cpu_intensity` range | `exec_ratio` condition | Label |
 |:---|:---|:---|
-| > 0.85 | Used > 85 % of its assigned slice — CPU-bound | **Compute** |
-| 0.10 – 0.85 | Yields regularly — latency-sensitive | **Interactive** |
-| < 0.10 | Released CPU far before slice expired — I/O-blocked | **IoWait** |
+| > 0.85 AND exec_ratio < 0.30 | Never sleeps between slices — CPU-bound | **Compute** |
+| > 0.85 AND exec_ratio ≥ 0.30 | High burst but just woke (e.g. 120fps render) | **Interactive** |
+| 0.10 – 0.85 | any | Yields regularly — latency-sensitive | **Interactive** |
+| < 0.10 | any | Released CPU far before slice expired — I/O-blocked | **IoWait** |
+
+The `exec_ratio` guard is critical: `exec_runtime` resets to 0 on every wakeup (`ops.runnable`), so
+a browser rendering WebGL frames at 120fps gets `exec_ratio ≈ 1.0` even though it consumes 100% of
+each slice.  A true background Compute task (stress-ng, compiler) never sleeps, so `exec_runtime`
+accumulates for seconds and `exec_ratio → 0` within a few slices.  Without this guard, the monitor
+would show `Interactive:1 Compute:77` for a browser workload — exactly the root cause of the
+[throughput regression seen during benchmarking](benchmarks_results.md).
 
 A weight-norm threshold (> 0.95) catches `SCHED_FIFO` / `SCHED_RR` tasks regardless of slice usage and labels them **RealTime**.
 
@@ -1028,9 +1037,19 @@ Same pattern as Phase 1: compute workers stall while VM workers (which sleep on 
 
 ## Limitations and Next Steps
 
-- **Reward signal is estimated** — scheduling latency is derived from inference timestamps rather than a true per-task P99 measurement. A `BPF_MAP_TYPE_RINGBUF` exporting precise per-task exit latencies would improve the Q-learning reward signal significantly.
-- **Elman RNN vs. true LSTM** — the burst predictor uses a small Elman RNN (H=4) with hardcoded weights for latency reasons. A true LSTM using `burn` or `onnxruntime-rs` would provide better predictions at the cost of higher inference latency.
-- **Task exit hook is heuristic** — reputation updates are triggered by a lifecycle heuristic (stale lifetime entries) rather than a BPF ringbuf exit event. A dedicated BPF program exporting `task_dead` events would make this precise.
+- **Elman RNN weights are hardcoded** — the burst predictor uses a small Elman RNN (H=4) with
+  compile-time weights derived from offline synthetic-trace analysis. The EMA smoothing layer
+  adapts burst predictions toward real observed distributions at runtime (~30 events per PID),
+  but weight updates require gradient computation that would exceed the 5 µs hot-path budget.
+  This is an intentional architectural tradeoff; offline retraining remains a future step.
+- **Reward signal uses real scheduling latency** *(previously: estimated from inference timestamps)* —
+  the Q-learning policy now measures actual user-space enqueue-to-dispatch wait time, updated as an
+  EMA in `dispatch_task()` and normalised by 10 ms. This gives the controller an accurate congestion
+  signal without needing a kernel-side ringbuf.
+- **Task exit hook is now precise** *(previously: 2-second staleness heuristic)* — `ops.disable`
+  fires a BPF event (written to the `task_exits` ring buffer) every time a task leaves sched_ext;
+  `flush_reputation_updates()` drains this ring buffer first, then falls back to the staleness pass
+  as a safety net. Pattern inspired by `scx_layered`'s `layered_disable` implementation.
 
 [↑ Back to Table of Contents](#table-of-contents)
 

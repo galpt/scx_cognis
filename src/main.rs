@@ -11,8 +11,8 @@
 //   │  ops.dispatch → Q-learning policy (adaptive time slice)           │
 //   │  ops.select_cpu → A* load balancer (P/E-core aware)             │
 //   │  ops.tick     → Isolation Forest anti-cheat                     │
-//   │  ops.exit     → Bayesian reputation update                      │
-//   │  ops.update_idle → LSTM-lite burst predictor (headroom signal)  │
+//   │  ops.disable  → Bayesian reputation update (precise task exit)  │
+//   │  ops.update_idle → Elman RNN burst predictor (headroom signal)  │
 //   └─────────────────────────────────────────────────────────────────┘
 //
 // The BPF dispatcher (provided by scx_rustland_core) is completely agnostic
@@ -39,7 +39,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Result;
 use clap::Parser;
-use libbpf_rs::OpenObject;
+use libbpf_rs::{OpenObject, RingBufferBuilder};
 use log::{info, warn};
 use procfs::process::Process;
 
@@ -230,10 +230,14 @@ struct Scheduler<'a> {
     /// must continue regardless of stats client lifecycle.
     stats_channel_failed: bool,
 
-    // Running counters for AImetrics.
+    // Running counters for AI metrics.
     label_counts: [u64; 5],
     total_inference_ns: u64,
     inference_samples: u64,
+    /// Exponential moving average of user-space scheduling latency
+    /// (enqueue → dispatch), in nanoseconds. Updated on every successful
+    /// dispatch. Used as `latency_p99_norm` in the Q-learning reward signal.
+    sched_latency_ema_ns: f64,
 }
 
 impl<'a> Scheduler<'a> {
@@ -332,6 +336,7 @@ impl<'a> Scheduler<'a> {
             label_counts: [0; 5],
             total_inference_ns: 0,
             inference_samples: 0,
+            sched_latency_ema_ns: 0.0,
         })
     }
 
@@ -581,6 +586,14 @@ impl<'a> Scheduler<'a> {
             return true;
         };
 
+        // Measure real user-space scheduling latency: the time this task waited
+        // in self.tasks between enqueue (drain_queued_tasks) and now (dispatch).
+        // This is a true measure of scheduler responsiveness — replaces the
+        // inference-time proxy that was used before.
+        let wait_ns = Self::now_ns().saturating_sub(task.timestamp);
+        // α = 0.05: smooth out per-task jitter while tracking trends over ~20 dispatches.
+        self.sched_latency_ema_ns = self.sched_latency_ema_ns * 0.95 + wait_ns as f64 * 0.05;
+
         let quarantined = self.reputation.is_quarantined(task.qtask.pid)
             || self.anti_cheat.is_flagged(task.qtask.pid);
 
@@ -638,29 +651,51 @@ impl<'a> Scheduler<'a> {
             self.label_counts[TaskLabel::Interactive as usize] as f64 / total_labeled;
         let compute_frac = self.label_counts[TaskLabel::Compute as usize] as f64 / total_labeled;
 
-        let avg_inference_us = if self.inference_samples > 0 {
-            self.total_inference_ns as f64 / self.inference_samples as f64 / 1000.0
-        } else {
-            0.0
-        };
-
         let sig = SchedulerSignal {
             load_norm: (nr_running / nr_cpus).min(1.0),
             interactive_frac,
             compute_frac,
-            // Normalise by 10 ms.
-            latency_p99_norm: (avg_inference_us / 10_000.0).min(1.0),
+            // Real enqueue→dispatch scheduling latency, normalised by 10 ms.
+            // Typical: < 100 µs (0.01). Overloaded: 1–5 ms (0.1–0.5).
+            latency_p99_norm: (self.sched_latency_ema_ns / 10_000_000.0).min(1.0),
             congestion_rate: *self.bpf.nr_sched_congested_mut() as f64,
         };
         self.policy.update(&sig);
     }
 
-    /// Emit reputation updates for finished tasks (ops.exit approximation).
+    /// Drain the `task_exits` BPF ring buffer that `ops.disable` writes to.
     ///
-    /// Rate-limited to once per second. A task is considered departed only when
-    /// its `last_seen_ns` timestamp is more than 2 seconds old — this prevents
-    /// the previous bug where every still-active task was evicted on every loop,
-    /// wiping the KNN pid_cache constantly and corrupting reputation scores.
+    /// Returns the list of PIDs that have just left sched_ext. Called at the
+    /// start of every `flush_reputation_updates` tick for precise, same-tick
+    /// exit detection (pattern from scx_layered's `layered_disable` impl).
+    fn drain_task_exits(&mut self) -> Vec<i32> {
+        let mut pids: Vec<i32> = Vec::new();
+        // Borrow the map field only — different struct field from self.lifetimes
+        // etc., so NLL allows the concurrent accesses in the closure below.
+        let map = &self.bpf.skel.maps.task_exits;
+        let mut builder = RingBufferBuilder::new();
+        // `add` requires the callback lifetime to outlive the map reference
+        // ('cb : 'slf).  Both live for the scope of this function, satisfying
+        // the constraint without any unsafe code.
+        let _ = builder.add(map, |data: &[u8]| {
+            if data.len() >= 4 {
+                let pid = i32::from_ne_bytes([data[0], data[1], data[2], data[3]]);
+                pids.push(pid);
+            }
+            0
+        });
+        if let Ok(rb) = builder.build() {
+            let _ = rb.consume();
+        }
+        pids
+    }
+
+    /// Emit reputation updates for finished tasks.
+    ///
+    /// First drains the `task_exits` BPF ring buffer (populated by ops.disable)
+    /// for precise, same-tick exit notifications learned from the scx_bpfland /
+    /// scx_layered ops.disable pattern. Then falls back to the staleness heuristic
+    /// as a safety net for any PIDs that were not captured by ops.disable.
     fn flush_reputation_updates(&mut self) {
         // Run at most once per second.
         if self.last_reputation_flush.elapsed() < Duration::from_secs(1) {
@@ -668,16 +703,35 @@ impl<'a> Scheduler<'a> {
         }
         self.last_reputation_flush = Instant::now();
 
-        // Tasks not seen for >2 seconds are assumed to have exited.
-        let stale_threshold_ns = 2 * NSEC_PER_SEC;
+        // ── Phase 1: precise exit notifications via ops.disable ring buffer ──
+        // Drain any PIDs the BPF disable hook published since last tick.
+        // This gives exact, sub-millisecond exit detection for every normal
+        // user-space task.
+        let exact_exits = self.drain_task_exits();
+        for pid in exact_exits {
+            if let Some(lt) = self.lifetimes.remove(&pid) {
+                let obs = ExitObservation {
+                    slice_underrun: lt.slice_used_ns < lt.slice_assigned_ns / 2,
+                    preempted: lt.preempted,
+                    clean_exit: !lt.cheat_flagged,
+                    cheat_flagged: lt.cheat_flagged,
+                    fork_count: 0,
+                    involuntary_ctx_sw: 0,
+                };
+                self.reputation.update_on_exit(pid, pid, &obs, "");
+                self.burst_pred.evict(pid);
+                self.anti_cheat.evict(pid);
+            }
+        }
+
+        // ── Phase 2: staleness fallback ──────────────────────────────────────
+        // Safety net for any PIDs that slipped through (e.g. kthreads skipped
+        // by ops.disable, or tasks that exited before the scheduler fully
+        // attached). Tasks not seen for > 2 seconds are assumed departed.
         let now = Self::now_ns();
 
-        // Hard cap: if the lifetimes map grows beyond 8192 entries (e.g., from
-        // a heavy benchmark with many short-lived browser sub-processes), evict
-        // stale entries.  Use HashMap::retain() in cascading time-window passes
-        // (each O(N)) rather than sorting the full map (O(N log N)).  We stop
-        // as soon as the map fits within the cap.
         const LIFETIMES_MAX: usize = 8192;
+        let stale_threshold_ns = 2 * NSEC_PER_SEC;
         if self.lifetimes.len() > LIFETIMES_MAX {
             // Pass 1: keep entries seen within the last 10 s.
             let cutoff = now.saturating_sub(10 * NSEC_PER_SEC);

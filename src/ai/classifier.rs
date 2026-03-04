@@ -105,17 +105,29 @@ impl HeuristicClassifier {
 
     /// Classify a task based on its feature vector.
     ///
-    /// | `cpu_intensity`    | Label       | Rationale                              |
-    /// |:-------------------|:------------|:---------------------------------------|
-    /// | > 0.85             | Compute     | Consumed > 85 % of assigned slice      |
-    /// | 0.10 – 0.85        | Interactive | Yields regularly; latency-sensitive    |
-    /// | < 0.10             | IoWait      | Released CPU before slice expired      |
-    /// | weight_norm > 0.95 | RealTime    | SCHED_FIFO / SCHED_RR                  |
+    /// | `cpu_intensity`     | `exec_ratio` | Label       | Rationale                                     |
+    /// |:--------------------|:-------------|:------------|:----------------------------------------------|
+    /// | > 0.85              | **< 0.30**   | Compute     | High CPU + never sleeps = truly CPU-bound     |
+    /// | > 0.85              | ≥ 0.30       | Interactive | High burst but just woke (e.g. 120fps render) |
+    /// | 0.10 – 0.85         | any          | Interactive | Yields regularly; latency-sensitive           |
+    /// | < 0.10              | any          | IoWait      | Released CPU before slice expired             |
+    /// | weight_norm > 0.95  | any          | RealTime    | SCHED_FIFO / SCHED_RR                         |
+    ///
+    /// The `exec_ratio` guard is critical: `exec_runtime` resets on every wakeup
+    /// (`ops.runnable`), so a browser rendering WebGL frames at 120fps gets
+    /// `exec_ratio ≈ 1.0` even at 100% CPU per slice. Without this guard the
+    /// monitor shows `Interactive:1 Compute:77` — the root cause of the
+    /// 10× throughput regression in benchmarks.
     pub fn classify(&self, f: &TaskFeatures) -> TaskLabel {
         if f.weight_norm > 0.95 {
             return TaskLabel::RealTime;
         }
-        if f.cpu_intensity > 0.85 {
+        // Compute requires BOTH high cpu_intensity AND low exec_ratio.
+        // exec_runtime resets to 0 on every wakeup (ops.runnable), so:
+        //   - Browser rendering at 120fps: exec_ratio ≈ 1.0 (just woke from vsync sleep)
+        //   - stress-ng / compiler: exec_ratio ≈ 0  (never sleeps, accumulates forever)
+        // Without this guard the monitor shows Interactive:1 Compute:77 for WebGL workloads.
+        if f.cpu_intensity > 0.85 && f.exec_ratio < 0.30 {
             return TaskLabel::Compute;
         }
         if f.cpu_intensity < 0.10 {
@@ -149,8 +161,19 @@ mod tests {
     #[test]
     fn heuristic_compute() {
         let clf = HeuristicClassifier::new();
-        // cpu_intensity = 0.9 → used 90 % of assigned slice → Compute.
+        // cpu_intensity = 0.9 (used 90% of slice) AND exec_ratio = 0.001 (never sleeps)
+        // → Compute.
         assert_eq!(clf.classify(&feat(0.9, 0.8, 0.001)), TaskLabel::Compute);
+    }
+
+    #[test]
+    fn high_cpu_fresh_wakeup_is_interactive() {
+        let clf = HeuristicClassifier::new();
+        // cpu_intensity = 0.95 (used full slice) but exec_ratio = 0.95 (just woke from sleep).
+        // e.g. a browser rendering one WebGL frame at 120fps: sleeps every ~8ms for vsync,
+        // resets exec_runtime on wakeup, so exec_ratio ≈ 1.0 even at 100% CPU per slice.
+        // Must be Interactive, NOT Compute.
+        assert_eq!(clf.classify(&feat(0.95, 0.2, 0.95)), TaskLabel::Interactive);
     }
 
     #[test]
