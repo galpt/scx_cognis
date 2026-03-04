@@ -158,24 +158,16 @@ deterministic heuristic evaluated on every `ops.enqueue` event. Five task featur
 | `weight_norm` | Normalised scheduler weight (priority) |
 | `cpu_affinity` | Allowed CPUs / total online CPUs |
 
-The primary classification feature is `cpu_intensity`.
-`prev_assigned_slice_ns` is the slice allocated to this PID on its previous scheduling event
-(stored in `TaskLifetime`). On first event, `base_slice_ns` is used as fallback.
-This makes classification stable and loop-free from the second event onward:
+The primary classification feature is `cpu_intensity`. `prev_assigned_slice_ns` is the slice allocated to this PID on its previous scheduling event (stored in `TaskLifetime`). On first event, `base_slice_ns` is used as fallback. This makes classification stable and loop-free from the second event onward:
 
 | `cpu_intensity` range | `exec_ratio` condition | Label |
 |:---|:---|:---|
 | > 0.85 AND exec_ratio < 0.30 | Never sleeps between slices — CPU-bound | **Compute** |
 | > 0.85 AND exec_ratio ≥ 0.30 | High burst but just woke (e.g. 120fps render) | **Interactive** |
-| 0.10 – 0.85 | any | Yields regularly — latency-sensitive | **Interactive** |
-| < 0.10 | any | Released CPU far before slice expired — I/O-blocked | **IoWait** |
+| 0.10 – 0.85 (any exec_ratio) | Yields regularly — latency-sensitive | **Interactive** |
+| < 0.10 (any exec_ratio) | Released CPU far before slice expired — I/O-blocked | **IoWait** |
 
-The `exec_ratio` guard is critical: `exec_runtime` resets to 0 on every wakeup (`ops.runnable`), so
-a browser rendering WebGL frames at 120fps gets `exec_ratio ≈ 1.0` even though it consumes 100% of
-each slice.  A true background Compute task (stress-ng, compiler) never sleeps, so `exec_runtime`
-accumulates for seconds and `exec_ratio → 0` within a few slices.  Without this guard, the monitor
-would show `Interactive:1 Compute:77` for a browser workload — exactly the root cause of the
-[throughput regression seen during benchmarking](benchmarks_results.md).
+The `exec_ratio` guard is critical: `exec_runtime` resets to 0 on every wakeup (`ops.runnable`), so a browser rendering WebGL frames at 120fps gets `exec_ratio ≈ 1.0` even though it consumes 100% of each slice. A true background Compute task (stress-ng, compiler) never sleeps, so `exec_runtime` accumulates for seconds and `exec_ratio → 0` within a few slices. Without this guard, the monitor would show `Interactive:1 Compute:77` for a browser workload — exactly the root cause of the [throughput regression seen during benchmarking](#reference-benchmark-results).
 
 A weight-norm threshold (> 0.95) catches `SCHED_FIFO` / `SCHED_RR` tasks regardless of slice usage and labels them **RealTime**.
 
@@ -1037,19 +1029,7 @@ Same pattern as Phase 1: compute workers stall while VM workers (which sleep on 
 
 ## Limitations and Next Steps
 
-- **Elman RNN weights are hardcoded** — the burst predictor uses a small Elman RNN (H=4) with
-  compile-time weights derived from offline synthetic-trace analysis. The EMA smoothing layer
-  adapts burst predictions toward real observed distributions at runtime (~30 events per PID),
-  but weight updates require gradient computation that would exceed the 5 µs hot-path budget.
-  This is an intentional architectural tradeoff; offline retraining remains a future step.
-- **Reward signal uses real scheduling latency** *(previously: estimated from inference timestamps)* —
-  the Q-learning policy now measures actual user-space enqueue-to-dispatch wait time, updated as an
-  EMA in `dispatch_task()` and normalised by 10 ms. This gives the controller an accurate congestion
-  signal without needing a kernel-side ringbuf.
-- **Task exit hook is now precise** *(previously: 2-second staleness heuristic)* — `ops.disable`
-  fires a BPF event (written to the `task_exits` ring buffer) every time a task leaves sched_ext;
-  `flush_reputation_updates()` drains this ring buffer first, then falls back to the staleness pass
-  as a safety net. Pattern inspired by `scx_layered`'s `layered_disable` implementation.
+- **Elman RNN weights are hardcoded** — the burst predictor uses a fixed H=4 Elman RNN with weights derived from offline synthetic-trace analysis. The EMA smoothing layer adapts predictions toward observed burst distributions at runtime, but weight updates require gradient computation incompatible with the <5 µs hot-path budget. Online or offline retraining remains a future step.
 
 [↑ Back to Table of Contents](#table-of-contents)
 
