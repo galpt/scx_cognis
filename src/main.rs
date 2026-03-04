@@ -349,29 +349,29 @@ impl<'a> Scheduler<'a> {
     fn compute_features(task: &QueuedTask, base_slice_ns: u64, nr_cpus: i32) -> TaskFeatures {
         let burst_ns = task.stop_ts.saturating_sub(task.start_ts);
 
-        // Fraction of the base slice that was actually consumed (0..1).
-        // Interactive tasks sleep before the slice expires → low value.
-        // CPU-bound tasks burn through the entire slice            → high value (≈ 1.0).
+        // CPU intensity: accumulated CPU runtime since last sleep, normalised by base slice.
+        // This is robust for bursty tasks because exec_runtime is maintained by the kernel and
+        // reset on sleep, making it a good proxy for "how CPU-bound is this task right now".
         let cpu_intensity = if base_slice_ns > 0 {
+            (task.exec_runtime as f64 / base_slice_ns as f64).clamp(0.0, 1.0) as f32
+        } else {
+            0.0
+        };
+
+        // Slice usage in the most recent run (0..1).
+        let runnable_ratio = if base_slice_ns > 0 {
             (burst_ns as f64 / base_slice_ns as f64).clamp(0.0, 1.0) as f32
         } else {
             0.0
         };
 
-        // Normalised accumulated CPU since last sleep (0..1, horizon = 20 × base_slice).
-        // exec_runtime resets on every sleep, so this measures how long the task has been
-        // running continuously without yielding.  Near 0 = just woke up; near 1 = spinning.
-        let run_streak_cap = (base_slice_ns * 20).max(1);
-        let runnable_ratio =
-            (task.exec_runtime as f64 / run_streak_cap as f64).clamp(0.0, 1.0) as f32;
-
-        // Freshness: last burst / accumulated run-streak (0..1).
-        // Near 1 = burst_ns ≈ exec_runtime → just woke from sleep     → Interactive.
-        // Near 0 = has been running for many slices without sleeping   → Compute.
+        // Freshness of the last run relative to the current accumulated runtime (0..1).
+        // Near 1.0 -> task likely just woke up and ran briefly (interactive/IO).
+        // Near 0.0 -> task has a long continuous run streak (compute-heavy).
         let exec_ratio = if task.exec_runtime > 0 {
             (burst_ns as f64 / task.exec_runtime as f64).clamp(0.0, 1.0) as f32
         } else {
-            1.0 // no run history yet — treat as a fresh wakeup (Interactive default)
+            1.0
         };
 
         TaskFeatures {

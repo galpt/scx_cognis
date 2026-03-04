@@ -182,18 +182,16 @@ impl KnnClassifier {
         if f.weight_norm > 0.95 {
             return TaskLabel::RealTime;
         }
-        // Compute: burning through the full assigned slice AND has been running
-        // continuously without sleeping for many slices (high run streak).
-        if f.cpu_intensity > 0.85 && f.runnable_ratio > 0.6 {
+        // Compute: sustained CPU-heavy run streak with low freshness.
+        if f.cpu_intensity > 0.85 && f.exec_ratio < 0.15 {
             return TaskLabel::Compute;
         }
-        // I/O-bound: very low CPU consumption per scheduling event.
-        if f.cpu_intensity < 0.15 {
+        // I/O wait: short, low-intensity bursts that also use only a small slice fraction.
+        if f.cpu_intensity < 0.15 && f.runnable_ratio < 0.2 {
             return TaskLabel::IoWait;
         }
-        // Interactive: used only a small-to-moderate fraction of its assigned slice,
-        // or just woke from a sleep (high freshness ratio → exec_runtime ≈ burst_ns).
-        if f.cpu_intensity < 0.5 || f.exec_ratio > 0.4 {
+        // Interactive: moderate slice usage or fresh wake-up behaviour.
+        if f.runnable_ratio < 0.6 || f.exec_ratio > 0.35 {
             return TaskLabel::Interactive;
         }
         TaskLabel::Unknown

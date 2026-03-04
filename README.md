@@ -959,59 +959,39 @@ If the `reward` value stays below 0.2 for extended periods, the AI is still lear
 
 > 500 fish (default Aquarium), 60 s per phase, `stress-ng` workload.
 >
-> **Context:** the first two runs were taken while a feature computation bug existed —
-> `cpu_intensity` and `exec_ratio` were computing the same value (`exec_runtime / burst_ns`),
-> causing virtually all tasks to be misclassified as **Compute** regardless of actual behaviour.
-> The fix in this release corrects the three feature definitions; re-run the benchmark to see
-> the improvement.
+> **Context:** results below are from CachyOS on the hardware listed above. During this run, monitor output showed `k >> d→u` and label skew (`IOwait` dominated), which indicates user-space scheduling was not keeping up consistently under stress.
 
 **Phase 1 — CPU stress (16 × workers, 60 s):**
 
 | Metric | Baseline (CFS) | scx_cognis | Δ |
 |:-------|:--------------:|:----------:|:---:|
-| bogo ops/s (real time) | 21,027 | 3,814 | −81.9% |
-| bogo ops/s (usr time) | 1,381 | 2,014 | +45.8% |
+| bogo ops/s (real time) | 20,765 | 2,116 | −89.8% |
+| bogo ops/s (usr time) | 1,377 | 2,026 | +47.1% |
 
-The usr-time improvement (+46%) shows each worker was *more efficient per CPU second* when
-scheduled by cognis — the real-time gap is the cost of the browser/compositor competing for
-CPU time, which is expected behaviour (Interactive tasks get shorter slices and pre-empt
-Compute workers more frequently).
+The usr-time improvement shows workers are efficient when they run, but the severe real-time drop means they are not being scheduled often enough end-to-end. This aligns with the observed `k >> d→u` fallback pattern.
 
 **Phase 2 — I/O stress (4 × `iomix` workers, 60 s):**
 
 | Metric | Baseline (CFS) | scx_cognis | Δ |
 |:-------|:--------------:|:----------:|:---:|
-| bogo ops/s (real time) | 181,082 | 142,756 | −21.2% |
-| bogo ops/s (usr time) | 43,678 | 40,621 | −7.0% |
+| bogo ops/s (real time) | 180,790 | 158,338 | −12.4% |
+| bogo ops/s (usr time) | 42,660 | 41,031 | −3.8% |
 
-The ~21% real-time gap during I/O phases reflects user-space scheduler round-trip overhead
-(each task must pass through the user-space Rust loop to be dispatched). I/O-bound phases
-are the worst case for this architecture; purely CPU-bound or interactive workloads show
-much smaller overhead.
+The I/O phase still shows overhead relative to CFS, but it is far smaller than the CPU-heavy gap. This suggests the main issue is classification/dispatch behavior under sustained compute pressure rather than pure I/O handling.
 
 **Phase 3 — Mixed stress (16 × `cpu` + 2 × `vm` workers, 60 s):**
 
 | Stressor | Metric | Baseline (CFS) | scx_cognis | Δ |
 |:---------|:-------|:--------------:|:----------:|:---:|
-| CPU ×16 | bogo ops/s (real) | 18,695 | 4,816 | −74.3% |
-| CPU ×16 | bogo ops/s (usr) | 1,395 | 1,783 | +27.8% |
-| VM ×2 | bogo ops/s (real) | 24,523 | 24,311 | −0.9% |
-| VM ×2 | bogo ops/s (usr) | 14,545 | 82,742 | +469% |
+| CPU ×16 | bogo ops/s (real) | 18,776 | 3,582 | −80.9% |
+| CPU ×16 | bogo ops/s (usr) | 1,397 | 2,049 | +46.7% |
+| VM ×2 | bogo ops/s (real) | 24,517 | 20,166 | −17.7% |
+| VM ×2 | bogo ops/s (usr) | 14,759 | 149,093 | +910% |
 
-VM workers show near-identical real-time throughput (−0.9%) with a large usr-time gain
-(+469%) because vm workers are memory-bound — cognis assigns them longer slices
-(`Compute` multiplier = 2×) so they amortise the context-switch cost better than CFS.
-
-The CPU worker real-time gap (−74%) is driven by the interactive pre-emption design:
-browser + compositor tasks interrupt CPU workers frequently, trading raw compute throughput
-for lower frame latency. The ~28% usr-time improvement confirms the workers themselves
-run efficiently when scheduled.
+Mixed-phase throughput remains below baseline, and this correlates with monitor traces showing almost no `Interactive` labels and very high kernel fallback dispatches. In other words, this run does **not** show expected out-of-the-box Cognis behavior yet.
 
 > [!TIP]
-> These numbers were captured with the legacy feature computation. After the feature fix
-> (classifier sees correct Interactive/Compute split), the real-time CPU gap is expected
-> to narrow because cognis can now distinguish the browser's compositor from compute workers
-> and pre-empt with more precision.
+> If you compare on CachyOS, keep CPU governor fixed (`performance`) for both schedulers, run each mode at least 3 times, and compare median values. Single runs can swing significantly.
 
 [↑ Back to Table of Contents](#table-of-contents)
 
