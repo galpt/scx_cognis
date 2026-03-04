@@ -488,13 +488,14 @@ Each line from `--monitor` is a snapshot of one polling interval. All counters l
 #### Full Output Format
 
 ```
-[cognis] r: 5/16  q:1 /0   | pf:0 | d→u:312   k:140 c:0  b:0  f:0  | cong:0 | 🧠 Interactive:18  Compute:3  IOwait:2  RT:0  Unknown:1 | quarantine:0 flagged:0 | slice:4000µs reward:0.42
+[cognis] tldr: Rest assured! I'm keeping your system responsive.        | r:  5/16  q:1 /0   | pf:0 | d→u:312   k:140 c:0  b:0  f:0  | cong:0 | 🧠 Interactive:18  Compute:3  IOwait:2  RT:0  Unknown:0 | quarantine:0 flagged:0 | slice:4000µs reward:0.42
 ```
 
 #### Column Reference
 
 | Column | Full Name | Type | Meaning |
 |:---|:---|:---|:---|
+| `tldr: ...` | human summary | computed | One-line plain-English summary of current system health. Changes every interval based on load, reward, congestion, and threat level. See the [TLDR message reference](#tldr-message-reference) below. |
 | `r: 5/16` | running / online CPUs | instant | Tasks actively executing right now out of total online CPUs. High ratios (≥ 0.8) mean the system is busy. |
 | `q:1 /0` | queued / scheduled | instant | `queued` = tasks handed by the kernel to userspace and waiting for a dispatch decision; `scheduled` = tasks that have been ordered but not yet sent back to BPF. Under normal load both stay near 0. |
 | `pf:0` | page faults | instant | Page faults inside the userspace scheduler itself (should always be **0**; any non-zero value means the scheduler binary was swapped out, which hurts latency). |
@@ -527,6 +528,33 @@ The KNN classifier uses a **sliding window of 512 labelled samples** and 5 neare
 | **Unknown** | 1.0× | none of the above — classifier not yet warmed up |
 
 > **Why does Interactive dominate?** Most desktop, service, and shell tasks have short, frequent scheduling bursts (`exec_ratio < 0.3`), so the heuristic naturally classifies them as Interactive. This is intentional: when in doubt, treat a task as latency-sensitive. The KNN refines this over time as it gathers more data.
+
+#### TLDR Message Reference
+
+Messages are evaluated each interval in **highest-severity-first** order. The first matching condition wins.
+
+| Message | Condition | What to do |
+|:---|:---|:---|
+| `I'm being swapped out! Latency will spike — check available RAM!` | `pf > 0` — scheduler binary was paged out | Free memory; the scheduler process should never be swapped |
+| `Dispatch failures detected! Something unexpected went wrong — check dmesg.` | `failed_dispatches > 0` | Run `sudo dmesg \| grep sched` and file a bug |
+| `SOS! The system is overwhelmed. Hanging on by a thread here!` | `reward < −0.5` — deep, sustained congestion | Reduce workload or reboot; something is seriously wrong |
+| `Under siege! Multiple rule-breakers caught and caged — enforcing order.` | `flagged > 5` **and** `quarantined > 5` | Normal if running untrusted workloads; cognis is handling it |
+| `Suspicious behaviour detected! Isolating troublemakers — your system is protected.` | `flagged > 0` — anti-cheat engine fired | Inspect flagged processes with `ps aux` |
+| `Several greedy tasks are throttled — keeping them from hogging your CPU.` | `quarantined > 3` | Some processes keep burning 100% of their slice; they are being rate-limited |
+| `Caught a greedy task! Putting it on a leash so other tasks can breathe.` | `quarantined > 0` | A process exceeded its slice budget; reputation engine is throttling it |
+| `Oh boy! Things are getting really busy. Tightening the reins...` | `congestion > 10` per interval | High burst of work; cognis is adapting — sustained = consider tuning `--slice-us` |
+| `Getting a little crowded in here, but I've got it handled.` | `congestion > 0` | Transient queue build-up; normal under bursty load |
+| `Working hard under pressure — might get bumpy. Stay with me!` | `reward < 0` (no explicit congestion) | Latency/throughput imbalance; usually self-corrects |
+| `Your CPU is at full throttle! Giving compute tasks the runway they need.` | `load ≥ 85%`, compute-dominated | CPU-bound workload (compilation, encoding); expected behaviour |
+| `Busy but responsive! Juggling lots of interactive tasks like a pro.` | `load ≥ 85%`, interactive-dominated | Heavy desktop/gaming load; cognis is prioritising responsiveness |
+| `Running hot! Balancing a heavy mixed workload across all cores.` | `load ≥ 85%`, mixed | All cores busy with varied work |
+| `A solid workload — distributing tasks evenly and keeping things smooth.` | `load 65–85%` | Normal moderately-loaded system |
+| `Smooth sailing! Everything is running beautifully right now.` | `reward ≥ 0.7`, `load < 50%` | Ideal operating conditions |
+| `Rest assured! I'm keeping your system responsive.` | `reward ≥ 0.4`, interactive-heavy | System healthy, desktop/UI is snappy |
+| `Compute tasks are in full swing — throughput maximised, interactivity preserved.` | `reward ≥ 0.4`, compute-heavy | Background compute running efficiently without hurting interactivity |
+| `Balancing work steadily — nothing to worry about.` | `reward ≥ 0.4`, balanced | Healthy mixed workload |
+| `System is mostly idle. Just here waiting to help!` | `load < 10%` | Light load; cognis is in standby |
+| `Keeping an eye on things — all nominal.` | fallback | Default: nothing notable to report |
 
 [↑ Back to Table of Contents](#table-of-contents)
 

@@ -65,11 +65,108 @@ pub struct Metrics {
 }
 
 impl Metrics {
+    /// Derive a human-readable one-liner summarising current system health.
+    /// Scenarios are checked highest-severity first so the most pressing issue
+    /// always surfaces in the output.
+    pub fn tldr(&self) -> &'static str {
+        let reward = self.reward_ema_x100 as f64 / 100.0;
+        let cpus = self.nr_cpus.max(1);
+        let load = self.nr_running as f64 / cpus as f64;
+        let classified = self.nr_interactive + self.nr_compute + self.nr_iowait + self.nr_realtime;
+        let compute_heavy = classified > 0 && self.nr_compute > classified / 2;
+        let interactive_heavy = classified > 0 && self.nr_interactive > classified / 2;
+
+        // ── Worst ──────────────────────────────────────────────────────────
+        // Scheduler itself is being paged out — immediate latency spike.
+        if self.nr_page_faults > 0 {
+            return "I'm being swapped out! Latency will spike — check available RAM!";
+        }
+        // Any dispatch failure means a kernel/BPF-level error.
+        if self.nr_failed_dispatches > 0 {
+            return "Dispatch failures detected! Something unexpected went wrong — check dmesg.";
+        }
+        // Reward deeply negative → sustained, uncontrolled congestion.
+        if reward < -0.5 {
+            return "SOS! The system is overwhelmed. Hanging on by a thread here!";
+        }
+        // Many rule-breakers caught simultaneously.
+        if self.nr_flagged > 5 && self.nr_quarantined > 5 {
+            return "Under siege! Multiple rule-breakers caught and caged — enforcing order.";
+        }
+        // Anti-cheat engine fired.
+        if self.nr_flagged > 0 {
+            return "Suspicious behaviour detected! Isolating troublemakers — your system is protected.";
+        }
+        // Multiple greedy tasks throttled by reputation engine.
+        if self.nr_quarantined > 3 {
+            return "Several greedy tasks are throttled — keeping them from hogging your CPU.";
+        }
+        // At least one greedy task quarantined.
+        if self.nr_quarantined > 0 {
+            return "Caught a greedy task! Putting it on a leash so other tasks can breathe.";
+        }
+        // Heavy congestion in the scheduler queue.
+        if self.nr_sched_congested > 10 {
+            return "Oh boy! Things are getting really busy. Tightening the reins...";
+        }
+        // Mild congestion.
+        if self.nr_sched_congested > 0 {
+            return "Getting a little crowded in here, but I've got it handled.";
+        }
+        // Reward negative without explicit congestion events.
+        if reward < 0.0 {
+            return "Working hard under pressure — might get bumpy. Stay with me!";
+        }
+
+        // ── Middle ground ──────────────────────────────────────────────────
+        // High load, compute-dominated.
+        if load >= 0.85 && compute_heavy {
+            return "Your CPU is at full throttle! Giving compute tasks the runway they need.";
+        }
+        // High load, interactive-dominated.
+        if load >= 0.85 && interactive_heavy {
+            return "Busy but responsive! Juggling lots of interactive tasks like a pro.";
+        }
+        // High overall load, mixed workload.
+        if load >= 0.85 {
+            return "Running hot! Balancing a heavy mixed workload across all cores.";
+        }
+        // Moderate-high load, smooth reward.
+        if load >= 0.65 {
+            return "A solid workload — distributing tasks evenly and keeping things smooth.";
+        }
+
+        // ── Best ───────────────────────────────────────────────────────────
+        // Great reward, low-to-moderate load.
+        if reward >= 0.7 && load < 0.5 {
+            return "Smooth sailing! Everything is running beautifully right now.";
+        }
+        // Good reward, mostly interactive.
+        if reward >= 0.4 && interactive_heavy {
+            return "Rest assured! I'm keeping your system responsive.";
+        }
+        // Good reward, compute in progress.
+        if reward >= 0.4 && compute_heavy {
+            return "Compute tasks are in full swing — throughput maximised, interactivity preserved.";
+        }
+        // Good reward, balanced mix.
+        if reward >= 0.4 {
+            return "Balancing work steadily — nothing to worry about.";
+        }
+        // System mostly idle (cold start or light desktop).
+        if load < 0.1 {
+            return "System is mostly idle. Just here waiting to help!";
+        }
+        // Default: nominal operation.
+        "Keeping an eye on things — all nominal."
+    }
+
     pub fn format<W: Write>(&self, w: &mut W) -> Result<()> {
         writeln!(
             w,
-            "[cognis] r:{:>3}/{:<3} q:{:<3}/{:<3} | pf:{:<4} | d→u:{:<6} k:{:<4} c:{:<4} b:{:<4} f:{:<4} | cong:{:<4} | \
+            "[cognis] tldr: {:<55} | r:{:>3}/{:<3} q:{:<3}/{:<3} | pf:{:<4} | d→u:{:<6} k:{:<4} c:{:<4} b:{:<4} f:{:<4} | cong:{:<4} | \
              🧠 Interactive:{:<4} Compute:{:<4} IOwait:{:<4} RT:{:<4} Unknown:{:<4} | quarantine:{} flagged:{} | slice:{}µs reward:{:.2}",
+            self.tldr(),
             self.nr_running,
             self.nr_cpus,
             self.nr_queued,
