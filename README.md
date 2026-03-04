@@ -263,12 +263,12 @@ Panels:
 
 | Panel | Content |
 |:---|:---|
-| Header | Scheduler name, uptime, kernel version |
-| Overview | Running / queued / scheduled task counts, CPU count |
-| Classification | Live bar gauges for Interactive / Compute / IoWait / RealTime |
-| Q-learning Policy | Current slice, reward EMA, ε value |
-| Latency Sparkline | Rolling 120-sample chart of average per-event inference (µs) |
-| Wall of Shame | Top 10 quarantined or anti-cheat-flagged PIDs |
+| Header | Scheduler name, live CPU/running/queued counts, current time-slice |
+| Overview | User/kernel/failed dispatch counts, congestion events, page faults, CPU load % |
+| Classification | Live bar gauges for Interactive / Compute / IoWait / RealTime with quarantine/flagged counts |
+| Q-learning Policy | Current time-slice, Q-learning reward EMA, average inference latency, latency budget check |
+| Latency Chart | Rolling 120-sample line chart of average per-event inference (µs) |
+| Wall of Shame | Top quarantined or anti-cheat-flagged PIDs with trust score and cheat flag |
 
 [↑ Back to Table of Contents](#table-of-contents)
 

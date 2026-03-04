@@ -225,7 +225,7 @@ fn draw_classification(f: &mut Frame, area: Rect, m: &Metrics) {
         )),
     ];
     let block = Block::default().borders(Borders::ALL).title(Span::styled(
-        " Task Classification (KNN) ",
+        " Task Classification (Heuristic) ",
         Style::default()
             .fg(Color::Yellow)
             .add_modifier(Modifier::BOLD),

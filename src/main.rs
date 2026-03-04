@@ -896,6 +896,11 @@ impl<'a> Scheduler<'a> {
                 let should_render = self.last_tui_render.elapsed() >= Duration::from_millis(50);
                 if should_render {
                     self.last_tui_render = Instant::now();
+                    // Feed fresh metrics to TUI state regardless of whether a
+                    // stats client is connected (update_tui is normally only
+                    // called when req_ch delivers a client request).
+                    let m = self.get_metrics();
+                    self.update_tui(&m);
                     if let (Some(ref state), Some(ref mut term)) =
                         (&self.tui_state, &mut self.tui_term)
                     {
