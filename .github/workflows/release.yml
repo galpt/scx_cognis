@@ -104,6 +104,7 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Compute next version from latest tag
+        id: compute_version
         run: |
           # Fetch all tags so we can find the latest release
           git fetch --tags --quiet
@@ -131,7 +132,7 @@ jobs:
 
           NEW_VERSION="${MAJOR}.${MINOR}.${PATCH}"
           echo "New version: $NEW_VERSION"
-          echo "NEW_VERSION=$NEW_VERSION" >> "$GITHUB_ENV"
+          echo "new_version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Install system dependencies
         run: |
@@ -154,7 +155,7 @@ jobs:
 
       - name: Patch Cargo.toml version
         run: |
-          sed -i "s/^version = \".*\"/version = \"${{ env.NEW_VERSION }}\"/" Cargo.toml
+          sed -i "s/^version = \".*\"/version = \"${{ steps.compute_version.outputs.new_version }}\"/" Cargo.toml
           grep '^version' Cargo.toml
 
       - name: cargo build --release
@@ -173,14 +174,14 @@ jobs:
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git tag "v${{ env.NEW_VERSION }}"
-          git push origin "v${{ env.NEW_VERSION }}"
+          git tag "v${{ steps.compute_version.outputs.new_version }}"
+          git push origin "v${{ steps.compute_version.outputs.new_version }}"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v${{ env.NEW_VERSION }}
-          name: v${{ env.NEW_VERSION }}
+          tag_name: v${{ steps.compute_version.outputs.new_version }}
+          name: v${{ steps.compute_version.outputs.new_version }}
           files: |
             release/scx_cognis-linux-x86_64.tar.gz
             release/scx_cognis-linux-x86_64.tar.gz.sha256
