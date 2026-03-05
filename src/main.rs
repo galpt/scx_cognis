@@ -472,12 +472,69 @@ impl<'a> Scheduler<'a> {
         q.push_back(task);
     }
 
-    /// Pop the highest-priority task available across all five buckets.
+    /// Pop the highest-priority task available across all five buckets,
+    /// with anti-starvation promotion.
     ///
-    /// Priority order: RealTime > Interactive > IoWait > Unknown > Compute.
+    /// Normal priority order: RealTime > Interactive > IoWait > Unknown > Compute.
     /// Within a bucket, tasks are served FIFO (insertion order).
+    ///
+    /// # Anti-starvation
+    ///
+    /// Strict bucket priority causes lower-priority tasks to starve when
+    /// higher-priority traffic is sustained.  The critical case is unbound
+    /// kernel workers (`kworker/uN:M`, `nr_cpus_allowed > 1`): they are routed
+    /// through the Rust scheduler (not the BPF per-CPU fast-path), can be
+    /// classified as `Compute` due to CPU-intensive burst behaviour, and then
+    /// wait indefinitely behind a stream of Interactive/IoWait tasks — until
+    /// the sched_ext watchdog fires (`EXIT: runnable task stall` at 5 s).
+    ///
+    /// Fix: before applying the normal priority order, scan the front of every
+    /// non-RT bucket.  Any task that has been waiting longer than
+    /// `STARVATION_NS` (500 ms = 10× below the 5 s watchdog) is returned
+    /// immediately, regardless of its label priority.  Buckets are checked from
+    /// lowest to highest priority so the most-starved task wins when multiple
+    /// buckets cross the threshold simultaneously.
+    ///
+    /// Cost: one `now_ns()` vDSO call + four saturating-subtract comparisons
+    /// per dispatch — O(1), < 50 ns total.
     #[inline(always)]
     fn pop_highest_priority_task(&mut self) -> Option<Task> {
+        // 500 ms = 10× safety margin below the 5 s sched_ext watchdog.
+        const STARVATION_NS: u64 = 500_000_000;
+        let now = Self::now_ns();
+
+        // Check buckets from lowest → highest priority so the most-starved
+        // bucket wins when multiple buckets are simultaneously over threshold.
+        if self
+            .compute_queue
+            .front()
+            .map_or(false, |t| now.saturating_sub(t.timestamp) >= STARVATION_NS)
+        {
+            return self.compute_queue.pop_front();
+        }
+        if self
+            .unknown_queue
+            .front()
+            .map_or(false, |t| now.saturating_sub(t.timestamp) >= STARVATION_NS)
+        {
+            return self.unknown_queue.pop_front();
+        }
+        if self
+            .iowait_queue
+            .front()
+            .map_or(false, |t| now.saturating_sub(t.timestamp) >= STARVATION_NS)
+        {
+            return self.iowait_queue.pop_front();
+        }
+        if self
+            .interactive_queue
+            .front()
+            .map_or(false, |t| now.saturating_sub(t.timestamp) >= STARVATION_NS)
+        {
+            return self.interactive_queue.pop_front();
+        }
+
+        // Normal priority order.
         if let Some(t) = self.rt_queue.pop_front() {
             return Some(t);
         }
