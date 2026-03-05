@@ -88,6 +88,17 @@ pub struct TaskFeatures {
     /// Reserved for future heuristic conditions.
     #[allow(dead_code)]
     pub cpu_affinity: f32,
+    /// Performance criticality — how much this task benefits from running on
+    /// the fastest available core (P-core) vs an efficient core (E-core).
+    ///
+    /// Approximated from cpu_intensity and exec_ratio:
+    ///   - High value: tasks that use lots of CPU and/or seldom sleep.
+    ///   - Low value: tasks that spend most of their time sleeping (I/O-bound).
+    ///
+    /// Used by the A* load balancer to dynamically route tasks to P vs E cores
+    /// based on a system-wide average threshold (rather than a static label→core
+    /// rule).  Range [0, 1].  Computed in `main.rs::compute_features()`.
+    pub perf_cri: f32,
 }
 
 /// Deterministic, stateless heuristic task classifier.
@@ -155,6 +166,7 @@ mod tests {
             exec_ratio: exec,
             weight_norm: 0.01,
             cpu_affinity: 1.0,
+            perf_cri: 0.5, // neutral default for classifier tests
         }
     }
 
@@ -217,6 +229,7 @@ mod tests {
             exec_ratio: 0.5,
             weight_norm: 0.99,
             cpu_affinity: 1.0,
+            perf_cri: 1.0, // RealTime always max perf_cri
         };
         assert_eq!(clf.classify(&f), TaskLabel::RealTime);
     }

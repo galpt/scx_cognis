@@ -24,6 +24,21 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+// ── Auto-slice constants ──────────────────────────────────────────────────────
+
+/// Targeted scheduling latency: the time window in which all runnable tasks
+/// should be served at least once.  Mirrors LAVD's targeted_latency concept.
+/// Actual slice = TARGETED_LATENCY_NS / max(nr_runnable_per_cpu, 1).
+const TARGETED_LATENCY_NS: u64 = 15_000_000; // 15 ms
+
+/// Absolute minimum slice regardless of how many tasks are running.
+/// Below this value, context-switch overhead starts dominating.
+const AUTO_SLICE_MIN_NS: u64 = 500_000; // 500 µs
+
+/// Absolute maximum slice even under very low load.
+/// Caps how long a Compute task can lock a CPU when the system is nearly idle.
+const AUTO_SLICE_MAX_NS: u64 = 20_000_000; // 20 ms
+
 // ── Action space ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,11 +50,9 @@ enum Action {
 
 const N_ACTIONS: usize = 3;
 
-// Adjustment ratios per action (applied to current slice).
-// Grow is kept in the action space so the Q-table can choose it when the
-// system is I/O-bound and the slice is already at its minimum.  However,
-// the hard cap (max_slice = base_slice_ns) prevents it from ever inflating
-// above the user's chosen base — growth only cancels a previous shrink.
+// Adjustment ratios per action (applied to current slice within [auto_base/4, auto_base]).
+// Q-learning can only CONTRACT the slice for interactive-heavy phases or RESTORE
+// it when the system is I/O-bound — it cannot inflate above the auto-computed base.
 const ACTION_RATIO: [f64; N_ACTIONS] = [0.80, 1.00, 1.15];
 
 // ── State discretisation ─────────────────────────────────────────────────────
@@ -160,8 +173,14 @@ pub struct PolicyController {
     prev_action: Action,
     /// Target slice value (nanoseconds) — written to shared atomic.
     pub current_slice_ns: u64,
-    /// Base slice from user options (fixed reference point).
+    /// User-configured base slice (acts as ceiling override if > 0; 0 = auto-only).
     base_slice_ns: u64,
+    /// Auto-computed slice ceiling: `TARGETED_LATENCY_NS / nr_runnable_per_cpu`,
+    /// clamped to `[AUTO_SLICE_MIN_NS, AUTO_SLICE_MAX_NS]`.  Updated by `update_load()`.
+    /// This is the dynamic ceiling for Q-learning to operate within — no manual
+    /// tuning required.  The effective ceiling is `min(auto_base_ns, base_slice_ns)`
+    /// so a manual `--slice-us` override is always respected.
+    pub auto_base_ns: u64,
     /// EMA of recent rewards (for TUI display).
     pub reward_ema: f64,
     /// Shared atomic that the scheduler hot-loop reads.
@@ -170,7 +189,10 @@ pub struct PolicyController {
 
 impl PolicyController {
     pub fn new(base_slice_ns: u64) -> Self {
-        let shared = Arc::new(AtomicU64::new(base_slice_ns));
+        // Start the auto-base at a reasonable default.  It will be updated
+        // immediately once the first tick_policy() fires with real load data.
+        let initial_auto = base_slice_ns.clamp(AUTO_SLICE_MIN_NS, AUTO_SLICE_MAX_NS);
+        let shared = Arc::new(AtomicU64::new(initial_auto));
         Self {
             q: QTable::new(),
             epsilon: 0.15,
@@ -178,10 +200,47 @@ impl PolicyController {
             gamma: 0.95,
             prev_state: 0,
             prev_action: Action::Keep,
-            current_slice_ns: base_slice_ns,
+            current_slice_ns: initial_auto,
             base_slice_ns,
+            auto_base_ns: initial_auto,
             reward_ema: 0.0,
             shared_slice_ns: shared,
+        }
+    }
+
+    /// Update the auto-computed slice ceiling based on current system load.
+    ///
+    /// Formula: `TARGETED_LATENCY_NS / max(tasks_per_cpu, 1)`,
+    /// clamped to `[AUTO_SLICE_MIN_NS, AUTO_SLICE_MAX_NS]`.
+    ///
+    /// This mirrors LAVD's `slice = targeted_latency / nr_runnable` formula and
+    /// eliminates the need for a human to tune `--slice-us` for their workload:
+    /// - Lightly loaded system (2 tasks on 8 cores → 0.25 tasks/cpu): 20 ms slice.
+    /// - Moderately loaded (16 tasks on 8 cores → 2 tasks/cpu): 7.5 ms slice.
+    /// - Heavily loaded (80 tasks on 8 cores → 10 tasks/cpu): 1.5 ms slice.
+    ///
+    /// Should be called once per policy tick (every 250 ms) with fresh counters.
+    pub fn update_load(&mut self, nr_runnable: u64, nr_cpus: u64) {
+        if nr_cpus == 0 {
+            return;
+        }
+        let tasks_per_cpu = (nr_runnable as f64 / nr_cpus as f64).max(1.0);
+        let computed = (TARGETED_LATENCY_NS as f64 / tasks_per_cpu) as u64;
+        let new_auto = computed.clamp(AUTO_SLICE_MIN_NS, AUTO_SLICE_MAX_NS);
+
+        // Smooth the update with a gentle EWMA to avoid abrupt slice changes
+        // when the runqueue depth fluctuates rapidly (e.g. burst of fork+exec).
+        let smoothed = ((self.auto_base_ns as f64 * 0.7) + (new_auto as f64 * 0.3)) as u64;
+        self.auto_base_ns = smoothed.clamp(AUTO_SLICE_MIN_NS, AUTO_SLICE_MAX_NS);
+    }
+
+    /// Effective slice ceiling: the lesser of the user's manual `--slice-us`
+    /// override (if non-zero) and the auto-computed load-based ceiling.
+    fn effective_base_ns(&self) -> u64 {
+        if self.base_slice_ns > 0 {
+            self.auto_base_ns.min(self.base_slice_ns)
+        } else {
+            self.auto_base_ns
         }
     }
 
@@ -228,15 +287,14 @@ impl PolicyController {
 
         // Apply action to current slice.
         let ratio = ACTION_RATIO[action as usize];
-        let min_slice = self.base_slice_ns / 4;
-        // Hard cap at base_slice_ns.  The Q-learning policy may only CONTRACT the slice for
-        // interactive-heavy phases, never inflate above the user's --slice-us.
-        // Benchmark analysis: policy inflated to 4× base (80 ms), then the
-        // Compute 2× multiplier pushed actual Compute slices to 160 ms —
-        // completely starving interactive tasks.  Production schedulers
-        // (scx_rustland, scx_flash) never inflate above their configured base.
-        let max_slice = self.base_slice_ns;
-        let new_slice = ((self.current_slice_ns as f64 * ratio) as u64).clamp(min_slice, max_slice);
+        let effective_max = self.effective_base_ns();
+        let min_slice = effective_max / 4;
+        // The effective_max is the lesser of the user's manual override and the
+        // auto-computed load-based ceiling.  Q-learning can only contract the
+        // slice within this window or restore it — it never inflates above the
+        // auto-computed ceiling.  This means on a heavily-loaded system the max
+        // slice automatically shrinks to give all tasks a fair turn.
+        let new_slice = ((self.current_slice_ns as f64 * ratio) as u64).clamp(min_slice, effective_max);
 
         self.current_slice_ns = new_slice;
         self.prev_state = state;
@@ -302,6 +360,8 @@ mod tests {
     #[test]
     fn slice_stays_in_bounds() {
         let mut ctrl = PolicyController::new(20_000_000); // 20 ms base
+        // Simulate a load of 4 tasks across 2 CPUs → 2 tasks/cpu → 7.5 ms auto-base.
+        ctrl.update_load(4, 2);
         let sig = SchedulerSignal {
             load_norm: 0.8,
             interactive_frac: 0.3,
@@ -313,8 +373,16 @@ mod tests {
             ctrl.update(&sig);
         }
         let slice = ctrl.read_slice_ns();
-        // Min is base/4 = 5 ms; max is base = 20 ms (no inflation allowed).
-        assert!(slice >= 20_000_000 / 4);
-        assert!(slice <= 20_000_000);
+        let effective_max = ctrl.effective_base_ns();
+        let effective_min = effective_max / 4;
+        // Slice must be within [effective_max / 4, effective_max].
+        assert!(
+            slice >= effective_min,
+            "slice {slice} below min {effective_min}"
+        );
+        assert!(
+            slice <= effective_max,
+            "slice {slice} above max {effective_max}"
+        );
     }
 }

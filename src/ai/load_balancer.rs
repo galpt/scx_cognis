@@ -99,6 +99,15 @@ pub struct AStarLoadBalancer {
     /// Topology: cpu_id → state.
     pub cpus: HashMap<i32, CpuState>,
     pub weights: CostWeights,
+    /// EWMA of per-task performance criticality observed system-wide.
+    ///
+    /// Tasks with `perf_cri > avg_perf_cri` are routed to P-cores (if available).
+    /// Tasks below average are routed to E-cores.  Updated periodically by the
+    /// policy tick via `update_avg_perf_cri()`.
+    ///
+    /// Starts at 0.5 (the centre of the [0, 1] range) so the system is
+    /// symmetrical until real observations arrive.
+    pub avg_perf_cri: f32,
 }
 
 impl AStarLoadBalancer {
@@ -106,6 +115,7 @@ impl AStarLoadBalancer {
         Self {
             cpus: HashMap::new(),
             weights: CostWeights::default(),
+            avg_perf_cri: 0.5,
         }
     }
 
@@ -122,19 +132,32 @@ impl AStarLoadBalancer {
         }
     }
 
+    /// Update the system-wide average performance criticality score.
+    ///
+    /// Called from `tick_policy()` with the EWMA of per-task `perf_cri` values
+    /// observed in the most recent scheduling window.  Uses a gentle EWMA (α=0.15)
+    /// to avoid over-reacting to short-lived bursts.
+    pub fn update_avg_perf_cri(&mut self, new_avg: f32) {
+        self.avg_perf_cri = self.avg_perf_cri * 0.85 + new_avg * 0.15;
+    }
+
     /// Select the best CPU for a task.
     ///
     /// * `prev_cpu`   — the CPU the task last ran on.
     /// * `label`      — the task label from the heuristic classifier.
     /// * `quarantine` — whether this task is flagged by the anti-cheat engine.
+    /// * `perf_cri`   — the task's performance criticality score (0..1).  Tasks
+    ///                  above `self.avg_perf_cri` are routed to P-cores; tasks
+    ///                  below are routed to E-cores.  This replaces the static
+    ///                  label→core-type mapping and adapts to the actual workload.
     ///
     /// Returns the selected `cpu_id`, or `RL_CPU_ANY` (-1) as a fallback.
-    pub fn select_cpu(&self, prev_cpu: i32, label: TaskLabel, quarantine: bool) -> i32 {
+    pub fn select_cpu(&self, prev_cpu: i32, label: TaskLabel, quarantine: bool, perf_cri: f32) -> i32 {
         if self.cpus.is_empty() {
             return -1; // RL_CPU_ANY
         }
 
-        let preferred_type = preferred_core_type(label);
+        let preferred_type = self.preferred_core_type(label, perf_cri);
         let prev_numa = self.cpus.get(&prev_cpu).map(|c| c.numa_node).unwrap_or(0);
 
         // A* search.  The "graph" is flat (every CPU is reachable), so we just
@@ -190,14 +213,29 @@ impl AStarLoadBalancer {
 
         util_cost + numa_cost + type_cost + therm_cost
     }
-}
 
-fn preferred_core_type(label: TaskLabel) -> CoreType {
-    match label {
-        TaskLabel::Interactive | TaskLabel::RealTime => CoreType::Performance,
-        TaskLabel::Compute => CoreType::Performance,
-        TaskLabel::IoWait => CoreType::Efficient,
-        TaskLabel::Unknown => CoreType::Unknown,
+    /// Determine the preferred core type for a task based on its performance
+    /// criticality score relative to the system-wide average.
+    ///
+    /// Unlike the old static `label → CoreType` mapping, this method dynamically
+    /// adjusts to the actual workload: if all tasks have high perf_cri (e.g. on
+    /// a pure gaming machine), all of them compete for P-cores on merit.  If
+    /// the system is mostly idle (all perf_cri near 0.5 = avg), the P/E split
+    /// reflects actual need rather than a hardcoded category.
+    ///
+    /// RealTime tasks are always routed to P-cores regardless of score.
+    fn preferred_core_type(&self, label: TaskLabel, perf_cri: f32) -> CoreType {
+        // RealTime tasks unconditionally require the fastest available core.
+        if matches!(label, TaskLabel::RealTime) {
+            return CoreType::Performance;
+        }
+        // On non-hybrid systems every CPU is Performance — the comparison is
+        // trivially true and every task "prefers" Performance, which is correct.
+        if perf_cri >= self.avg_perf_cri {
+            CoreType::Performance
+        } else {
+            CoreType::Efficient
+        }
     }
 }
 
@@ -223,7 +261,8 @@ mod tests {
         lb.update_cpu(make_cpu(1, 0.0, CoreType::Performance)); // idle
         lb.update_cpu(make_cpu(2, 0.8, CoreType::Performance));
 
-        let best = lb.select_cpu(0, TaskLabel::Interactive, false);
+        // perf_cri = 0.8 > avg_perf_cri = 0.5  →  prefers Performance core; idle wins.
+        let best = lb.select_cpu(0, TaskLabel::Interactive, false, 0.8);
         assert_eq!(best, 1);
     }
 
@@ -244,7 +283,7 @@ mod tests {
         });
 
         // Quarantined task must land on cpu 1.
-        let best = lb.select_cpu(0, TaskLabel::Compute, true);
+        let best = lb.select_cpu(0, TaskLabel::Compute, true, 0.5);
         assert_eq!(best, 1);
     }
 }

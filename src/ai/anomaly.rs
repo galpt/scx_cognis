@@ -134,8 +134,9 @@ const MAX_DEPTH: usize = 8; // ceil(log2(SAMPLE_SIZE)) ≈ 7
 
 /// Lightweight Isolation Forest for real-time anomaly detection.
 ///
-/// The anomaly score is in (0, 1).  Scores above `ANOMALY_THRESHOLD` indicate
-/// likely scheduler abuse.
+/// The anomaly score is in (0, 1).  Scores above the adaptive threshold (which
+/// self-calibrates to the p95 of observed scores, floored at this value)
+/// indicate likely scheduler abuse.
 pub const ANOMALY_THRESHOLD: f32 = 0.65;
 
 pub struct IsolationForest {
@@ -201,17 +202,49 @@ impl IsolationForest {
 
 // ── Anti-Cheat Engine ───────────────────────────────────────────────────────
 
+/// Consecutive anomaly ticks required before a TGID is quarantined.
+///
+/// A single transient measurement spike (e.g. a burst fork during app init,
+/// or a brief yield-spin during a lock convoy) should not immediately
+/// quarantine a legitimate process.  Three consecutive anomaly readings provide
+/// a reasonable confirmation window without adding meaningful latency.
+const CONFIRM_TICKS: u32 = 3;
+
+/// Consecutive normal ticks required for an already-quarantined TGID to be
+/// automatically pardoned.
+///
+/// Once a process has been flagged, it must demonstrate sustained normal
+/// behaviour before being unquarantined.  Five ticks (≈ 500 ms at the 100 ms
+/// anti-cheat interval) is long enough to confirm the process has settled.
+const PARDON_TICKS: u32 = 5;
+
 /// Manages per-TGID statistics and runs anomaly detection via `IsolationForest`.
+///
+/// False-positive mitigations:
+///  1. Confirmation window (`CONFIRM_TICKS`): a TGID must be anomalous on
+///     `CONFIRM_TICKS` consecutive evaluations before being quarantined.
+///  2. Adaptive threshold: the anomaly threshold self-calibrates each retrain
+///     cycle to the p95 of all observed scores (floored at `ANOMALY_THRESHOLD`).
+///     This prevents the fixed 0.65 value from over-flagging on workloads where
+///     most processes naturally have higher scores (e.g. build servers).
+///  3. Timed pardon: a quarantined TGID that scores below the adaptive threshold
+///     for `PARDON_TICKS` consecutive ticks is automatically unquarantined.
 pub struct AntiCheatEngine {
     forest: IsolationForest,
     stats: HashMap<i32, ProcessStats>,
-    /// TGIDs currently flagged as cheaters.
+    /// TGIDs currently flagged as anomalous, with the timestamp of flagging.
     flagged: HashMap<i32, u64>,
+    /// Consecutive anomaly readings per TGID (resets on any normal reading).
+    confirm_counts: HashMap<i32, u32>,
+    /// Consecutive normal readings for already-flagged TGIDs (used for pardon).
+    pardon_counts: HashMap<i32, u32>,
     tick_count: u64,
     /// Training data buffer (ring buffer of recent samples).
     train_buf: Vec<[f32; FEATURE_DIM]>,
     train_max: usize,
     train_head: usize,
+    /// Self-calibrating threshold: p95 of observed scores, floored at `ANOMALY_THRESHOLD`.
+    adaptive_threshold: f32,
 }
 
 const TRAIN_BUF_SIZE: usize = 512;
@@ -223,10 +256,13 @@ impl AntiCheatEngine {
             forest: IsolationForest::new(),
             stats: HashMap::with_capacity(256),
             flagged: HashMap::new(),
+            confirm_counts: HashMap::new(),
+            pardon_counts: HashMap::new(),
             tick_count: 0,
             train_buf: vec![[0.0; FEATURE_DIM]; TRAIN_BUF_SIZE],
             train_max: TRAIN_BUF_SIZE,
             train_head: 0,
+            adaptive_threshold: ANOMALY_THRESHOLD,
         }
     }
 
@@ -248,7 +284,7 @@ impl AntiCheatEngine {
         entry.window_ns = window_ns;
     }
 
-    /// Tick — evaluate all tracked TGIDs.  Returns the list of newly-flagged TGIDs.
+    /// Tick — evaluate all tracked TGIDs.  Returns the list of newly-quarantined TGIDs.
     pub fn tick(&mut self, now_ns: u64) -> Vec<i32> {
         self.tick_count += 1;
 
@@ -260,7 +296,7 @@ impl AntiCheatEngine {
             .map(|(&tgid, s)| (tgid, s.to_features()))
             .collect();
 
-        // Possibly retrain.
+        // Possibly retrain and recalibrate the adaptive threshold.
         if self.tick_count.is_multiple_of(RETRAIN_EVERY) {
             let samples: Vec<[f32; FEATURE_DIM]> = stats_snapshot.iter().map(|(_, f)| *f).collect();
             // Also include historical buffer.
@@ -271,6 +307,19 @@ impl AntiCheatEngine {
                 }
             }
             self.forest.fit(&all);
+
+            // Recalibrate adaptive threshold to the p95 of current sample scores.
+            // Using a percentile means the threshold naturally adapts to the
+            // score distribution of the actual workload, avoiding false positives
+            // on build servers or other high-score-baseline environments.
+            if !all.is_empty() {
+                let mut scores: Vec<f32> = all.iter().map(|s| self.forest.score(s)).collect();
+                scores.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                let p95_idx = ((scores.len() as f32 * 0.95) as usize).min(scores.len() - 1);
+                let p95 = scores[p95_idx];
+                // Floor at ANOMALY_THRESHOLD to never become too permissive.
+                self.adaptive_threshold = p95.max(ANOMALY_THRESHOLD);
+            }
         }
 
         for (tgid, feats) in stats_snapshot {
@@ -278,14 +327,41 @@ impl AntiCheatEngine {
             self.train_buf[self.train_head] = feats;
             self.train_head = (self.train_head + 1) % self.train_max;
 
-            if self.forest.is_anomaly(&feats) {
-                if let std::collections::hash_map::Entry::Vacant(e) = self.flagged.entry(tgid) {
-                    e.insert(now_ns);
-                    new_flags.push(tgid);
+            let score = self.forest.score(&feats);
+            let is_anomalous = score > self.adaptive_threshold;
+
+            if is_anomalous {
+                // Require CONFIRM_TICKS consecutive anomaly readings before quarantining.
+                // This eliminates false positives from transient spikes (e.g. app startup,
+                // fork-heavy init phases, or brief lock convoys).
+                let count = self.confirm_counts.entry(tgid).or_insert(0);
+                *count += 1;
+                // Reset pardon streak on any anomaly reading.
+                self.pardon_counts.insert(tgid, 0);
+
+                if *count >= CONFIRM_TICKS {
+                    if let std::collections::hash_map::Entry::Vacant(e) = self.flagged.entry(tgid) {
+                        e.insert(now_ns);
+                        new_flags.push(tgid);
+                    }
+                    // If already flagged, reset pardon counter on each anomaly reading.
                 }
             } else {
-                // Clear flag if process normalised.
-                self.flagged.remove(&tgid);
+                // Normal reading: reset the anomaly confirmation streak.
+                self.confirm_counts.insert(tgid, 0);
+
+                if self.flagged.contains_key(&tgid) {
+                    // Already quarantined — count normal ticks toward pardon.
+                    let pardon = self.pardon_counts.entry(tgid).or_insert(0);
+                    *pardon += 1;
+                    if *pardon >= PARDON_TICKS {
+                        // Sustained normal behaviour: automatically unquarantine.
+                        self.flagged.remove(&tgid);
+                        self.pardon_counts.remove(&tgid);
+                    }
+                } else {
+                    self.pardon_counts.insert(tgid, 0);
+                }
             }
         }
 
@@ -305,6 +381,11 @@ impl AntiCheatEngine {
         }
     }
 
+    /// The current adaptive anomaly threshold (self-calibrates each retrain cycle).
+    pub fn current_threshold(&self) -> f32 {
+        self.adaptive_threshold
+    }
+
     /// All currently flagged TGIDs with their flagging timestamp.
     pub fn wall_of_shame(&self) -> &HashMap<i32, u64> {
         &self.flagged
@@ -314,6 +395,8 @@ impl AntiCheatEngine {
     pub fn evict(&mut self, tgid: i32) {
         self.stats.remove(&tgid);
         self.flagged.remove(&tgid);
+        self.confirm_counts.remove(&tgid);
+        self.pardon_counts.remove(&tgid);
     }
 }
 

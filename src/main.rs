@@ -68,8 +68,15 @@ const NSEC_PER_SEC: u64 = 1_000_000_000;
 /// policy controller — all with a sub-10µs per-event latency target.
 #[derive(Debug, Parser)]
 struct Opts {
-    /// Base scheduling slice duration in microseconds (Q-learning policy adjusts this dynamically).
-    #[clap(short = 's', long, default_value = "5000")]
+    /// Base scheduling slice duration in microseconds.
+    ///
+    /// Set to 0 (default) to let the scheduler auto-compute the optimal slice
+    /// from system load: `targeted_latency (15 ms) / nr_runnable_tasks_per_cpu`.
+    /// This is the recommended mode — no manual tuning required.
+    ///
+    /// Set to a non-zero value to pin the maximum slice to that value, overriding
+    /// the auto-computed ceiling.  Useful for tuning latency budgets on specific hardware.
+    #[clap(short = 's', long, default_value = "0")]
     slice_us: u64,
 
     /// Minimum scheduling slice duration in microseconds.
@@ -135,6 +142,11 @@ struct Task {
     timestamp: u64,
     label: TaskLabel,
     slice_ns: u64,
+    /// Performance criticality score stored as fixed-point u16 (perf_cri × 1000).
+    /// Range 0..=1000, representing 0.0..=1.0 with 0.1% resolution.
+    /// Stored as integer so Task remains fully Eq-comparable for BTreeSet ordering.
+    /// Converted back to f32 when passed to the A* load balancer.
+    perf_cri_fp: u16,
 }
 
 impl Ord for Task {
@@ -241,13 +253,25 @@ struct Scheduler<'a> {
     /// (enqueue → dispatch), in nanoseconds. Updated on every successful
     /// dispatch. Used as `latency_p99_norm` in the Q-learning reward signal.
     sched_latency_ema_ns: f64,
+    /// EWMA of per-task performance criticality scores observed in the current
+    /// scheduling window.  Fed into the A* load balancer periodically so the
+    /// P/E-core routing threshold adapts to the actual workload composition.
+    perf_cri_ema: f32,
 }
 
 impl<'a> Scheduler<'a> {
     fn init(opts: &'a Opts, open_object: &'a mut MaybeUninit<OpenObject>) -> Result<Self> {
         let stats_server = StatsServer::new(stats::server_data()).launch()?;
 
-        let base_slice_ns = opts.slice_us * NSEC_PER_USEC;
+        // When --slice-us is 0 (the default), the auto-slice mode is active:
+        // PolicyController.update_load() computes the slice from system load and
+        // targeted_latency.  base_slice_ns = 0 signals to PolicyController that
+        // the user has not pinned a ceiling, so it uses auto_base_ns exclusively.
+        //
+        // When --slice-us > 0, the user has chosen an explicit ceiling; we use
+        // it as the reference for vruntime fairness AND as the PolicyController
+        // ceiling override.
+        let base_slice_ns = opts.slice_us * NSEC_PER_USEC; // 0 when auto mode
         let slice_ns_min = opts.slice_us_min * NSEC_PER_USEC;
 
         let policy = PolicyController::new(base_slice_ns);
@@ -348,6 +372,7 @@ impl<'a> Scheduler<'a> {
             total_inference_ns: 0,
             inference_samples: 0,
             sched_latency_ema_ns: 0.0,
+            perf_cri_ema: 0.5, // start at midpoint; adapts after first policy tick
         })
     }
 
@@ -422,16 +447,43 @@ impl<'a> Scheduler<'a> {
             1.0
         };
 
+        // Performance criticality: how much would this task benefit from a
+        // fast P-core vs an efficient E-core?
+        //
+        // Approximation from observable burst statistics:
+        //   - Tasks that use lots of CPU (high cpu_intensity) AND spend little
+        //     time sleeping (low exec_ratio) are the most performance-sensitive:
+        //     compilers, video encoders, physics simulations.
+        //   - RealTime tasks always get max perf_cri.
+        //   - I/O-bound tasks (low cpu_intensity) score low: CPU speed barely
+        //     matters when the task is blocked on disk/network most of the time.
+        //
+        // Formula: blend cpu_intensity weight (0.7) with a non-sleep penalty
+        // (0.3) so tasks that are CPU-heavy AND never sleep get a high score
+        // while tasks that are CPU-heavy BUT frequently sleep (e.g. a 120fps
+        // game render thread syncing to vsync) get a moderate score.
+        //
+        // Range: [0, 1].  System-wide average tracked in perf_cri_ema and fed
+        // into the A* load balancer for dynamic P/E routing.
+        let weight_norm = (task.weight as f32 / 10000.0).clamp(0.0, 1.0);
+        let non_sleep = 1.0 - exec_ratio.min(1.0) * 0.5;
+        let perf_cri = if weight_norm > 0.95 {
+            1.0f32 // RealTime tasks unconditionally need the fastest core.
+        } else {
+            (cpu_intensity * 0.7 + non_sleep * 0.3).clamp(0.0, 1.0)
+        };
+
         TaskFeatures {
             runnable_ratio,
             cpu_intensity,
             exec_ratio,
-            weight_norm: (task.weight as f32 / 10000.0).clamp(0.0, 1.0),
+            weight_norm,
             cpu_affinity: (task.nr_cpus_allowed as f32 / (nr_cpus as f32).max(1.0)).clamp(0.0, 1.0),
+            perf_cri,
         }
     }
 
-    fn ai_classify_and_enqueue(&mut self, task: &mut QueuedTask) -> (u64, u64, TaskLabel) {
+    fn ai_classify_and_enqueue(&mut self, task: &mut QueuedTask) -> (u64, u64, TaskLabel, f32) {
         let t0 = Self::now_ns();
 
         let nr_cpus = (*self.bpf.nr_online_cpus_mut()).max(1) as i32;
@@ -481,7 +533,14 @@ impl<'a> Scheduler<'a> {
         }
 
         // Ensure clamp min ≤ max even if user passes large --slice-us-min.
-        let clamp_max = (self.base_slice_ns * 8).max(self.slice_ns_min);
+        // When in auto mode (base_slice_ns == 0), use the policy's current
+        // auto_base_ns as the ceiling reference so clamp_max is meaningful.
+        let ref_base = if self.base_slice_ns > 0 {
+            self.base_slice_ns
+        } else {
+            self.policy.auto_base_ns
+        };
+        let clamp_max = (ref_base * 8).max(self.slice_ns_min);
         slice = slice.clamp(self.slice_ns_min, clamp_max);
         if quarantined {
             slice = self.slice_ns_min;
@@ -502,8 +561,10 @@ impl<'a> Scheduler<'a> {
         task.vtime = if task.vtime == 0 {
             self.vruntime_now
         } else {
-            // Sleeping tasks gain at most one base_slice of credit.
-            let vruntime_min = self.vruntime_now.saturating_sub(self.base_slice_ns);
+            // Sleeping tasks gain at most one auto/base-slice of credit.
+            // Use `ref_base` (policy auto_base or user override) as the cap so
+            // the credit stays meaningful even in auto-slice mode.
+            let vruntime_min = self.vruntime_now.saturating_sub(ref_base);
             task.vtime.max(vruntime_min)
         };
         let slice_ns_actual = task.stop_ts.saturating_sub(task.start_ts);
@@ -535,7 +596,7 @@ impl<'a> Scheduler<'a> {
         self.total_inference_ns += elapsed;
         self.inference_samples += 1;
 
-        (deadline, slice, label)
+        (deadline, slice, label, features.perf_cri)
     }
 
     // ── Drain queued tasks (runs scheduling pipeline per task) ──────────────
@@ -544,8 +605,13 @@ impl<'a> Scheduler<'a> {
         loop {
             match self.bpf.dequeue_task() {
                 Ok(Some(mut task)) => {
-                    let (deadline, slice_ns, label) = self.ai_classify_and_enqueue(&mut task);
+                    let (deadline, slice_ns, label, perf_cri) = self.ai_classify_and_enqueue(&mut task);
                     let timestamp = Self::now_ns();
+
+                    // Update per-task perf_cri EWMA for the load balancer threshold.
+                    // α = 0.05: tracks the running average without being dominated
+                    // by any single burst task in a batch.
+                    self.perf_cri_ema = self.perf_cri_ema * 0.95 + perf_cri * 0.05;
 
                     // Track lifetime for reputation updates.
                     let e = self.lifetimes.entry(task.pid).or_default();
@@ -578,6 +644,7 @@ impl<'a> Scheduler<'a> {
                         timestamp,
                         label,
                         slice_ns,
+                        perf_cri_fp: (perf_cri * 1000.0).clamp(0.0, 1000.0) as u16,
                         qtask: task,
                     });
                 }
@@ -618,7 +685,7 @@ impl<'a> Scheduler<'a> {
         } else {
             let cpu = self
                 .load_bal
-                .select_cpu(task.qtask.cpu, task.label, quarantined);
+                .select_cpu(task.qtask.cpu, task.label, quarantined, task.perf_cri_fp as f32 / 1000.0);
             if cpu >= 0 {
                 cpu
             } else {
@@ -655,15 +722,24 @@ impl<'a> Scheduler<'a> {
         }
         self.last_policy_tick = Instant::now();
 
-        let nr_cpus = (*self.bpf.nr_online_cpus_mut()).max(1) as f64;
-        let nr_running = *self.bpf.nr_running_mut() as f64;
+        let nr_cpus = (*self.bpf.nr_online_cpus_mut()).max(1) as u64;
+        let nr_running = *self.bpf.nr_running_mut() as u64;
         let total_labeled = self.label_counts.iter().sum::<u64>().max(1) as f64;
         let interactive_frac =
             self.label_counts[TaskLabel::Interactive as usize] as f64 / total_labeled;
         let compute_frac = self.label_counts[TaskLabel::Compute as usize] as f64 / total_labeled;
 
+        // Update the auto-computed slice ceiling based on current load.
+        // This mirrors LAVD's slice = targeted_latency / nr_tasks approach and
+        // removes the need for a human to tune --slice-us for their workload.
+        self.policy.update_load(nr_running, nr_cpus);
+
+        // Update the P/E-core routing threshold in the A* load balancer.
+        // Uses the per-task perf_cri EWMA accumulated in drain_queued_tasks().
+        self.load_bal.update_avg_perf_cri(self.perf_cri_ema);
+
         let sig = SchedulerSignal {
-            load_norm: (nr_running / nr_cpus).min(1.0),
+            load_norm: (nr_running as f64 / nr_cpus as f64).min(1.0),
             interactive_frac,
             compute_frac,
             // Real enqueue→dispatch scheduling latency, normalised by 10 ms.
