@@ -823,6 +823,12 @@ impl<'a> Scheduler<'a> {
             self.push_task(task);
             return false;
         }
+        // Mark the target CPU busy so the next select_cpu() call in this
+        // dispatch window won't pick the same CPU again (round-robin effect).
+        // Skipped for RL_CPU_ANY dispatches — BPF distributes those itself.
+        if dispatched.cpu >= 0 {
+            self.cpu_sel.mark_busy(dispatched.cpu);
+        }
         true
     }
 
@@ -1005,6 +1011,14 @@ impl<'a> Scheduler<'a> {
         // By filling the BPF dispatch list with up to nr_cpus tasks at once,
         // every runnable CPU gets a task in a single round-trip.
         let nr_cpus = (*self.bpf.nr_online_cpus_mut()).max(1) as usize;
+        // Reset the idle-CPU bitmask so that each dispatch window starts with
+        // all CPUs considered available.  As tasks are dispatched to specific
+        // CPUs, those CPUs are marked busy one-by-one, producing round-robin
+        // distribution across the eligible pool within each schedule() call.
+        // Without this reset, select_cpu() always returns CPU 0 (trailing_zeros
+        // of a static all_mask), pinning every task to the same CPU and causing
+        // kworker affinity stalls that trip the sched_ext watchdog.
+        self.cpu_sel.reset_idle();
         // Dispatch up to 2× nr_cpus per cycle.  When nr_cpus tasks wake
         // simultaneously (common under burst or compute-saturated workloads),
         // a 1× budget forces an extra schedule() round-trip for the overflow.

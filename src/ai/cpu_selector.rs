@@ -65,9 +65,17 @@ fn cpu_bit(cpu_id: i32) -> u64 {
 
 /// O(1) bitmask CPU selector.
 ///
-/// Replaces `AStarLoadBalancer`.  All placement state lives in three u64 fields
-/// (`p_mask`, `restricted_mask`, `all_mask`) that never grow or shrink after
-/// `Scheduler::init()`.
+/// Replaces `AStarLoadBalancer`.  All placement state lives in four u64 fields:
+/// - `p_mask`:          static P-core membership, set once at init.
+/// - `restricted_mask`: static quarantine-only CPUs, set once at init.
+/// - `all_mask`:        static online CPU set, set once at init.
+/// - `idle_mask`:       **dynamic** — which CPUs are available this dispatch window.
+///
+/// `idle_mask` is reset to `all_mask` at the start of every `schedule()` call
+/// and cleared bit-by-bit as tasks are dispatched to specific CPUs.  This turns
+/// the selection into effective round-robin distribution across CPUs within each
+/// scheduling window, preventing the "always CPU-0" monopoly that caused
+/// kworker stalls when the original idle-mask was never wired up.
 pub struct CpuSelector {
     /// Bit i set = CPU i is a Performance (big/P) core.
     /// On non-hybrid CPUs (AMD, homogeneous Intel, VMs) every bit is set,
@@ -77,6 +85,13 @@ pub struct CpuSelector {
     restricted_mask: u64,
     /// Bit i set = CPU i is online.
     all_mask: u64,
+    /// Bit i set = CPU i is available for dispatch in the current scheduling window.
+    ///
+    /// Reset to `all_mask` at the start of each `schedule()` call via
+    /// `reset_idle()`.  Cleared by `mark_busy(cpu)` after each successful
+    /// dispatch to a specific CPU.  When empty, `select_cpu` falls back to
+    /// `prev_cpu` (respecting CPU affinity) before returning `RL_CPU_ANY`.
+    idle_mask: u64,
     /// Number of online CPUs tracked in `all_mask`.
     pub nr_cpus: u32,
     /// EWMA of per-task performance criticality observed system-wide.
@@ -97,6 +112,7 @@ impl CpuSelector {
             p_mask: 0,
             restricted_mask: 0,
             all_mask: 0,
+            idle_mask: 0,
             nr_cpus: 0,
             avg_perf_cri: 0.5,
         }
@@ -114,6 +130,7 @@ impl CpuSelector {
             return;
         }
         self.all_mask |= bit;
+        self.idle_mask = self.all_mask; // keep idle_mask in sync during init
         self.nr_cpus = self.all_mask.count_ones();
 
         if matches!(state.core_type, CoreType::Performance) {
@@ -129,6 +146,37 @@ impl CpuSelector {
         }
     }
 
+    // ── Dynamic idle-mask management ──────────────────────────────────────────
+
+    /// Reset the idle mask to all online CPUs at the start of a dispatch window.
+    ///
+    /// Called by `Scheduler::schedule()` once before the per-task dispatch loop.
+    /// CPUs are then marked busy one-by-one as tasks are dispatched, giving
+    /// effective round-robin distribution within each scheduling cycle.
+    #[inline(always)]
+    pub fn reset_idle(&mut self) {
+        self.idle_mask = self.all_mask;
+    }
+
+    /// Mark CPU `cpu` as busy (dispatched to this cycle).
+    ///
+    /// Called after a successful `bpf.dispatch_task()` that targeted a specific
+    /// CPU.  Does nothing for `RL_CPU_ANY` dispatches.
+    #[inline(always)]
+    pub fn mark_busy(&mut self, cpu: i32) {
+        self.idle_mask &= !cpu_bit(cpu);
+    }
+
+    /// Mark CPU `cpu` as idle (available for the next task).
+    ///
+    /// Optional: can be called from a BPF idle callback if available.
+    #[inline(always)]
+    pub fn mark_idle(&mut self, cpu: i32) {
+        self.idle_mask |= cpu_bit(cpu) & self.all_mask;
+    }
+
+    // ── Periodic policy update ─────────────────────────────────────────────────
+
     /// Update the system-wide average performance criticality score.
     ///
     /// Called from `tick_policy()` with the EWMA of per-task `perf_cri` values
@@ -141,11 +189,12 @@ impl CpuSelector {
 
     /// Select the best CPU for a task.
     ///
-    /// Cost: 3–6 bit operations + TZCNT = O(1), approximately 1–2 ns.
+    /// Cost: 4–8 bit operations + TZCNT = O(1), approximately 2–3 ns.
     ///
     /// # Parameters
-    /// * `_prev_cpu`  — the CPU the task last ran on (unused; NUMA-distance
-    ///   routing is a planned future extension via per-NUMA masks).
+    /// * `prev_cpu`   — the CPU the task last ran on.  Used as affinity hint:
+    ///   if no idle CPU of the preferred type exists, `prev_cpu` is returned
+    ///   (respecting CPU affinity for kworkers and affinity-pinned threads).
     /// * `label`      — task label from the heuristic classifier.
     /// * `quarantine` — task is anomaly-flagged and must run on restricted CPUs.
     /// * `perf_cri`   — task's performance criticality score ∈ [0, 1].
@@ -153,11 +202,18 @@ impl CpuSelector {
     ///   Below                → routed to E-core.
     ///
     /// # Returns
-    /// The selected `cpu_id` (lowest-numbered bit in the winner mask),
-    /// or `-1` (`RL_CPU_ANY`) if no eligible CPU exists.
+    /// The selected `cpu_id`, or `-1` (`RL_CPU_ANY`) if no eligible CPU exists.
+    ///
+    /// # Selection priority
+    /// 1. Idle CPU of the preferred core type (P or E) — best placement.
+    /// 2. Any idle CPU in the eligible pool — good enough.
+    /// 3. `prev_cpu` if it is in the eligible pool — preserves CPU affinity and
+    ///    cache warmth; critical for kworkers that must run on a specific CPU.
+    /// 4. Any CPU in the pool by lowest bit — last resort (rare; pool non-empty
+    ///    but no idle CPUs and prev_cpu ineligible).
     pub fn select_cpu(
         &self,
-        _prev_cpu: i32,
+        prev_cpu: i32,
         label: TaskLabel,
         quarantine: bool,
         perf_cri: f32,
@@ -183,20 +239,31 @@ impl CpuSelector {
         // All other tasks: compare perf_cri against the system-wide average.
         let want_p = matches!(label, TaskLabel::RealTime) || perf_cri >= self.avg_perf_cri;
 
-        // First: try the preferred core type.
-        let preferred = if want_p {
-            pool & self.p_mask
+        // ── Priority 1: idle CPU of the preferred core type. ──────────────────
+        let idle_pool = pool & self.idle_mask;
+        let preferred_idle = if want_p {
+            idle_pool & self.p_mask
         } else {
-            pool & !self.p_mask // E-core preferred
+            idle_pool & !self.p_mask // E-core preferred
         };
-
-        if preferred != 0 {
-            // trailing_zeros() = TZCNT = 1 instruction.  Picks the lowest-numbered
-            // eligible CPU in the preferred type.
-            return preferred.trailing_zeros() as i32;
+        if preferred_idle != 0 {
+            return preferred_idle.trailing_zeros() as i32;
         }
 
-        // Fallback: relax core-type constraint — any eligible CPU in the pool.
+        // ── Priority 2: any idle CPU in the eligible pool. ────────────────────
+        if idle_pool != 0 {
+            return idle_pool.trailing_zeros() as i32;
+        }
+
+        // ── Priority 3: prev_cpu if eligible (affinity / cache warmth). ───────
+        // This is the critical path for kworkers and CPU-affine threads: when
+        // all CPUs in the pool are already busy this cycle, fall back to the
+        // task's home CPU rather than always picking bit-0 (CPU 0).
+        if prev_cpu >= 0 && (pool & cpu_bit(prev_cpu)) != 0 {
+            return prev_cpu;
+        }
+
+        // ── Priority 4: any eligible CPU — last resort. ───────────────────────
         pool.trailing_zeros() as i32
     }
 }
