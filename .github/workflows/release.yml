@@ -139,6 +139,12 @@ jobs:
     needs: [compute-version, ci-ubuntu, ci-arch, ci-cachyos]
     permissions:
       contents: write
+    # Override the repo-level .cargo/config.toml which redirects the build
+    # output to /tmp/scx_cognis_build (a workaround for the space in the local
+    # dev path). In CI the checkout path has no spaces, so we use the standard
+    # ./target directory so that packaging steps can find the binary reliably.
+    env:
+      CARGO_TARGET_DIR: target
     steps:
       - uses: actions/checkout@v4
         with:

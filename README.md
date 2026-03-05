@@ -149,7 +149,7 @@ schedule loop →  Reputation Engine          (staleness-based, every 1 s)
 #### Heuristic Task Classifier
 
 Dynamically labels each PID as `Interactive`, `Compute`, `IoWait`, `RealTime`, or `Unknown` using a
-deterministic heuristic evaluated on every `ops.enqueue` event. Five task features are tracked:
+deterministic heuristic evaluated on every `ops.enqueue` event. Six task features are tracked:
 
 | Feature | Description |
 |:---|:---|
@@ -158,6 +158,7 @@ deterministic heuristic evaluated on every `ops.enqueue` event. Five task featur
 | `exec_ratio` | $`\text{burst\_ns} / \text{exec\_runtime}`$ — freshness: near $`1.0`$ = just woke; near $`0.0`$ = spinning without sleeping |
 | `weight_norm` | Normalised scheduler weight (priority) |
 | `cpu_affinity` | Allowed CPUs / total online CPUs |
+| `perf_cri` | Performance criticality score $`\in [0,1]`$: $`\text{cpu\_intensity}\times 0.7 + (1 - \text{exec\_ratio}\times 0.5)\times 0.3`$. RealTime tasks are hard-capped to $`1.0`$. Used by the A\* load balancer to route tasks to P/E-cores. |
 
 The primary classification feature is `cpu_intensity`. `prev_assigned_slice_ns` is the slice allocated to this PID on its previous scheduling event (stored in `TaskLifetime`). On first event, `base_slice_ns` is used as fallback. This makes classification stable and loop-free from the second event onward:
 
@@ -181,7 +182,17 @@ Labels influence the base time-slice multiplier and feed into the Reputation Eng
 
 #### Isolation Forest Anti-Cheat Engine
 
-Detects scheduler-abusing processes (fork-bombers, yield-spinners, deadline-gaming) using an approximated Isolation Forest: 32 trees, sample size 128, max depth 8. Anomaly scores are averaged over all trees; tasks scoring above the 0.65 threshold are flagged and routed exclusively to restricted CPUs.
+Detects scheduler-abusing processes (fork-bombers, yield-spinners, deadline-gaming) using an approximated Isolation Forest: 32 trees, sample size 128, max depth 8. Anomaly scores are averaged over all trees.
+
+Three tiers of false-positive protection prevent legitimate processes (e.g. a browser forking during app-init, or a service doing a brief yield-spin during a lock convoy) from being incorrectly quarantined:
+
+| Mechanism | Detail |
+|:---|:---|
+| **Confirmation window** | A task must score above the threshold on **3 consecutive ticks** before quarantine is applied. A single transient spike does not trigger isolation. |
+| **Adaptive threshold** | The threshold self-calibrates to the **p95 of all observed anomaly scores** over the last 500 ticks (one retrain cycle), floored at the hard minimum of `0.65`. This prevents the model from becoming over-sensitive as workloads shift. |
+| **Timed pardon** | Once flagged, a task must score **below** the threshold for **5 consecutive ticks** to be automatically unquarantined. There is no permanent blacklist. |
+
+Confirmed-anomalous tasks are routed exclusively to the restricted CPU set (size configurable via `--restricted-cpus`, default 1 CPU).
 
 The forest is retrained every 500 ticks (~50 s at a 100 ms tick rate) to adapt to workload changes without stalling the hot path.
 
@@ -193,7 +204,7 @@ Selects the optimal CPU for each task using an A\*-inspired heuristic traversal 
 
 - Current CPU utilisation (primary cost)
 - NUMA node distance to the task's previous CPU
-- Core-type mismatch penalty (Performance vs. Efficiency cores)
+- Core-type mismatch penalty (Performance vs. Efficiency cores), using a **dynamic threshold**: the task's `perf_cri` score is compared against the system-wide EWMA `avg_perf_cri` (α = 0.15, updated each tick). Tasks with `perf_cri ≥ avg_perf_cri` are routed to P-cores; lower-scoring tasks go to E-cores. The threshold floats with the live workload mix — a render-heavy workload raises `avg_perf_cri`, reserving P-cores for the most critical threads.
 - Thermal throttle penalty
 - Quarantine routing (flagged tasks may only land on restricted CPUs)
 
@@ -357,17 +368,25 @@ clamped to $`[-1.0,\ +1.0]`$.
 
 The slice action space is: $`\{\, \text{shrink} \times 0.80,\ \text{keep} \times 1.00,\ \text{grow} \times 1.15 \,\}`$.
 
-The Q-learning controller's maximum output is capped at `base_slice_ns` (the user's `--slice-us` setting), preventing any inflation beyond the configured budget.
+The Q-learning controller's output is capped at `effective_base_ns()` — the auto-computed load-adaptive slice (see [Time-Slice Calculation](#time-slice-calculation)) when `--slice-us 0` is used, or the user-provided ceiling otherwise.
 
 [↑ Back to Table of Contents](#table-of-contents)
 
 ### Time-Slice Calculation
 
+The **base slice** is determined by the `PolicyController` each tick:
+
+```math
+\text{base\_slice\_ns} = \operatorname{clamp}\!\left(\frac{\text{TARGETED\_LATENCY\_NS}\,(15\,\text{ms})}{\text{tasks\_per\_cpu}},\; 500\,\mu\text{s},\; 20\,\text{ms}\right)
+```
+
+smoothed with a 0.7/0.3 EWMA to avoid jitter. This **auto-compute mode** is the default (`--slice-us 0`). Passing a non-zero `--slice-us N` value caps the slice at `N` µs — it acts as a safety ceiling, not a fixed target.
+
 For each dispatched task, the final slice is:
 
 ```math
 \begin{aligned}
-\text{slice} ={}& \text{base\_slice\_ns} \\
+\text{slice} ={}& \text{effective\_base\_ns} \\
   {}\times{}& f_{\pi} && \text{(Q-learning policy factor)} \\
   {}\times{}& f_{\ell} && \text{(Interactive}=0.5,\ \text{Compute}=1.0,\ \text{IoWait}=0.75,\ \text{RT}=0.25\text{)} \\
   {}\times{}& f_{r} && \text{(Bayesian trust}\ f_{r} \in [0.25,\ 1.0]\text{)} \\
@@ -375,7 +394,7 @@ For each dispatched task, the final slice is:
 \end{aligned}
 ```
 
-clamped to $`[\text{slice\_ns\_min},\ 8 \times \text{base\_slice\_ns}]`$.
+clamped to $`[\text{slice\_ns\_min},\ 8 \times \text{effective\_base\_ns}]`$.
 
 If the Elman RNN predicts a short burst, the slice is further capped to $`\min(\text{slice},\ 2 \times \text{predicted\_burst})`$.
 
@@ -493,7 +512,10 @@ Usage: scx_cognis [OPTIONS]
 
 Options:
   -s, --slice-us <SLICE_US>
-          Base scheduling slice duration in microseconds [default: 5000]
+          Base scheduling slice in µs. Set to 0 (default) to let the scheduler
+          auto-derive the slice from current system load using the targeted-latency
+          formula (TARGETED_LATENCY_NS / tasks_per_cpu, clamped 500 µs – 20 ms).
+          A non-zero value is respected as a maximum ceiling. [default: 0]
   -S, --slice-us-min <SLICE_US_MIN>
           Minimum scheduling slice duration in microseconds [default: 1000]
   -l, --percpu-local
@@ -570,7 +592,7 @@ Each line from `--monitor` is a snapshot of one polling interval. All counters l
 | `Unknown:1` | unclassified events | per-interval | Events that did not match any heuristic rule. In practice this should never appear with the current 3-band heuristic (every task is classified as Compute, Interactive, or IoWait). Gets a 1× baseline time-slice. |
 | `quarantine:0` | quarantined PIDs | instant | PIDs currently throttled by the **Reputation Engine** for consistently burning 100% of their assigned slice (monopolising behaviour). They receive the minimum time-slice until their reputation recovers. |
 | `flagged:0` | flagged TGIDs | instant | Thread-groups detected as outliers by the **Isolation Forest Anti-Cheat Engine** (statistical anomaly in scheduling behaviour). Flagged tasks are isolated to prevent them from starving others. |
-| `slice:4000µs` | policy time-slice | instant | The **Q-learning Policy Controller**'s current base time-slice in microseconds. The controller adjusts this every ~250 ms based on the reward signal — it shrinks when Interactive tasks are well-served and grows when the system is I/O-bound. |
+| `slice:4000µs` | policy time-slice | instant | The **Q-learning Policy Controller**'s current effective base time-slice in microseconds. In auto mode (`--slice-us 0`, the default) this is derived from `TARGETED_LATENCY_NS / tasks_per_cpu` (clamped 500 µs – 20 ms, EWMA-smoothed) and then fine-tuned by the Q-learning policy factor. The controller shrinks the slice when Interactive tasks are well-served and grows it when the system is mostly idle. |
 | `reward:0.42` | reward EMA | instant | Exponential moving average of the scheduler's **reward function**: $`R = (\text{interactive\_frac} \times \text{load\_norm}) \times 0.7 - \text{congestion} \times 0.2 - \text{latency} \times 0.1`$. Values near $`1.0`$ are ideal (Interactive tasks served under load); near $`0`$ means mostly Compute tasks dominating; negative values indicate sustained high congestion. |
 
 #### Classification Label Deep-Dive
@@ -773,8 +795,9 @@ sudo ./target/release/scx_cognis
 # With TUI dashboard:
 sudo ./target/release/scx_cognis --tui
 
-# With a shorter base slice (good for desktop / interactive workloads):
-sudo ./target/release/scx_cognis --tui -s 10000
+# With a manual slice ceiling (overrides the auto-computed value; use when you
+# want to cap the maximum slice, e.g. on very latency-sensitive workloads):
+sudo ./target/release/scx_cognis --tui -s 5000
 ```
 
 #### Step 5 — (Optional) Install system-wide
