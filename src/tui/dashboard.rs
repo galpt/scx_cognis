@@ -3,11 +3,13 @@
 //
 // TUI Dashboard — built with ratatui.
 //
-// Renders four panels:
-//   1. System overview (running/queued tasks, CPUs, slice).
-//   2. Task classification breakdown (interactive/compute/io/rt).
-//   3. AI policy state (Q-learning reward EMA, predicted vs actual burst).
-//   4. Reputation "Wall of Shame" — flagged/quarantined processes.
+// Renders six panels:
+//   1. Header (scheduler name, live CPU/queued/slice counts).
+//   2. System overview (running/queued tasks, CPUs, dispatch/congestion stats).
+//   3. Task classification breakdown (interactive/compute/io/rt gauges).
+//   4. AI policy state (Q-learning reward EMA, slice, inference latency).
+//   5. Latency chart (rolling 120-sample inference latency line chart).
+//   6. Reputation "Wall of Shame" — flagged/quarantined processes.
 
 use std::collections::VecDeque;
 use std::io;

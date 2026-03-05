@@ -259,7 +259,7 @@ R = (\text{interactive\_frac} \times \text{load\_norm}) \times 0.7 - \text{conge
 
 clamped to $`[-1.0,\ +1.0]`$, where `interactive_frac` is the fraction of currently-queued Interactive tasks and `load_norm` is CPU utilisation (0–1). This produces a meaningful gradient: the policy learns to **shrink** when Compute tasks dominate (low `interactive_frac`) and **keep/grow** only when Interactive tasks are well-served.
 
-$`\varepsilon`$-greedy exploration decays from $`0.30 \to 0.02`$ with each update. The current slice is published to an `AtomicU64` so the dispatch hot-path reads it without locking.
+$`\varepsilon`$-greedy exploration decays from $`0.15 \to 0.02`$ with each update. The current slice is published to an `AtomicU64` so the dispatch hot-path reads it without locking.
 
 Policy updates run every 250 ms; Isolation Forest anti-cheat ticks every 100 ms — both are **off the scheduling hot-path**.
 
