@@ -3,9 +3,12 @@
 
 # Cargo lock is committed for binary crates (do not add Cargo.lock here)
 
-# BPF / LLVM artefacts that scx_rustland_core's build.rs drops in the project root
-main.bpf.c
-intf.h
+# BPF / LLVM artefacts that scx_rustland_core's build.rs drops in the project root.
+# Anchored with / so only the root-level generated copies are ignored — vendor/
+# subdirectory copies (e.g. vendor/scx_rustland_core/assets/bpf/main.bpf.c) are
+# tracked normally and must be committed for CI to compile successfully.
+/main.bpf.c
+/intf.h
 *.o
 *.d
 *.ll
