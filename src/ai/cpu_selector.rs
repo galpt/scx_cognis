@@ -244,7 +244,7 @@ mod tests {
         let mut sel = CpuSelector::new();
         sel.update_cpu(make_cpu(0, CoreType::Performance, false)); // normal CPU
         sel.update_cpu(make_cpu(1, CoreType::Efficient, true)); // restricted CPU
-        // Quarantined task must land on cpu 1 only.
+                                                                // Quarantined task must land on cpu 1 only.
         let chosen = sel.select_cpu(0, TaskLabel::Compute, true, 0.5);
         assert_eq!(chosen, 1, "quarantined task must go to restricted cpu 1");
     }
@@ -254,7 +254,7 @@ mod tests {
         let mut sel = CpuSelector::new();
         sel.update_cpu(make_cpu(0, CoreType::Performance, false)); // normal
         sel.update_cpu(make_cpu(1, CoreType::Performance, true)); // restricted only
-        // Normal task must not land on restricted cpu 1.
+                                                                  // Normal task must not land on restricted cpu 1.
         let chosen = sel.select_cpu(0, TaskLabel::Interactive, false, 0.8);
         assert_eq!(chosen, 0, "normal task must not go to restricted cpu 1");
     }
@@ -277,6 +277,9 @@ mod tests {
         sel.update_cpu(make_cpu(1, CoreType::Efficient, false));
         let chosen = sel.select_cpu(0, TaskLabel::Interactive, false, 0.9);
         // No P-cores available → falls back to any eligible CPU.
-        assert!(chosen >= 0, "must fall back to any eligible cpu, got {chosen}");
+        assert!(
+            chosen >= 0,
+            "must fall back to any eligible cpu, got {chosen}"
+        );
     }
 }

@@ -166,7 +166,10 @@ impl TrustTable {
         unsafe {
             let layout = std::alloc::Layout::new::<Self>();
             let ptr = std::alloc::alloc_zeroed(layout) as *mut Self;
-            assert!(!ptr.is_null(), "TrustTable allocation failed — out of memory");
+            assert!(
+                !ptr.is_null(),
+                "TrustTable allocation failed — out of memory"
+            );
             Box::from_raw(ptr)
         }
     }
@@ -307,7 +310,7 @@ impl TrustTable {
     /// Replaces `ReputationEngine::slice_factor()`.
     pub fn slice_factor(&self, pid: i32) -> f64 {
         let t = self.trust_score(pid); // ∈ [-1.0, +1.0]
-        // Linear remap: f(t) = 0.625 + t * 0.375, clamped to [0.25, 1.0].
+                                       // Linear remap: f(t) = 0.625 + t * 0.375, clamped to [0.25, 1.0].
         (0.625 + t as f64 * 0.375).clamp(0.25, 1.0)
     }
 
@@ -517,7 +520,10 @@ mod tests {
             t.update_on_exit(1, 1, &obs_good, "good");
         }
         let f_high = t.slice_factor(1);
-        assert!(f_high > 0.9, "trusted task should have near-1.0× slice factor");
+        assert!(
+            f_high > 0.9,
+            "trusted task should have near-1.0× slice factor"
+        );
         // Adversarial → 0.25× minimum.
         let obs_bad = ExitObservation {
             cheat_flagged: true,
@@ -528,7 +534,10 @@ mod tests {
             t.update_on_exit(2, 2, &obs_bad, "bad");
         }
         let f_low = t.slice_factor(2);
-        assert!(f_low < 0.35, "adversarial task should have near-0.25× slice factor");
+        assert!(
+            f_low < 0.35,
+            "adversarial task should have near-0.25× slice factor"
+        );
     }
 
     #[test]

@@ -71,7 +71,11 @@ struct RnnState {
 
 impl Default for RnnState {
     fn default() -> Self {
-        Self { h: [0.0; H], ema_burst_ns: 0.0, ema_actual_ns: 0.0 }
+        Self {
+            h: [0.0; H],
+            ema_burst_ns: 0.0,
+            ema_actual_ns: 0.0,
+        }
     }
 }
 
@@ -91,7 +95,7 @@ fn tanh(x: f32) -> f32 {
 /// Zero heap allocations after construction.
 pub struct BurstPredictor {
     state_table: Box<[RnnState; PRED_TABLE_SIZE]>,
-    state_pids:  Box<[i32; PRED_TABLE_SIZE]>,
+    state_pids: Box<[i32; PRED_TABLE_SIZE]>,
     ema_alpha: f64,
 }
 
@@ -102,16 +106,26 @@ impl BurstPredictor {
         let state_table = unsafe {
             let layout = std::alloc::Layout::array::<RnnState>(PRED_TABLE_SIZE).expect("layout");
             let ptr = std::alloc::alloc_zeroed(layout) as *mut [RnnState; PRED_TABLE_SIZE];
-            assert!(!ptr.is_null(), "BurstPredictor state_table allocation failed");
+            assert!(
+                !ptr.is_null(),
+                "BurstPredictor state_table allocation failed"
+            );
             Box::from_raw(ptr)
         };
         let state_pids = unsafe {
             let layout = std::alloc::Layout::array::<i32>(PRED_TABLE_SIZE).expect("layout");
             let ptr = std::alloc::alloc_zeroed(layout) as *mut [i32; PRED_TABLE_SIZE];
-            assert!(!ptr.is_null(), "BurstPredictor state_pids allocation failed");
+            assert!(
+                !ptr.is_null(),
+                "BurstPredictor state_pids allocation failed"
+            );
             Box::from_raw(ptr)
         };
-        Self { state_table, state_pids, ema_alpha: 0.15 }
+        Self {
+            state_table,
+            state_pids,
+            ema_alpha: 0.15,
+        }
     }
 
     #[inline(always)]
@@ -141,27 +155,40 @@ impl BurstPredictor {
         let state = &mut self.state_table[s];
 
         let burst_norm = (burst_ns as f64 / BURST_MAX_NS).min(1.0) as f32;
-        let x = [burst_norm, exec_ratio.clamp(0.0, 1.0), cpu_intensity.clamp(0.0, 1.0)];
+        let x = [
+            burst_norm,
+            exec_ratio.clamp(0.0, 1.0),
+            cpu_intensity.clamp(0.0, 1.0),
+        ];
 
         // h[t] = tanh( W_h · h[t-1]  +  W_x · x[t]  +  b )
         let mut new_h = [0.0f32; H];
         for i in 0..H {
             let wx: f32 = W_X[i].iter().zip(x.iter()).map(|(w, xi)| w * xi).sum();
-            let wh: f32 = W_H[i].iter().zip(state.h.iter()).map(|(w, hi)| w * hi).sum();
+            let wh: f32 = W_H[i]
+                .iter()
+                .zip(state.h.iter())
+                .map(|(w, hi)| w * hi)
+                .sum();
             new_h[i] = tanh(wx + wh + B[i]);
         }
         state.h = new_h;
 
         // y = W_out · h  +  b_out
-        let y_norm: f32 = W_OUT.iter().zip(new_h.iter()).map(|(w, hi)| w * hi).sum::<f32>() + B_OUT;
+        let y_norm: f32 = W_OUT
+            .iter()
+            .zip(new_h.iter())
+            .map(|(w, hi)| w * hi)
+            .sum::<f32>()
+            + B_OUT;
         let y_norm = y_norm.clamp(0.0, 1.0);
         let predicted_ns = (y_norm as f64 * BURST_MAX_NS) as u64;
 
         // EMA smoothing: α = 0.15 filters per-tick jitter while tracking trends.
-        state.ema_burst_ns = self.ema_alpha * predicted_ns as f64
-            + (1.0 - self.ema_alpha) * state.ema_burst_ns;
-        state.ema_actual_ns = self.ema_alpha * burst_ns as f64
-            + (1.0 - self.ema_alpha) * state.ema_actual_ns;
+        state.ema_burst_ns =
+            self.ema_alpha * predicted_ns as f64 + (1.0 - self.ema_alpha) * state.ema_burst_ns;
+        state.ema_actual_ns =
+            self.ema_alpha * burst_ns as f64 + (1.0 - self.ema_alpha) * state.ema_actual_ns;
 
         state.ema_burst_ns as u64
     }
@@ -209,7 +236,10 @@ mod tests {
             pred.observe_and_predict(42, 5_000_000 + i * 100_000, 0.4, 0.6);
         }
         let p = pred.prediction_for(42);
-        assert!(p > 0, "prediction should be non-zero after 30 warmup observations");
+        assert!(
+            p > 0,
+            "prediction should be non-zero after 30 warmup observations"
+        );
     }
 
     #[test]
@@ -218,7 +248,11 @@ mod tests {
         pred.observe_and_predict(1, 1_000_000, 0.3, 0.5);
         assert!(pred.prediction_for(1) > 0);
         pred.evict(1);
-        assert_eq!(pred.prediction_for(1), 0, "prediction must be 0 after eviction");
+        assert_eq!(
+            pred.prediction_for(1),
+            0,
+            "prediction must be 0 after eviction"
+        );
     }
 
     #[test]
@@ -239,7 +273,8 @@ mod tests {
         pred.evict(10);
         assert_eq!(pred.prediction_for(10), 0, "evicted PID must return 0");
         assert_eq!(
-            pred.prediction_for(20), p20_before,
+            pred.prediction_for(20),
+            p20_before,
             "evicting PID 10 should not affect PID 20"
         );
     }

@@ -50,7 +50,11 @@ pub struct HistoryRing {
 
 impl HistoryRing {
     pub const fn new() -> Self {
-        Self { buf: [0.0; HISTORY_LEN], head: 0, len: 0 }
+        Self {
+            buf: [0.0; HISTORY_LEN],
+            head: 0,
+            len: 0,
+        }
     }
 
     /// Append a value, overwriting the oldest when full.
@@ -126,8 +130,10 @@ impl Default for DashboardState {
 impl DashboardState {
     pub fn push_history(&mut self) {
         self.inference_hist.push(self.inference_us);
-        self.reward_hist.push(self.metrics.reward_ema_x100 as f64 / 100.0);
-        self.throughput_hist.push(self.metrics.nr_user_dispatches as f64);
+        self.reward_hist
+            .push(self.metrics.reward_ema_x100 as f64 / 100.0);
+        self.throughput_hist
+            .push(self.metrics.nr_user_dispatches as f64);
         // Push AI slice into the fixed u64 ring.
         self.ai_slice_hist[self.ai_slice_head] = self.metrics.ai_slice_us;
         self.ai_slice_head = (self.ai_slice_head + 1) % HISTORY_LEN;

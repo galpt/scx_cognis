@@ -31,8 +31,8 @@ mod ai;
 mod stats;
 mod tui;
 
-use std::collections::{HashMap, HashSet};
 use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::mem::MaybeUninit;
 
@@ -191,11 +191,11 @@ struct Scheduler<'a> {
 
     // Per-label task queues (priority order: RT > Interactive > IoWait > Unknown > Compute).
     // Each bucket is pre-allocated to QUEUE_DEPTH and never grows after init.
-    rt_queue:          VecDeque<Task>,
+    rt_queue: VecDeque<Task>,
     interactive_queue: VecDeque<Task>,
-    iowait_queue:      VecDeque<Task>,
-    unknown_queue:     VecDeque<Task>,
-    compute_queue:     VecDeque<Task>,
+    iowait_queue: VecDeque<Task>,
+    unknown_queue: VecDeque<Task>,
+    compute_queue: VecDeque<Task>,
 
     // Time tracking.
     vruntime_now: u64,
@@ -212,7 +212,7 @@ struct Scheduler<'a> {
 
     // Fixed-size per-PID lifetime table (Fibonacci hash, zero-alloc after init).
     lifetime_table: Box<[TaskLifetime; LIFETIME_TABLE_SIZE]>,
-    lifetime_pids:  Box<[i32; LIFETIME_TABLE_SIZE]>,
+    lifetime_pids: Box<[i32; LIFETIME_TABLE_SIZE]>,
 
     // TUI shared state (None if TUI not requested).
     tui_state: Option<SharedState>,
@@ -333,11 +333,11 @@ impl<'a> Scheduler<'a> {
             bpf,
             opts,
             stats_server,
-            rt_queue:          VecDeque::with_capacity(QUEUE_DEPTH),
+            rt_queue: VecDeque::with_capacity(QUEUE_DEPTH),
             interactive_queue: VecDeque::with_capacity(QUEUE_DEPTH),
-            iowait_queue:      VecDeque::with_capacity(QUEUE_DEPTH),
-            unknown_queue:     VecDeque::with_capacity(QUEUE_DEPTH),
-            compute_queue:     VecDeque::with_capacity(QUEUE_DEPTH),
+            iowait_queue: VecDeque::with_capacity(QUEUE_DEPTH),
+            unknown_queue: VecDeque::with_capacity(QUEUE_DEPTH),
+            compute_queue: VecDeque::with_capacity(QUEUE_DEPTH),
             vruntime_now: 0,
             init_page_faults: 0,
             base_slice_ns,
@@ -363,8 +363,7 @@ impl<'a> Scheduler<'a> {
                 unsafe {
                     let layout = std::alloc::Layout::array::<i32>(LIFETIME_TABLE_SIZE)
                         .expect("lifetime_pids layout");
-                    let ptr = std::alloc::alloc_zeroed(layout)
-                        as *mut [i32; LIFETIME_TABLE_SIZE];
+                    let ptr = std::alloc::alloc_zeroed(layout) as *mut [i32; LIFETIME_TABLE_SIZE];
                     assert!(!ptr.is_null(), "lifetime_pids allocation failed");
                     Box::from_raw(ptr)
                 }
@@ -461,11 +460,11 @@ impl<'a> Scheduler<'a> {
     #[inline(always)]
     fn push_task(&mut self, task: Task) {
         let q = match task.label {
-            TaskLabel::RealTime    => &mut self.rt_queue,
+            TaskLabel::RealTime => &mut self.rt_queue,
             TaskLabel::Interactive => &mut self.interactive_queue,
-            TaskLabel::IoWait      => &mut self.iowait_queue,
-            TaskLabel::Unknown     => &mut self.unknown_queue,
-            TaskLabel::Compute     => &mut self.compute_queue,
+            TaskLabel::IoWait => &mut self.iowait_queue,
+            TaskLabel::Unknown => &mut self.unknown_queue,
+            TaskLabel::Compute => &mut self.compute_queue,
         };
         if q.len() >= QUEUE_DEPTH {
             q.pop_front(); // drop oldest under back-pressure
@@ -479,10 +478,18 @@ impl<'a> Scheduler<'a> {
     /// Within a bucket, tasks are served FIFO (insertion order).
     #[inline(always)]
     fn pop_highest_priority_task(&mut self) -> Option<Task> {
-        if let Some(t) = self.rt_queue.pop_front()          { return Some(t); }
-        if let Some(t) = self.interactive_queue.pop_front() { return Some(t); }
-        if let Some(t) = self.iowait_queue.pop_front()      { return Some(t); }
-        if let Some(t) = self.unknown_queue.pop_front()      { return Some(t); }
+        if let Some(t) = self.rt_queue.pop_front() {
+            return Some(t);
+        }
+        if let Some(t) = self.interactive_queue.pop_front() {
+            return Some(t);
+        }
+        if let Some(t) = self.iowait_queue.pop_front() {
+            return Some(t);
+        }
+        if let Some(t) = self.unknown_queue.pop_front() {
+            return Some(t);
+        }
         self.compute_queue.pop_front()
     }
 
@@ -779,8 +786,8 @@ impl<'a> Scheduler<'a> {
         // α = 0.05: smooth out per-task jitter while tracking trends over ~20 dispatches.
         self.sched_latency_ema_ns = self.sched_latency_ema_ns * 0.95 + wait_ns as f64 * 0.05;
 
-        let quarantined = self.trust.is_quarantined(task.qtask.pid)
-            || self.trust.is_flagged(task.qtask.pid);
+        let quarantined =
+            self.trust.is_quarantined(task.qtask.pid) || self.trust.is_flagged(task.qtask.pid);
 
         let mut dispatched = DispatchedTask::new(&task.qtask);
         dispatched.slice_ns = task.slice_ns;
@@ -805,7 +812,11 @@ impl<'a> Scheduler<'a> {
                 quarantined,
                 task.perf_cri_fp as f32 / 1000.0,
             );
-            if cpu >= 0 { cpu } else { RL_CPU_ANY }
+            if cpu >= 0 {
+                cpu
+            } else {
+                RL_CPU_ANY
+            }
         };
 
         if self.bpf.dispatch_task(&dispatched).is_err() {
