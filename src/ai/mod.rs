@@ -1,7 +1,13 @@
 // Copyright (c) scx_cognis contributors
 // SPDX-License-Identifier: GPL-2.0-only
 //
-// AI inference engine — aggregates all sub-modules.
+// Scheduling policy modules — aggregates all sub-modules:
+//   - Heuristic task classifier (deterministic rules)
+//   - Isolation Forest anomaly detection (unsupervised ML)
+//   - A* load balancer (classical heuristic search)
+//   - Elman RNN burst predictor (fixed-weight recurrent model)
+//   - Bayesian reputation engine (Beta-distribution prior)
+//   - Q-learning policy controller (tabular reinforcement learning)
 
 pub mod anomaly;
 pub mod burst_predictor;

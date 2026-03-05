@@ -1,7 +1,7 @@
 // Copyright (c) scx_cognis contributors
 // SPDX-License-Identifier: GPL-2.0-only
 //
-// AI Module: Heuristic Task Classifier
+// Heuristic Task Classifier
 //
 // Classifies each scheduling event into one of five labels using a
 // deterministic, O(1) rule evaluated directly on `ops.enqueue`:

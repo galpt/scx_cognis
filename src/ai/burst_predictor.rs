@@ -1,11 +1,11 @@
 // Copyright (c) scx_cognis contributors
 // SPDX-License-Identifier: GPL-2.0-only
 //
-// AI Module: LSTM-lite Burst Predictor
+// Elman RNN Burst Predictor
 //
 // Predicts the next CPU burst duration for a PID using a compact recurrent
 // model.  A true forward-pass LSTM is too heavyweight for sub-10 µs latency on
-// the hot path, so this implements a **Elman RNN** (one recurrent layer) with
+// the hot path, so this implements an Elman RNN (one recurrent layer) with
 // a fixed tiny weight matrix baked in at compile time.
 //
 // The model maintains a hidden state `h` per PID and updates it on every

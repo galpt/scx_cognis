@@ -41,7 +41,7 @@ pub struct Metrics {
     #[stat(desc = "Scheduler congestion events")]
     pub nr_sched_congested: u64,
 
-    // ── AI-specific metrics ───────────────────────────────────────────────
+    // ── Scheduling policy metrics ──────────────────────────────────────────
     #[stat(desc = "Tasks classified as Interactive")]
     pub nr_interactive: u64,
     #[stat(desc = "Tasks classified as Compute")]
@@ -56,9 +56,9 @@ pub struct Metrics {
     pub nr_quarantined: u64,
     #[stat(desc = "TGIDs flagged by anti-cheat isolation forest")]
     pub nr_flagged: u64,
-    #[stat(desc = "Current AI-adjusted time slice (µs)")]
+    #[stat(desc = "Current Q-learning policy time slice (µs)")]
     pub ai_slice_us: u64,
-    #[stat(desc = "Average AI inference latency per task (µs)")]
+    #[stat(desc = "Average per-event scheduling pipeline latency (µs)")]
     pub ai_inference_us: u64,
     #[stat(desc = "Policy controller reward EMA (×100 for integer display)")]
     pub reward_ema_x100: i64,
@@ -217,7 +217,7 @@ impl Metrics {
             // delta() must subtract again so each --monitor line shows only the faults
             // that occurred during *that* interval, not the lifetime total.)
             nr_page_faults: self.nr_page_faults.saturating_sub(rhs.nr_page_faults),
-            // AI classification counters — per-interval deltas so --monitor shows
+            // Classification counters — per-interval deltas so --monitor shows
             // events-per-interval instead of ever-growing cumulative totals.
             nr_interactive: self.nr_interactive.saturating_sub(rhs.nr_interactive),
             nr_compute: self.nr_compute.saturating_sub(rhs.nr_compute),

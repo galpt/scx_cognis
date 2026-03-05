@@ -1,7 +1,7 @@
 // Copyright (c) scx_cognis contributors
 // SPDX-License-Identifier: GPL-2.0-only
 //
-// AI Module: A* Load Balancer
+// A* Load Balancer
 //
 // Uses an A*-inspired heuristic search over per-CPU cost nodes to find the
 // "path of least resistance" when placing a task.  Cost accounts for:
@@ -125,7 +125,7 @@ impl AStarLoadBalancer {
     /// Select the best CPU for a task.
     ///
     /// * `prev_cpu`   — the CPU the task last ran on.
-    /// * `label`      — the AI-assigned task label.
+    /// * `label`      — the task label from the heuristic classifier.
     /// * `quarantine` — whether this task is flagged by the anti-cheat engine.
     ///
     /// Returns the selected `cpu_id`, or `RL_CPU_ANY` (-1) as a fallback.

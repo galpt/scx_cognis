@@ -1,6 +1,6 @@
 # scx_cognis
 
-"Cognis" (from Latin *cognōscere*) — to learn, to know — is a Linux CPU scheduler with adaptive scheduling policy, built on established statistical and machine-learning algorithms.
+"Cognis" (from Latin *cognōscere*) — to learn, to know — is a Linux CPU scheduler with adaptive scheduling policy, combining deterministic heuristics, classical graph algorithms, Bayesian statistics, and tabular reinforcement learning.
 
 `scx_cognis` is a Linux CPU scheduler built on the [`sched_ext`](https://www.kernel.org/doc/html/latest/scheduler/sched-ext.html) framework and [`scx_rustland_core`](https://crates.io/crates/scx_rustland_core). It combines a deterministic task classifier, Bayesian reputation tracking, tabular Q-learning, Isolation Forest anomaly detection, and an Elman RNN burst predictor — all running in user-space Rust with a sub-5 µs per-event inference target.
 
@@ -134,7 +134,7 @@ test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fin
 
 ### Pipeline Overview
 
-Every scheduling decision passes through a multi-stage inference pipeline. The entire pipeline completes in **< 5 µs** on a modern CPU, staying well within the time-slice budget.
+Every scheduling decision passes through a multi-stage pipeline. The entire pipeline completes in **< 5 µs** on a modern CPU, staying well within the time-slice budget.
 
 ```
 ops.enqueue   →  Heuristic Classifier  →  Reputation Check  →  Burst Predictor
@@ -256,7 +256,7 @@ Policy updates run every 250 ms; Isolation Forest anti-cheat ticks every 100 ms 
 
 #### ratatui TUI Dashboard
 
-A real-time glass-box view of every AI decision, rendered in the terminal using [ratatui](https://ratatui.rs/). Press `q` or `Esc` to exit.
+A real-time glass-box view of all scheduling decisions and policy state, rendered in the terminal using [ratatui](https://ratatui.rs/). Press `q` or `Esc` to exit.
 
 Panels:
 

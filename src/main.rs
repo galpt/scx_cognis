@@ -1,10 +1,11 @@
 // Copyright (c) scx_cognis contributors
 // SPDX-License-Identifier: GPL-2.0-only
 //
-// scx_cognis — An Attempt at an Intelligent CPU Scheduler
+// scx_cognis — Adaptive CPU Scheduler
 //
-// Built on scx_rustland_core (sched_ext), this scheduler replaces static
-// heuristics with a live AI inference pipeline:
+// Built on scx_rustland_core (sched_ext), this scheduler combines deterministic
+// heuristics, classical search algorithms, and statistical/RL-based components
+// in a multi-stage scheduling pipeline:
 //
 //   ┌─────────────────────────────────────────────────────────────────┐
 //   │  ops.enqueue  → Heuristic classifier + Reputation check          │
@@ -59,12 +60,12 @@ const NSEC_PER_SEC: u64 = 1_000_000_000;
 
 // ── CLI Options ────────────────────────────────────────────────────────────
 
-/// scx_cognis: an intelligent, AI-driven CPU scheduler.
+/// scx_cognis: an adaptive CPU scheduler combining heuristics, statistical models, and RL.
 ///
-/// scx_cognis uses an ensemble of AI algorithms to make scheduling decisions:
-/// heuristic task classification, Isolation Forest anti-cheat, A* CPU placement,
-/// Elman-RNN burst prediction, Bayesian reputation tracking, and a tabular Q-learning
-/// policy controller — all with a sub-10µs inference latency target.
+/// Scheduling pipeline: a deterministic heuristic task classifier, Isolation Forest
+/// anomaly detection, A* CPU placement heuristic, Elman RNN burst prediction (fixed
+/// offline-trained weights), Bayesian reputation tracking, and a tabular Q-learning
+/// policy controller — all with a sub-10µs per-event latency target.
 #[derive(Debug, Parser)]
 struct Opts {
     /// Base scheduling slice duration in microseconds (Q-learning policy adjusts this dynamically).
@@ -202,7 +203,7 @@ struct Scheduler<'a> {
     base_slice_ns: u64,
     slice_ns_min: u64,
 
-    // AI components.
+    // Scheduling policy components.
     classifier: HeuristicClassifier,
     anti_cheat: AntiCheatEngine,
     load_bal: AStarLoadBalancer,
@@ -232,7 +233,7 @@ struct Scheduler<'a> {
     /// must continue regardless of stats client lifecycle.
     stats_channel_failed: bool,
 
-    // Running counters for AI metrics.
+    // Running counters for scheduling policy metrics.
     label_counts: [u64; 5],
     total_inference_ns: u64,
     inference_samples: u64,
@@ -374,7 +375,7 @@ impl<'a> Scheduler<'a> {
         value.saturating_mul(100) / weight
     }
 
-    // ── AI inference pipeline (ops.enqueue) ───────────────────────────────
+    // ── Scheduling pipeline (ops.enqueue) ───────────────────────────────
 
     /// Compute task features from a QueuedTask.
     ///
@@ -466,7 +467,7 @@ impl<'a> Scheduler<'a> {
         let ai_slice = self.policy.read_slice_ns();
 
         // Final time-slice:
-        //   base = AI-adjusted slice × label_multiplier × (weight / 100)
+        //   base = Q-learning policy slice × label_multiplier × (weight / 100)
         //   clamped to [slice_ns_min .. base_slice * 8]
         let mut slice = (ai_slice as f64
             * label.slice_multiplier()
@@ -537,7 +538,7 @@ impl<'a> Scheduler<'a> {
         (deadline, slice, label)
     }
 
-    // ── Drain queued tasks (calls AI pipeline per task) ───────────────────
+    // ── Drain queued tasks (runs scheduling pipeline per task) ──────────────
 
     fn drain_queued_tasks(&mut self) {
         loop {
@@ -632,7 +633,7 @@ impl<'a> Scheduler<'a> {
         true
     }
 
-    // ── Periodic AI housekeeping ───────────────────────────────────────────
+    // ── Periodic housekeeping ───────────────────────────────────────────
 
     /// Anti-cheat tick (every 100 ms).
     fn tick_anti_cheat(&mut self) {
@@ -783,7 +784,7 @@ impl<'a> Scheduler<'a> {
     // ── Main scheduling loop ───────────────────────────────────────────────
 
     fn schedule(&mut self) {
-        // 1. Drain queued tasks (AI classify + enqueue).
+        // 1. Drain queued tasks (heuristic classify + enqueue).
         self.drain_queued_tasks();
 
         // 2. Batch-dispatch up to nr_cpus tasks in a single schedule() call.
@@ -810,7 +811,7 @@ impl<'a> Scheduler<'a> {
         self.bpf.notify_complete(self.tasks.len() as u64);
     }
 
-    // ── Background AI housekeeping ─────────────────────────────────────────────
+    // ── Background housekeeping ─────────────────────────────────────────────
     //
     // Kept OFF the schedule() critical path.  schedule() is called in a
     // tight BPF dispatch loop; any stall there risks the sched_ext watchdog
@@ -881,7 +882,7 @@ impl<'a> Scheduler<'a> {
                 }
             }
 
-            // Background AI housekeeping (anti-cheat, policy, reputation).
+            // Background housekeeping (anti-cheat, Q-learning policy update, reputation).
             // Runs outside schedule() so the BPF dispatch path is never
             // delayed by periodic work.  50 ms outer gate plus each
             // function's inner timer ensures at most one unit of work
