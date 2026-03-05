@@ -1036,7 +1036,7 @@ If the `reward` value stays low (near 0) during CPU-heavy phases, this is normal
 
 **Phase 1 — CPU stress (16 × workers, 60 s):**
 
-| Metric | Baseline (CFS) | scx_cognis | Δ |
+| Metric | Baseline (linux-cachyos) | scx_cognis | Δ |
 |:-------|:--------------:|:----------:|:---:|
 | bogo ops/s (real time) | 20,824 | 2,081 | −90.0% |
 | bogo ops/s (usr time) | 1,384 | 2,077 | +50.1% |
@@ -1045,7 +1045,7 @@ The real-time drop reflects frequent pre-emption of compute workers by higher-pr
 
 **Phase 2 — I/O stress (4 × `iomix` workers, 60 s):**
 
-| Metric | Baseline (CFS) | scx_cognis | Δ |
+| Metric | Baseline (linux-cachyos) | scx_cognis | Δ |
 |:-------|:--------------:|:----------:|:---:|
 | bogo ops/s (real time) | 182,051 | 171,387 | −5.9% |
 | bogo ops/s (usr time) | 41,935 | 42,999 | +2.5% |
@@ -1054,7 +1054,7 @@ I/O-bound workers sleep frequently on disk I/O, so they are rarely pre-empted by
 
 **Phase 3 — Mixed stress (16 × `cpu` + 2 × `vm` workers, 60 s):**
 
-| Stressor | Metric | Baseline (CFS) | scx_cognis | Δ |
+| Stressor | Metric | Baseline (linux-cachyos) | scx_cognis | Δ |
 |:---------|:-------|:--------------:|:----------:|:---:|
 | CPU ×16 | bogo ops/s (real) | 18,618 | 1,827 | −90.2% |
 | CPU ×16 | bogo ops/s (usr) | 1,389 | 2,053 | +47.9% |
