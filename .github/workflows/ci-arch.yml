@@ -1,10 +1,10 @@
 name: CI (Arch Linux)
 
 on:
-  push:
-    branches: [ main, master ]
   pull_request:
     branches: [ main, master ]
+  workflow_dispatch:
+  workflow_call:
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Compile-check on Arch Linux using the official archlinux/archlinux:latest

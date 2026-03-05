@@ -1,10 +1,10 @@
 name: CI (CachyOS)
 
 on:
-  push:
-    branches: [ main, master ]
   pull_request:
     branches: [ main, master ]
+  workflow_dispatch:
+  workflow_call:
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Compile-check on CachyOS using the official cachyos/cachyos:latest Docker

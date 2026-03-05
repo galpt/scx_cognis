@@ -1,0 +1,115 @@
+name: Release
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Manual release workflow.  Go to Actions → Release → Run workflow, enter the
+# version (e.g. 1.2.3), and this workflow will:
+#   1. Run all three CI checks (Ubuntu lint+test+build, Arch, CachyOS)
+#   2. Build the release binary
+#   3. Create a git tag vX.Y.Z
+#   4. Publish a GitHub Release with the compiled binary and SHA-256 checksum
+# ──────────────────────────────────────────────────────────────────────────────
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release (X.Y.Z — no "v" prefix, e.g. 1.2.3)'
+        required: true
+        type: string
+
+jobs:
+  # ──────────────────────────────────────────────────────────────────────────
+  # Step 1: Run all three CI checks in parallel
+  # ──────────────────────────────────────────────────────────────────────────
+  ci-ubuntu:
+    uses: ./.github/workflows/ci.yml
+
+  ci-arch:
+    uses: ./.github/workflows/ci-arch.yml
+
+  ci-cachyos:
+    uses: ./.github/workflows/ci-cachyos.yml
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Step 2: Build, tag, and publish the release (only if all CI jobs pass)
+  # ──────────────────────────────────────────────────────────────────────────
+  release:
+    runs-on: ubuntu-24.04
+    needs: [ ci-ubuntu, ci-arch, ci-cachyos ]
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Validate version input
+        run: |
+          VERSION="${{ inputs.version }}"
+          if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "Error: version must be in X.Y.Z format (e.g. 1.2.3)"
+            exit 1
+          fi
+          echo "Releasing version: v$VERSION"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            clang llvm libclang-dev \
+            libbpf-dev libelf-dev zlib1g-dev \
+            libseccomp-dev \
+            pkg-config
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Patch Cargo.toml version
+        run: |
+          VERSION="${{ inputs.version }}"
+          sed -i "s/^version = \".*\"/version = \"$VERSION\"/" Cargo.toml
+          grep '^version' Cargo.toml
+
+      - name: cargo build --release
+        run: cargo build --release
+
+      - name: Package release archive
+        run: |
+          mkdir -p release
+          cp target/release/scx_cognis release/
+          chmod +x release/scx_cognis
+          cd release
+          tar -czf scx_cognis-linux-x86_64.tar.gz scx_cognis
+          sha256sum scx_cognis-linux-x86_64.tar.gz > scx_cognis-linux-x86_64.tar.gz.sha256
+          ls -lh
+
+      - name: Create and push git tag
+        run: |
+          TAG="v${{ inputs.version }}"
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag "$TAG"
+          git push origin "$TAG"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ inputs.version }}
+          name: v${{ inputs.version }}
+          files: |
+            release/scx_cognis-linux-x86_64.tar.gz
+            release/scx_cognis-linux-x86_64.tar.gz.sha256
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

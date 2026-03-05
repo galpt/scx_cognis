@@ -1,71 +1,16 @@
-name: CI
+name: CI (Ubuntu)
 
 on:
-  push:
-    branches: [ main, master ]
-    tags: [ 'v*' ]
   pull_request:
     branches: [ main, master ]
+  workflow_dispatch:
+  workflow_call:
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Auto-tag: bump patch version on every push to main that is not a version bump
+# Lint → Test → Build compile-check on Ubuntu 24.04.
+# Triggered on pull requests, manual dispatch, or called by release.yml.
 # ──────────────────────────────────────────────────────────────────────────────
 jobs:
-  auto-tag:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      actions: read
-    if: >
-      github.event_name == 'push' &&
-      (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') &&
-      !startsWith(github.event.head_commit.message, 'chore: bump version')
-    outputs:
-      new_tag: ${{ steps.tag.outputs.new_tag }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Get latest tag
-        id: get_tag
-        run: |
-          git fetch --tags
-          LATEST=$(git describe --tags --abbrev=0 2>/dev/null || echo "v1.0.0")
-          echo "latest_tag=$LATEST" >> $GITHUB_OUTPUT
-
-      - name: Increment patch version
-        id: tag
-        run: |
-          LATEST=${{ steps.get_tag.outputs.latest_tag }}
-          # Strip leading 'v' and any trailing -TIMESTAMP suffix to get pure semver
-          VERSION=${LATEST#v}
-          VERSION=${VERSION%%-*}
-          IFS='.' read -ra PARTS <<< "$VERSION"
-          MAJOR=${PARTS[0]:-1}
-          MINOR=${PARTS[1]:-0}
-          PATCH=${PARTS[2]:-0}
-          # Enforce v1.x.x floor — existing v0.x.x tags must not carry forward
-          if [ "$MAJOR" -lt 1 ]; then
-            MAJOR=1; MINOR=0; PATCH=0
-          fi
-          PATCH=$((PATCH + 1))
-          # base semantic version
-          NEW="v$MAJOR.$MINOR.$PATCH"
-          # append UTC timestamp so that every tag is globally unique
-          TIMESTAMP=$(date -u +'%Y%m%d%H%M%S')
-          NEW="${NEW}-$TIMESTAMP"
-          echo "new_tag=$NEW" >> $GITHUB_OUTPUT
-          echo "New tag: $NEW"
-
-      - name: Push tag
-        run: |
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git tag ${{ steps.tag.outputs.new_tag }}
-          git push origin ${{ steps.tag.outputs.new_tag }}
-
   # ──────────────────────────────────────────────────────────────────────────
   # Lint: format check
   # ──────────────────────────────────────────────────────────────────────────
@@ -109,18 +54,17 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            /tmp/scx_cognis_build
           key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
 
       - name: cargo test
         run: cargo test --all -- --nocapture
 
   # ──────────────────────────────────────────────────────────────────────────
-  # Build: compile release binary for Linux x86-64
+  # Build: compile-check release binary (no artifact upload)
   # ──────────────────────────────────────────────────────────────────────────
   build:
     runs-on: ubuntu-24.04
-    needs: [ auto-tag, test ]
+    needs: [ test ]
     steps:
       - uses: actions/checkout@v4
 
@@ -142,69 +86,7 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            /tmp/scx_cognis_build
           key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Patch Cargo.toml version to match release tag
-        run: |
-          # Prefer the auto-tag output; fall back to the git ref on tag-triggered builds.
-          RAW_TAG="${{ needs.auto-tag.outputs.new_tag }}"
-          [ -z "$RAW_TAG" ] && RAW_TAG="${GITHUB_REF_NAME}"
-          # Strip 'v' prefix and any -TIMESTAMP suffix → pure semver e.g. 1.0.1
-          SEMVER="${RAW_TAG#v}"
-          SEMVER="${SEMVER%%-*}"
-          echo "Patching Cargo.toml version to: $SEMVER"
-          sed -i "s/^version = \".*\"/version = \"$SEMVER\"/" Cargo.toml
-          grep '^version' Cargo.toml
 
       - name: cargo build --release
         run: cargo build --release
-
-      - name: Upload binary artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: scx_cognis-linux-x86_64
-          path: /tmp/scx_cognis_build/release/scx_cognis
-          if-no-files-found: error
-
-  # ──────────────────────────────────────────────────────────────────────────
-  # Release: create a GitHub Release with the compiled binary
-  # ──────────────────────────────────────────────────────────────────────────
-  release:
-    runs-on: ubuntu-latest
-    needs: [ auto-tag, build ]
-    permissions:
-      contents: write
-    if: >
-      always() &&
-      needs.build.result == 'success' &&
-      (needs.auto-tag.result == 'success' || startsWith(github.ref, 'refs/tags/v'))
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Download binary artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: scx_cognis-linux-x86_64
-          path: release/
-
-      - name: Package release archive
-        run: |
-          chmod +x release/scx_cognis
-          cd release
-          tar -czf scx_cognis-linux-x86_64.tar.gz scx_cognis
-          sha256sum scx_cognis-linux-x86_64.tar.gz > scx_cognis-linux-x86_64.tar.gz.sha256
-          ls -lh
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ needs.auto-tag.outputs.new_tag || github.ref_name }}
-          files: |
-            release/scx_cognis-linux-x86_64.tar.gz
-            release/scx_cognis-linux-x86_64.tar.gz.sha256
-          draft: false
-          prerelease: false
-          generate_release_notes: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
