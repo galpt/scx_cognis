@@ -15,6 +15,48 @@ on:
 
 jobs:
   # ──────────────────────────────────────────────────────────────────────────
+  # Compute next version from the latest git tag
+  # ──────────────────────────────────────────────────────────────────────────
+  compute-version:
+    name: Compute next version
+    runs-on: ubuntu-24.04
+    outputs:
+      new_version: ${{ steps.tag.outputs.new_version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get latest tag
+        id: get_tag
+        run: |
+          git fetch --tags --quiet
+          LATEST=$(git tag --list 'v*' \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+            | sort -V \
+            | tail -n1)
+          LATEST="${LATEST:-v1.0.0}"
+          echo "latest_tag=$LATEST" >> "$GITHUB_OUTPUT"
+
+      - name: Increment version
+        id: tag
+        run: |
+          LATEST=${{ steps.get_tag.outputs.latest_tag }}
+          BASE="${LATEST#v}"
+          IFS='.' read -ra PARTS <<< "$BASE"
+          MAJOR=${PARTS[0]:-1}
+          MINOR=${PARTS[1]:-0}
+          PATCH=${PARTS[2]:-0}
+          case "${{ inputs.bump }}" in
+            major) MAJOR=$((MAJOR+1)); MINOR=0; PATCH=0 ;;
+            minor) MINOR=$((MINOR+1)); PATCH=0 ;;
+            patch) PATCH=$((PATCH+1)) ;;
+          esac
+          NEW="${MAJOR}.${MINOR}.${PATCH}"
+          echo "New version: v$NEW"
+          echo "new_version=$NEW" >> "$GITHUB_OUTPUT"
+
+  # ──────────────────────────────────────────────────────────────────────────
   # CI: lint + test on Ubuntu (must pass before release builds)
   # ──────────────────────────────────────────────────────────────────────────
   ci-ubuntu:
@@ -94,7 +136,7 @@ jobs:
   release:
     name: Build and publish release
     runs-on: ubuntu-24.04
-    needs: [ci-ubuntu, ci-arch, ci-cachyos]
+    needs: [compute-version, ci-ubuntu, ci-arch, ci-cachyos]
     permissions:
       contents: write
     steps:
@@ -102,37 +144,6 @@ jobs:
         with:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Compute next version from latest tag
-        id: compute_version
-        run: |
-          # Fetch all tags so we can find the latest release
-          git fetch --tags --quiet
-
-          # Find the highest vX.Y.Z tag; default to v0.0.0 if none exist
-          LATEST=$(git tag --list 'v*' \
-            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
-            | sort -V \
-            | tail -n1)
-          LATEST="${LATEST:-v0.0.0}"
-          echo "Latest tag: $LATEST"
-
-          # Strip leading 'v' and split
-          BASE="${LATEST#v}"
-          MAJOR=$(echo "$BASE" | cut -d. -f1)
-          MINOR=$(echo "$BASE" | cut -d. -f2)
-          PATCH=$(echo "$BASE" | cut -d. -f3)
-
-          # Increment the requested component
-          case "${{ inputs.bump }}" in
-            major) MAJOR=$((MAJOR+1)); MINOR=0; PATCH=0 ;;
-            minor) MINOR=$((MINOR+1)); PATCH=0 ;;
-            patch) PATCH=$((PATCH+1)) ;;
-          esac
-
-          NEW_VERSION="${MAJOR}.${MINOR}.${PATCH}"
-          echo "New version: $NEW_VERSION"
-          echo "new_version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Install system dependencies
         run: |
@@ -155,7 +166,7 @@ jobs:
 
       - name: Patch Cargo.toml version
         run: |
-          sed -i "s/^version = \".*\"/version = \"${{ steps.compute_version.outputs.new_version }}\"/" Cargo.toml
+          sed -i "s/^version = \".*\"/version = \"${{ needs.compute-version.outputs.new_version }}\"/" Cargo.toml
           grep '^version' Cargo.toml
 
       - name: cargo build --release
@@ -174,14 +185,14 @@ jobs:
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git tag "v${{ steps.compute_version.outputs.new_version }}"
-          git push origin "v${{ steps.compute_version.outputs.new_version }}"
+          git tag "v${{ needs.compute-version.outputs.new_version }}"
+          git push origin "v${{ needs.compute-version.outputs.new_version }}"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v${{ steps.compute_version.outputs.new_version }}
-          name: v${{ steps.compute_version.outputs.new_version }}
+          tag_name: v${{ needs.compute-version.outputs.new_version }}
+          name: v${{ needs.compute-version.outputs.new_version }}
           files: |
             release/scx_cognis-linux-x86_64.tar.gz
             release/scx_cognis-linux-x86_64.tar.gz.sha256
