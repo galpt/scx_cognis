@@ -896,17 +896,36 @@ void BPF_STRUCT_OPS(rustland_dispatch, s32 cpu, struct task_struct *prev)
 		return;
 
 	/*
+	 * Consume a task from the shared DSQ before giving the user-space
+	 * scheduler another slice.
+	 *
+	 * bpf_user_ringbuf_drain() (step 1) inserts tasks into SHARED_DSQ
+	 * when the user-space scheduler dispatched them with RL_CPU_ANY.
+	 * cognis dispatches the majority of tasks through RL_CPU_ANY (the
+	 * perf_cri_ema saturation fast-path always uses RL_CPU_ANY), so
+	 * SHARED_DSQ is the primary consumer queue -- not cpu_to_dsq.
+	 *
+	 * If usersched fires before this check (old order: usersched ->
+	 * SHARED_DSQ), it finds nr_scheduled > 0 and returns immediately,
+	 * leaving the task in SHARED_DSQ for the next ops.dispatch cycle.
+	 * Under any sustained load this repeats indefinitely: every CPU
+	 * that wakes up runs the user-space scheduler instead of the task
+	 * waiting in SHARED_DSQ, starving it until the sched_ext watchdog
+	 * fires ("runnable task stall").
+	 *
+	 * Fix: drain SHARED_DSQ here, right after draining the dispatched
+	 * ring buffer, so tasks placed there by handle_dispatched_task()
+	 * are consumed in the same ops.dispatch call that produced them.
+	 */
+	if (scx_bpf_dsq_move_to_local(SHARED_DSQ))
+		return;
+
+	/*
 	 * Dispatch the user-space scheduler if there's any pending action
 	 * to do.
 	 */
 	if (usersched_has_pending_tasks() &&
 	    scx_bpf_dsq_move_to_local(SCHED_DSQ))
-		return;
-
-	/*
-	 * Consume a task from the shared DSQ.
-	 */
-	if (scx_bpf_dsq_move_to_local(SHARED_DSQ))
 		return;
 
 	/*
