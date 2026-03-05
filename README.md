@@ -554,10 +554,9 @@ scx_cognis --monitor 1.0
 scx_cognis --monitor 0.5
 ```
 
-The version is displayed inline at the start of every output line (`[cognis v1.0.2] ...`), so you can confirm which release is running without stopping the service. Use `scx_cognis --version` for a one-shot version check when the scheduler is not running.
-
 > [!NOTE]
-> If the scheduler was started **without** the provided service file (e.g. a manually launched instance), the socket may be root-only. In that case prefix with `sudo`.
+> 1. If the scheduler was started **without** the provided service file (e.g. a manually launched instance), the socket may be root-only. In that case prefix with `sudo`.
+> 2. The version is displayed inline at the start of every output line (`[cognis v1.0.2] ...`), so you can confirm which release is running without stopping the service. Use `scx_cognis --version` for a one-shot version check when the scheduler is not running.
 
 [↑ Back to Table of Contents](#table-of-contents)
 
