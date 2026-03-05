@@ -489,6 +489,12 @@ sudo ./target/release/scx_cognis
 
 ### TUI Dashboard
 
+<p align="center">
+	<img src="https://github.com/galpt/scx_cognis/blob/main/img/cognis-ratatui.png" alt="With Cognis Enabled" style="max-width:100%;height:auto;" />
+	<br/>
+	<em>How It Looks Like</em>
+</p>
+
 `--tui` starts `scx_cognis` as the active scheduler **with** a live dashboard. Because only one sched_ext scheduler can run at a time, you must stop the systemd service first if it is running:
 
 ```bash
