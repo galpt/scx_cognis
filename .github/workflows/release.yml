@@ -1,13 +1,5 @@
 name: Release
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Manual release workflow.  Go to Actions → Release → Run workflow, enter the
-# version (e.g. 1.2.3), and this workflow will:
-#   1. Run all three CI checks (Ubuntu lint+test+build, Arch, CachyOS)
-#   2. Build the release binary
-#   3. Create a git tag vX.Y.Z
-#   4. Publish a GitHub Release with the compiled binary and SHA-256 checksum
-# ──────────────────────────────────────────────────────────────────────────────
 on:
   workflow_dispatch:
     inputs:
@@ -18,26 +10,88 @@ on:
 
 jobs:
   # ──────────────────────────────────────────────────────────────────────────
-  # Step 1: Run all three CI checks in parallel
+  # CI: lint + test on Ubuntu (must pass before release builds)
   # ──────────────────────────────────────────────────────────────────────────
   ci-ubuntu:
-    uses: ./.github/workflows/ci.yml
+    name: CI — Ubuntu lint + test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
 
-  ci-arch:
-    uses: ./.github/workflows/ci-arch.yml
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            clang llvm libclang-dev \
+            libbpf-dev libelf-dev zlib1g-dev \
+            libseccomp-dev pkg-config
 
-  ci-cachyos:
-    uses: ./.github/workflows/ci-cachyos.yml
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo test
+        run: cargo test --all -- --nocapture
 
   # ──────────────────────────────────────────────────────────────────────────
-  # Step 2: Build, tag, and publish the release (only if all CI jobs pass)
+  # CI: compile-check on Arch Linux
+  # ──────────────────────────────────────────────────────────────────────────
+  ci-arch:
+    name: CI — Arch Linux compile check
+    runs-on: ubuntu-24.04
+    container:
+      image: archlinux/archlinux:latest
+    steps:
+      - name: Install build dependencies
+        run: |
+          pacman -Syu --noconfirm
+          pacman -S --noconfirm --needed \
+            git base-devel clang llvm libbpf libelf libseccomp pkg-config curl
+
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: cargo check
+        run: cargo check --all
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # CI: compile-check on CachyOS
+  # ──────────────────────────────────────────────────────────────────────────
+  ci-cachyos:
+    name: CI — CachyOS compile check
+    runs-on: ubuntu-24.04
+    container:
+      image: cachyos/cachyos:latest
+    steps:
+      - name: Install build dependencies
+        run: |
+          pacman -Syu --noconfirm
+          pacman -S --noconfirm --needed \
+            git base-devel clang llvm libbpf libelf libseccomp pkg-config curl
+
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: cargo check
+        run: cargo check --all
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Release: build, tag, and publish (only if all CI jobs pass)
   # ──────────────────────────────────────────────────────────────────────────
   release:
+    name: Build and publish release
     runs-on: ubuntu-24.04
-    needs: [ ci-ubuntu, ci-arch, ci-cachyos ]
+    needs: [ci-ubuntu, ci-arch, ci-cachyos]
     permissions:
       contents: write
-
     steps:
       - uses: actions/checkout@v4
         with:
@@ -51,7 +105,7 @@ jobs:
             echo "Error: version must be in X.Y.Z format (e.g. 1.2.3)"
             exit 1
           fi
-          echo "Releasing version: v$VERSION"
+          echo "Releasing v$VERSION"
 
       - name: Install system dependencies
         run: |
@@ -59,8 +113,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             clang llvm libclang-dev \
             libbpf-dev libelf-dev zlib1g-dev \
-            libseccomp-dev \
-            pkg-config
+            libseccomp-dev pkg-config
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -75,8 +128,7 @@ jobs:
 
       - name: Patch Cargo.toml version
         run: |
-          VERSION="${{ inputs.version }}"
-          sed -i "s/^version = \".*\"/version = \"$VERSION\"/" Cargo.toml
+          sed -i "s/^version = \".*\"/version = \"${{ inputs.version }}\"/" Cargo.toml
           grep '^version' Cargo.toml
 
       - name: cargo build --release
@@ -85,20 +137,18 @@ jobs:
       - name: Package release archive
         run: |
           mkdir -p release
-          cp target/release/scx_cognis release/
+          cp target/release/scx_cognis release/scx_cognis
           chmod +x release/scx_cognis
           cd release
           tar -czf scx_cognis-linux-x86_64.tar.gz scx_cognis
           sha256sum scx_cognis-linux-x86_64.tar.gz > scx_cognis-linux-x86_64.tar.gz.sha256
-          ls -lh
 
       - name: Create and push git tag
         run: |
-          TAG="v${{ inputs.version }}"
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git tag "$TAG"
-          git push origin "$TAG"
+          git tag "v${{ inputs.version }}"
+          git push origin "v${{ inputs.version }}"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
