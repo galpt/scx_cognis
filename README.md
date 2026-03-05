@@ -153,9 +153,9 @@ deterministic heuristic evaluated on every `ops.enqueue` event. Five task featur
 
 | Feature | Description |
 |:---|:---|
-| `runnable_ratio` | $\text{burst\_ns} / \text{base\_slice\_ns}$ — most-recent burst as a fraction of the target slice |
-| `cpu_intensity` | $\text{burst\_ns} / \text{prev\_assigned\_slice\_ns}$ — fraction of the *assigned* slice the task actually consumed |
-| `exec_ratio` | $\text{burst\_ns} / \text{exec\_runtime}$ — freshness: near $1.0$ = just woke; near $0.0$ = spinning without sleeping |
+| `runnable_ratio` | $`\text{burst\_ns} / \text{base\_slice\_ns}`$ — most-recent burst as a fraction of the target slice |
+| `cpu_intensity` | $`\text{burst\_ns} / \text{prev\_assigned\_slice\_ns}`$ — fraction of the *assigned* slice the task actually consumed |
+| `exec_ratio` | $`\text{burst\_ns} / \text{exec\_runtime}`$ — freshness: near $`1.0`$ = just woke; near $`0.0`$ = spinning without sleeping |
 | `weight_norm` | Normalised scheduler weight (priority) |
 | `cpu_affinity` | Allowed CPUs / total online CPUs |
 
@@ -163,10 +163,10 @@ The primary classification feature is `cpu_intensity`. `prev_assigned_slice_ns` 
 
 | `cpu_intensity` range | `exec_ratio` condition | Label |
 |:---|:---|:---|
-| $> 0.85$ and $\text{exec\_ratio} < 0.30$ | Never sleeps between slices — CPU-bound | **Compute** |
-| $> 0.85$ and $\text{exec\_ratio} \geq 0.30$ | High burst but just woke (e.g. 120fps render) | **Interactive** |
-| $0.10 \leq \text{cpu\_intensity} \leq 0.85$ (any `exec_ratio`) | Yields regularly — latency-sensitive | **Interactive** |
-| $< 0.10$ (any `exec_ratio`) | Released CPU far before slice expired — I/O-blocked | **IoWait** |
+| $`> 0.85`$ and $`\text{exec\_ratio} < 0.30`$ | Never sleeps between slices — CPU-bound | **Compute** |
+| $`> 0.85`$ and $`\text{exec\_ratio} \geq 0.30`$ | High burst but just woke (e.g. 120fps render) | **Interactive** |
+| $`0.10 \leq \text{cpu\_intensity} \leq 0.85`$ (any `exec_ratio`) | Yields regularly — latency-sensitive | **Interactive** |
+| $`< 0.10`$ (any `exec_ratio`) | Released CPU far before slice expired — I/O-blocked | **IoWait** |
 
 > [!IMPORTANT]
 > **The `exec_ratio` guard is critical**
@@ -212,26 +212,26 @@ Falls back to `RL_CPU_ANY` (kernel-side placement) when no CPU is a clear winner
 
 #### Elman RNN Burst Predictor
 
-Predicts each PID's next CPU burst duration using a compact Elman RNN: $H = 4$ hidden units, $X = 3$ inputs (`burst_norm`, `exec_ratio`, `cpu_intensity`). The architecture is a standard single-layer Elman RNN ($h_t = \tanh(W_h \cdot h_{t-1} + W_x \cdot x_t + b)$); weights are compile-time constants derived from offline analysis of synthetic scheduler traces and have not been validated on real production workloads. The forward pass runs in $O(H \cdot X) = O(12)$ multiplications with per-PID hidden state in a `HashMap<i32, PidState>`.
+Predicts each PID's next CPU burst duration using a compact Elman RNN: $`H = 4`$ hidden units, $`X = 3`$ inputs (`burst_norm`, `exec_ratio`, `cpu_intensity`). The architecture is a standard single-layer Elman RNN ($`h_t = \tanh(W_h \cdot h_{t-1} + W_x \cdot x_t + b)`$); weights are compile-time constants derived from offline analysis of synthetic scheduler traces and have not been validated on real production workloads. The forward pass runs in $`O(H \cdot X) = O(12)`$ multiplications with per-PID hidden state in a `HashMap<i32, PidState>`.
 
-Predictions are EMA-smoothed ($\alpha = 0.15$) to reduce jitter. If the predictor forecasts a short burst, the scheduler preemptively shortens the assigned slice, reclaiming CPU time for other tasks.
+Predictions are EMA-smoothed ($`\alpha = 0.15`$) to reduce jitter. If the predictor forecasts a short burst, the scheduler preemptively shortens the assigned slice, reclaiming CPU time for other tasks.
 
 [↑ Back to Table of Contents](#table-of-contents)
 
 #### Bayesian Reputation Engine
 
-Maintains a $\mathrm{Beta}(\alpha, \beta)$ prior over trust for each PID:
+Maintains a $`\mathrm{Beta}(\alpha, \beta)`$ prior over trust for each PID:
 
-- **Cooperative events** (task yields within slice, clean exit, low fork rate) → increment $\alpha$
-- **Adversarial events** (slice burned, cheat flag, high fork count) → increment $\beta$
+- **Cooperative events** (task yields within slice, clean exit, low fork rate) → increment $`\alpha`$
+- **Adversarial events** (slice burned, cheat flag, high fork count) → increment $`\beta`$
 
-Trust score $E[T] = \dfrac{\alpha}{\alpha + \beta}$. Tasks below the $0.35$ threshold are quarantined — their slice factor is reduced and the A\* load balancer routes them to restricted cores.
+Trust score $`E[T] = \dfrac{\alpha}{\alpha + \beta}`$. Tasks below the $`0.35`$ threshold are quarantined — their slice factor is reduced and the A\* load balancer routes them to restricted cores.
 
 [↑ Back to Table of Contents](#table-of-contents)
 
 #### Q-learning Policy Controller
 
-Continuously tunes the global base time-slice using tabular Q-learning ($\text{TABLE\_SIZE} = 625 = 5^4$ states, 3 actions: $\text{shrink} \times 0.80 \mid \text{keep} \times 1.00 \mid \text{grow} \times 1.15$). The four-dimensional state is:
+Continuously tunes the global base time-slice using tabular Q-learning ($`\text{TABLE\_SIZE} = 625 = 5^4`$ states, 3 actions: $`\text{shrink} \times 0.80 \mid \text{keep} \times 1.00 \mid \text{grow} \times 1.15`$). The four-dimensional state is:
 
 | Dimension | Bins | Description |
 |:---|:---|:---|
@@ -246,9 +246,9 @@ $$
 R = (\text{interactive\_frac} \times \text{load\_norm}) \times 0.7 - \text{congestion} \times 0.2 - \text{latency} \times 0.1
 $$
 
-clamped to $[-1.0,\ +1.0]$, where `interactive_frac` is the fraction of currently-queued Interactive tasks and `load_norm` is CPU utilisation (0–1). This produces a meaningful gradient: the policy learns to **shrink** when Compute tasks dominate (low `interactive_frac`) and **keep/grow** only when Interactive tasks are well-served.
+clamped to $`[-1.0,\ +1.0]`$, where `interactive_frac` is the fraction of currently-queued Interactive tasks and `load_norm` is CPU utilisation (0–1). This produces a meaningful gradient: the policy learns to **shrink** when Compute tasks dominate (low `interactive_frac`) and **keep/grow** only when Interactive tasks are well-served.
 
-$\varepsilon$-greedy exploration decays from $0.30 \to 0.02$ with each update. The current slice is published to an `AtomicU64` so the dispatch hot-path reads it without locking.
+$`\varepsilon`$-greedy exploration decays from $`0.30 \to 0.02`$ with each update. The current slice is published to an `AtomicU64` so the dispatch hot-path reads it without locking.
 
 Policy updates run every 250 ms; Isolation Forest anti-cheat ticks every 100 ms — both are **off the scheduling hot-path**.
 
@@ -325,11 +325,11 @@ The pipeline runs **synchronously on the hot scheduling path** for the per-task 
 
 | Component | Complexity | Typical cost |
 |:---|:---|:---|
-| Heuristic classify | $O(1)$ — 4 comparisons | < 0.05 µs |
-| Reputation read | $O(1)$ HashMap lookup | < 0.1 µs |
-| Burst predictor | $O(H \cdot X) = O(12)$ matmul | < 0.1 µs |
-| A\* placement | $O(n_\text{cpus})$ BinaryHeap | ~1 µs |
-| Q-learning slice read | $O(1)$ atomic read | < 0.05 µs |
+| Heuristic classify | $`O(1)`$ — 4 comparisons | < 0.05 µs |
+| Reputation read | $`O(1)`$ HashMap lookup | < 0.1 µs |
+| Burst predictor | $`O(H \cdot X) = O(12)`$ matmul | < 0.1 µs |
+| A\* placement | $`O(n_\text{cpus})`$ BinaryHeap | ~1 µs |
+| Q-learning slice read | $`O(1)`$ atomic read | < 0.05 µs |
 | **Total (typical)** | | **~1–2 µs** |
 
 [↑ Back to Table of Contents](#table-of-contents)
@@ -348,15 +348,15 @@ $$
 R = (\text{interactive\_frac} \times \text{load\_norm}) \times 0.7 - \text{congestion} \times 0.2 - \text{latency} \times 0.1
 $$
 
-clamped to $[-1.0,\ +1.0]$.
+clamped to $`[-1.0,\ +1.0]`$.
 
 | Term | Weight | Description |
 |:---|:---|:---|
-| $\text{interactive\_frac} \times \text{load\_norm}$ | **0.7** | Reward for serving Interactive tasks under load |
-| $\text{congestion}$ | 0.2 | Penalty for scheduler queue congestion |
-| $\text{latency}$ | 0.1 | Penalty for estimated scheduling latency |
+| $`\text{interactive\_frac} \times \text{load\_norm}`$ | **0.7** | Reward for serving Interactive tasks under load |
+| $`\text{congestion}`$ | 0.2 | Penalty for scheduler queue congestion |
+| $`\text{latency}`$ | 0.1 | Penalty for estimated scheduling latency |
 
-The slice action space is: $\{\, \text{shrink} \times 0.80,\ \text{keep} \times 1.00,\ \text{grow} \times 1.15 \,\}$.
+The slice action space is: $`\{\, \text{shrink} \times 0.80,\ \text{keep} \times 1.00,\ \text{grow} \times 1.15 \,\}`$.
 
 The Q-learning controller's maximum output is capped at `base_slice_ns` (the user's `--slice-us` setting), preventing any inflation beyond the configured budget.
 
@@ -376,9 +376,9 @@ $$
 \end{aligned}
 $$
 
-clamped to $[\text{slice\_ns\_min},\ 8 \times \text{base\_slice\_ns}]$.
+clamped to $`[\text{slice\_ns\_min},\ 8 \times \text{base\_slice\_ns}]`$.
 
-If the Elman RNN predicts a short burst, the slice is further capped to $\min(\text{slice},\ 2 \times \text{predicted\_burst})$.
+If the Elman RNN predicts a short burst, the slice is further capped to $`\min(\text{slice},\ 2 \times \text{predicted\_burst})`$.
 
 [↑ Back to Table of Contents](#table-of-contents)
 
@@ -572,20 +572,20 @@ Each line from `--monitor` is a snapshot of one polling interval. All counters l
 | `quarantine:0` | quarantined PIDs | instant | PIDs currently throttled by the **Reputation Engine** for consistently burning 100% of their assigned slice (monopolising behaviour). They receive the minimum time-slice until their reputation recovers. |
 | `flagged:0` | flagged TGIDs | instant | Thread-groups detected as outliers by the **Isolation Forest Anti-Cheat Engine** (statistical anomaly in scheduling behaviour). Flagged tasks are isolated to prevent them from starving others. |
 | `slice:4000µs` | policy time-slice | instant | The **Q-learning Policy Controller**'s current base time-slice in microseconds. The controller adjusts this every ~250 ms based on the reward signal — it shrinks when Interactive tasks are well-served and grows when the system is I/O-bound. |
-| `reward:0.42` | reward EMA | instant | Exponential moving average of the scheduler's **reward function**: $R = (\text{interactive\_frac} \times \text{load\_norm}) \times 0.7 - \text{congestion} \times 0.2 - \text{latency} \times 0.1$. Values near $1.0$ are ideal (Interactive tasks served under load); near $0$ means mostly Compute tasks dominating; negative values indicate sustained high congestion. |
+| `reward:0.42` | reward EMA | instant | Exponential moving average of the scheduler's **reward function**: $`R = (\text{interactive\_frac} \times \text{load\_norm}) \times 0.7 - \text{congestion} \times 0.2 - \text{latency} \times 0.1`$. Values near $`1.0`$ are ideal (Interactive tasks served under load); near $`0`$ means mostly Compute tasks dominating; negative values indicate sustained high congestion. |
 
 #### Classification Label Deep-Dive
 
 The classifier uses a **deterministic 3-band heuristic** evaluated stateless on every scheduling event. There is no sliding window or voting — this prevents feedback-loop misclassification while maintaining O(1) latency.
 
-The key feature is $\text{cpu\_intensity} = \text{burst\_ns} / \text{prev\_assigned\_slice\_ns}$ (slice-usage fraction):
+The key feature is $`\text{cpu\_intensity} = \text{burst\_ns} / \text{prev\_assigned\_slice\_ns}`$ (slice-usage fraction):
 
 | Label | Slice Multiplier | Heuristic Rule |
 |:---|:---|:---|
-| **RealTime** | 0.25× | priority weight $> 95\%$ of max (SCHED_FIFO / SCHED_RR tasks) |
-| **Compute** | 1.0× | $\text{cpu\_intensity} > 0.85$ — task consumed > 85% of its assigned slice (CPU-bound) |
-| **Interactive** | 0.5× | $0.10 \leq \text{cpu\_intensity} \leq 0.85$ — task yields regularly (latency-sensitive) |
-| **IoWait** | 0.75× | $\text{cpu\_intensity} < 0.10$ — task released CPU far before slice expired (I/O-blocked) |
+| **RealTime** | 0.25× | priority weight $`> 95\%`$ of max (SCHED_FIFO / SCHED_RR tasks) |
+| **Compute** | 1.0× | $`\text{cpu\_intensity} > 0.85`$ — task consumed > 85% of its assigned slice (CPU-bound) |
+| **Interactive** | 0.5× | $`0.10 \leq \text{cpu\_intensity} \leq 0.85`$ — task yields regularly (latency-sensitive) |
+| **IoWait** | 0.75× | $`\text{cpu\_intensity} < 0.10`$ — task released CPU far before slice expired (I/O-blocked) |
 | **Unknown** | 1.0× | reserved; not emitted by the current heuristic |
 
 > [!TIP]
