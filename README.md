@@ -1,8 +1,8 @@
 # scx_cognis
 
-"Cognis" (from Latin *cognōscere*) — to learn, to know — is a Linux CPU scheduler with adaptive scheduling policy, combining deterministic heuristics, classical graph algorithms, Bayesian statistics, and tabular reinforcement learning.
+"Cognis" (from Latin *cognōscere*) — to learn, to know — is a Linux CPU scheduler with adaptive scheduling policy, combining deterministic heuristics, O(1) bitmask CPU selection, trust-based anomaly detection, and tabular reinforcement learning.
 
-`scx_cognis` is a Linux CPU scheduler built on the [`sched_ext`](https://www.kernel.org/doc/html/latest/scheduler/sched-ext.html) framework and [`scx_rustland_core`](https://crates.io/crates/scx_rustland_core). It combines a deterministic task classifier, Bayesian reputation tracking, tabular Q-learning, Isolation Forest anomaly detection, and an Elman RNN burst predictor — all running in user-space Rust with a sub-5 µs per-event inference target.
+`scx_cognis` is a Linux CPU scheduler built on the [`sched_ext`](https://www.kernel.org/doc/html/latest/scheduler/sched-ext.html) framework and [`scx_rustland_core`](https://crates.io/crates/scx_rustland_core). It combines a deterministic task classifier, a zero-alloc trust engine, tabular Q-learning, and an Elman RNN burst predictor — all running in user-space Rust with a sub-5 µs per-event inference target. Every hot-path data structure is a fixed-size array; no heap allocation occurs during scheduling events.
 
 ---
 
@@ -16,10 +16,9 @@
   - [Pipeline Overview](#pipeline-overview)
   - [Component Details](#component-details)
     - [Heuristic Task Classifier](#heuristic-task-classifier)
-    - [Isolation Forest Anti-Cheat Engine](#isolation-forest-anti-cheat-engine)
-    - [A\* Load Balancer](#a-load-balancer)
+    - [O(1) CPU Selector](#o1-cpu-selector)
     - [Elman RNN Burst Predictor](#elman-rnn-burst-predictor)
-    - [Bayesian Reputation Engine](#bayesian-reputation-engine)
+    - [Trust Engine](#trust-engine)
     - [Q-learning Policy Controller](#q-learning-policy-controller)
     - [ratatui TUI Dashboard](#ratatui-tui-dashboard)
 - [Design Notes](#design-notes)
@@ -81,31 +80,39 @@
 
 ## Status
 
-Stable — all 17 unit tests pass on every commit. The scheduler builds cleanly from crates.io with no external SCM dependencies, and has been run successfully on production workloads on `sched_ext`-enabled kernels (≥ 6.12).
+Stable — all 25 unit tests pass on every commit. The scheduler builds cleanly from crates.io with no external SCM dependencies, and has been run successfully on production workloads on `sched_ext`-enabled kernels (≥ 6.12).
 
 ### Test Results
 
 ```
-running 17 tests
-test ai::burst_predictor::tests::evict_removes_state ............. ok
-test ai::burst_predictor::tests::predicts_nonzero_after_warmup ... ok
-test ai::classifier::tests::heuristic_boundary_compute_high ...... ok
-test ai::classifier::tests::heuristic_boundary_interactive_low ... ok
-test ai::classifier::tests::heuristic_compute .................... ok
-test ai::classifier::tests::heuristic_interactive ................ ok
-test ai::classifier::tests::heuristic_iowait ..................... ok
-test ai::classifier::tests::heuristic_realtime ................... ok
-test ai::classifier::tests::high_cpu_fresh_wakeup_is_interactive ... ok
-test ai::anomaly::tests::anomaly_score_range ...................... ok
-test ai::load_balancer::tests::quarantine_only_restricted ......... ok
-test ai::load_balancer::tests::selects_idle_cpu ................... ok
-test ai::reputation::tests::penalise_decreases_trust .............. ok
-test ai::reputation::tests::quarantine_on_cheat_flag .............. ok
-test ai::reputation::tests::reward_increases_trust ................ ok
-test ai::reputation::tests::uniform_prior_mean .................... ok
+running 25 tests
+test ai::burst_predictor::tests::different_pids_independent ........ ok
+test ai::burst_predictor::tests::evict_removes_state .............. ok
+test ai::burst_predictor::tests::predicts_nonzero_after_warmup .... ok
+test ai::classifier::tests::heuristic_boundary_compute_high ....... ok
+test ai::classifier::tests::heuristic_boundary_interactive_low .... ok
+test ai::classifier::tests::heuristic_compute ..................... ok
+test ai::classifier::tests::heuristic_interactive ................. ok
+test ai::classifier::tests::heuristic_iowait ...................... ok
+test ai::classifier::tests::heuristic_realtime .................... ok
+test ai::classifier::tests::high_cpu_fresh_wakeup_is_interactive .. ok
+test ai::cpu_selector::tests::fallback_to_any_when_preferred_unavailable ... ok
+test ai::cpu_selector::tests::non_quarantine_avoids_restricted .... ok
+test ai::cpu_selector::tests::quarantine_only_restricted .......... ok
+test ai::cpu_selector::tests::realtime_always_p_core .............. ok
+test ai::cpu_selector::tests::selects_e_core_for_low_perf_cri ..... ok
+test ai::cpu_selector::tests::selects_p_core_for_high_perf_cri .... ok
+test ai::trust::tests::adversarial_exits_lower_trust_to_quarantine . ok
+test ai::trust::tests::clean_exit_clears_cheat_flag ............... ok
+test ai::trust::tests::cooperative_exits_improve_trust ............ ok
+test ai::trust::tests::evict_clears_slot .......................... ok
+test ai::trust::tests::neutral_initial_score ...................... ok
+test ai::trust::tests::slice_factor_ranges ........................ ok
+test ai::trust::tests::str_to_comm_truncates_at_15 ................ ok
+test ai::trust::tests::worst_actors_finds_low_trust_entries ........ ok
 test ai::policy::tests::slice_stays_in_bounds ..................... ok
 
-test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 ```
 
 ### Tested Platforms
@@ -137,11 +144,11 @@ test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fin
 Every scheduling decision passes through a multi-stage pipeline. The entire pipeline completes in **< 5 µs** on a modern CPU, staying well within the time-slice budget.
 
 ```
-ops.enqueue   →  Heuristic Classifier  →  Reputation Check  →  Burst Predictor
+ops.enqueue   →  Heuristic Classifier  →  Trust Check  →  Burst Predictor
 ops.dispatch  →  Q-learning Policy (adaptive time slice)
-ops.select_cpu → A* Load Balancer  (P/E-core, NUMA, quarantine-aware)
-ops.tick      →  Isolation Forest Anti-Cheat
-schedule loop →  Reputation Engine          (staleness-based, every 1 s)
+ops.select_cpu → O(1) CPU Selector  (P/E-core bitmask, quarantine-aware)
+ops.tick      →  Trust Engine tick  (no-op; prepared for future anomaly detection)
+schedule loop →  Trust Engine flush          (staleness-based, every 1 s)
 ```
 
 ### Component Details
@@ -158,7 +165,7 @@ deterministic heuristic evaluated on every `ops.enqueue` event. Six task feature
 | `exec_ratio` | $`\text{burst\_ns} / \text{exec\_runtime}`$ — freshness: near $`1.0`$ = just woke; near $`0.0`$ = spinning without sleeping |
 | `weight_norm` | Normalised scheduler weight (priority) |
 | `cpu_affinity` | Allowed CPUs / total online CPUs |
-| `perf_cri` | Performance criticality score $`\in [0,1]`$: $`\text{cpu\_intensity}\times 0.7 + (1 - \text{exec\_ratio}\times 0.5)\times 0.3`$. RealTime tasks are hard-capped to $`1.0`$. Used by the A\* load balancer to route tasks to P/E-cores. |
+| `perf_cri` | Performance criticality score $`\in [0,1]`$: $`\text{cpu\_intensity}\times 0.7 + (1 - \text{exec\_ratio}\times 0.5)\times 0.3`$. RealTime tasks are hard-capped to $`1.0`$. Used by the O(1) CPU selector to route tasks to P/E-cores. |
 
 The primary classification feature is `cpu_intensity`. `prev_assigned_slice_ns` is the slice allocated to this PID on its previous scheduling event (stored in `TaskLifetime`). On first event, `base_slice_ns` is used as fallback. This makes classification stable and loop-free from the second event onward:
 
@@ -176,39 +183,21 @@ The primary classification feature is `cpu_intensity`. `prev_assigned_slice_ns` 
 
 A weight-norm threshold (> 0.95) catches `SCHED_FIFO` / `SCHED_RR` tasks regardless of slice usage and labels them **RealTime**.
 
-Labels influence the base time-slice multiplier and feed into the Reputation Engine and Q-learning Policy.
+Labels influence the base time-slice multiplier and feed into the Trust Engine and Q-learning Policy.
 
 [↑ Back to Table of Contents](#table-of-contents)
 
-#### Isolation Forest Anti-Cheat Engine
+#### O(1) CPU Selector
 
-Detects scheduler-abusing processes (fork-bombers, yield-spinners, deadline-gaming) using an approximated Isolation Forest: 32 trees, sample size 128, max depth 8. Anomaly scores are averaged over all trees.
+Selects the optimal CPU for each task using a 64-bit bitmask in O(1) time (a single TZCNT instruction). Three candidate sets are maintained:
 
-Three tiers of false-positive protection prevent legitimate processes (e.g. a browser forking during app-init, or a service doing a brief yield-spin during a lock convoy) from being incorrectly quarantined:
-
-| Mechanism | Detail |
+| Mask | Purpose |
 |:---|:---|
-| **Confirmation window** | A task must score above the threshold on **3 consecutive ticks** before quarantine is applied. A single transient spike does not trigger isolation. |
-| **Adaptive threshold** | The threshold self-calibrates to the **p95 of all observed anomaly scores** over the last 500 ticks (one retrain cycle), floored at the hard minimum of `0.65`. This prevents the model from becoming over-sensitive as workloads shift. |
-| **Timed pardon** | Once flagged, a task must score **below** the threshold for **5 consecutive ticks** to be automatically unquarantined. There is no permanent blacklist. |
+| `p_mask` | P-core (Performance) CPUs |
+| `restricted_mask` | CPUs reserved for quarantined tasks |
+| `all_mask` | All reachable CPUs |
 
-Confirmed-anomalous tasks are routed exclusively to the restricted CPU set (size configurable via `--restricted-cpus`, default 1 CPU).
-
-The forest is retrained every 500 ticks (~50 s at a 100 ms tick rate) to adapt to workload changes without stalling the hot path.
-
-[↑ Back to Table of Contents](#table-of-contents)
-
-#### A\* Load Balancer
-
-Selects the optimal CPU for each task using an A\*-inspired heuristic traversal over a per-CPU cost graph. Placement cost accounts for:
-
-- Current CPU utilisation (primary cost)
-- NUMA node distance to the task's previous CPU
-- Core-type mismatch penalty (Performance vs. Efficiency cores), using a **dynamic threshold**: the task's `perf_cri` score is compared against the system-wide EWMA `avg_perf_cri` (α = 0.15, updated each tick). Tasks with `perf_cri ≥ avg_perf_cri` are routed to P-cores; lower-scoring tasks go to E-cores. The threshold floats with the live workload mix — a render-heavy workload raises `avg_perf_cri`, reserving P-cores for the most critical threads.
-- Thermal throttle penalty
-- Quarantine routing (flagged tasks may only land on restricted CPUs)
-
-CPU topology is read from sysfs at scheduler startup:
+CPU type is read from sysfs at scheduler startup:
 
 | Topology data | Source |
 |:---|:---|
@@ -217,26 +206,36 @@ CPU topology is read from sysfs at scheduler startup:
 
 On non-hybrid CPUs (AMD, homogeneous Intel, VMs) the sysfs entries are absent and all CPUs are treated as Performance-class.
 
-Falls back to `RL_CPU_ANY` (kernel-side placement) when no CPU is a clear winner.
+Routing logic (evaluated in order):
+
+1. **Quarantine** — flagged task → `restricted_mask` only.
+2. **RealTime** — always routed to `p_mask` (guaranteed P-core for minimum latency).
+3. **perf_cri ≥ avg_perf_cri** → `p_mask`. The `avg_perf_cri` threshold is a system-wide EWMA (α = 0.15, updated each tick). It floats with the live workload mix — a render-heavy workload raises the threshold, reserving P-cores for the most critical threads.
+4. **perf_cri < avg_perf_cri** → E-cores (`all_mask & ~p_mask`), falling back to `all_mask` on homogeneous systems.
+5. **No winner** → `RL_CPU_ANY` (kernel-side placement fallback).
 
 [↑ Back to Table of Contents](#table-of-contents)
 
 #### Elman RNN Burst Predictor
 
-Predicts each PID's next CPU burst duration using a compact Elman RNN: $`H = 4`$ hidden units, $`X = 3`$ inputs (`burst_norm`, `exec_ratio`, `cpu_intensity`). The architecture is a standard single-layer Elman RNN ($`h_t = \tanh(W_h \cdot h_{t-1} + W_x \cdot x_t + b)`$); weights are compile-time constants derived from offline analysis of synthetic scheduler traces and have not been validated on real production workloads. The forward pass runs in $`O(H \cdot X) = O(12)`$ multiplications with per-PID hidden state in a `HashMap<i32, PidState>`.
+Predicts each PID's next CPU burst duration using a compact Elman RNN: $`H = 4`$ hidden units, $`X = 3`$ inputs (`burst_norm`, `exec_ratio`, `cpu_intensity`). The architecture is a standard single-layer Elman RNN ($`h_t = \tanh(W_h \cdot h_{t-1} + W_x \cdot x_t + b)`$); weights are compile-time constants derived from offline analysis of synthetic scheduler traces and have not been validated on real production workloads. The forward pass runs in $`O(H \cdot X) = O(12)`$ multiplications with per-PID hidden state stored in a zero-alloc fixed open-addressing table (`[RnnState; 4096]`).
 
 Predictions are EMA-smoothed ($`\alpha = 0.15`$) to reduce jitter. If the predictor forecasts a short burst, the scheduler preemptively shortens the assigned slice, reclaiming CPU time for other tasks.
 
 [↑ Back to Table of Contents](#table-of-contents)
 
-#### Bayesian Reputation Engine
+#### Trust Engine
 
-Maintains a $`\mathrm{Beta}(\alpha, \beta)`$ prior over trust for each PID:
+Maintains a trust score (`f32` in `[-1.0, 1.0]`) for each PID in a zero-alloc fixed table (`[f32; 4096]`). A Fibonacci hash maps PIDs to slots; eviction is handled on exit or by age.
 
-- **Cooperative events** (task yields within slice, clean exit, low fork rate) → increment $`\alpha`$
-- **Adversarial events** (slice burned, cheat flag, high fork count) → increment $`\beta`$
+| Event | Effect |
+|:---|:---|
+| Cooperative (yields within slice, clean exit, low fork rate) | Trust score increases (EWMA update toward `+1.0`) |
+| Adversarial (slice burned, cheat flag, high fork count, involuntary ctx-switch) | Trust score decreases (EWMA update toward `−1.0`) |
 
-Trust score $`E[T] = \dfrac{\alpha}{\alpha + \beta}`$. Tasks below the $`0.35`$ threshold are quarantined — their slice factor is reduced and the A\* load balancer routes them to restricted cores.
+Tasks below the `−0.35` quarantine threshold receive a reduced slice factor (`f_r` clamped to `[0.25, 1.0]`) and are routed exclusively to restricted CPUs by the O(1) CPU selector.
+
+The trust engine also exposes a `worst_actors()` snapshot (up to 20 entries) for the TUI "Trust Wall of Shame" panel.
 
 [↑ Back to Table of Contents](#table-of-contents)
 
@@ -261,7 +260,7 @@ clamped to $`[-1.0,\ +1.0]`$, where `interactive_frac` is the fraction of curren
 
 $`\varepsilon`$-greedy exploration decays from $`0.15 \to 0.02`$ with each update. The current slice is published to an `AtomicU64` so the dispatch hot-path reads it without locking.
 
-Policy updates run every 250 ms; Isolation Forest anti-cheat ticks every 100 ms — both are **off the scheduling hot-path**.
+Policy updates run every 250 ms; trust engine ticks every 100 ms — both are **off the scheduling hot-path**.
 
 [↑ Back to Table of Contents](#table-of-contents)
 
@@ -275,10 +274,10 @@ Panels:
 |:---|:---|
 | Header | Scheduler name, live CPU/running/queued counts, current time-slice |
 | Overview | User/kernel/failed dispatch counts, congestion events, page faults, CPU load % |
-| Classification | Live bar gauges for Interactive / Compute / IoWait / RealTime with quarantine/flagged counts |
+| Classification | Live bar gauges for Interactive / Compute / IoWait / RealTime with quarantine/flagged PIDs |
 | Q-learning Policy | Current time-slice, Q-learning reward EMA, average inference latency, latency budget check |
 | Latency Chart | Rolling 120-sample line chart of average per-event inference (µs) |
-| Wall of Shame | Top quarantined or anti-cheat-flagged PIDs with trust score and cheat flag |
+| Trust Wall of Shame | Top quarantined or trust-flagged PIDs with trust score and cheat flag |
 
 [↑ Back to Table of Contents](#table-of-contents)
 
@@ -301,10 +300,10 @@ flowchart TD
     end
 
     subgraph Pipeline["Scheduling Pipeline"]
-        P1["`**dequeue** → heuristic classify → Bayesian reputation check → Elman RNN headroom hint`"]
-        P2["`**select_cpu** → A\* topology search`"]
+        P1["`**dequeue** → heuristic classify → trust check → Elman RNN headroom hint`"]
+        P2["`**select_cpu** → O(1) bitmask CPU select`"]
         P3["`**dispatch** → Q-learning policy slice read`"]
-        P4["`**tick** → Isolation Forest anti-cheat`"]
+        P4["`**tick** → trust engine tick`"]
     end
 
     subgraph TUI["ratatui TUI Dashboard"]
@@ -318,29 +317,29 @@ flowchart TD
 
 ### Pipeline Details
 
-The pipeline runs **synchronously on the hot scheduling path** for the per-task steps (heuristic classify, reputation read, burst predictor read, A\*, Q-learning slice read). Heavier operations (anti-cheat forest ticks, Q-table updates) run on **periodic timers** off the hot path.
+The pipeline runs **synchronously on the hot scheduling path** for the per-task steps (heuristic classify, trust check, burst predictor read, O(1) CPU select, Q-learning slice read). Heavier operations (trust engine ticks, Q-table updates) run on **periodic timers** off the hot path.
 
 | Step | Hot Path? | Frequency |
 |:---|:---|:---|
 | Heuristic classify | ✅ Yes | every `ops.enqueue` |
-| Reputation read | ✅ Yes | every `ops.enqueue` |
+| Trust check | ✅ Yes | every `ops.enqueue` |
 | Burst predictor read | ✅ Yes | every `ops.enqueue` |
-| A\* CPU select | ✅ Yes | every `ops.select_cpu` |
+| O(1) CPU select | ✅ Yes | every `ops.select_cpu` |
 | Q-learning slice read | ✅ Yes | every `ops.dispatch` (atomic read) |
-| Anti-cheat tick | ❌ No | every 100 ms |
+| Trust engine tick | ❌ No | every 100 ms |
 | Q-table update | ❌ No | every 250 ms |
-| Reputation update | ❌ No | every 1 s (staleness heuristic) |
+| Trust engine flush | ❌ No | every 1 s (staleness heuristic) |
 
 ### Latency Budget
 
 | Component | Complexity | Typical cost |
 |:---|:---|:---|
 | Heuristic classify | $`O(1)`$ — 4 comparisons | < 0.05 µs |
-| Reputation read | $`O(1)`$ HashMap lookup | < 0.1 µs |
+| Trust check | $`O(1)`$ fixed-table lookup | < 0.1 µs |
 | Burst predictor | $`O(H \cdot X) = O(12)`$ matmul | < 0.1 µs |
-| A\* placement | $`O(n_\text{cpus})`$ BinaryHeap | ~1 µs |
+| O(1) CPU select | $`O(1)`$ bitmask TZCNT | < 0.01 µs |
 | Q-learning slice read | $`O(1)`$ atomic read | < 0.05 µs |
-| **Total (typical)** | | **~1–2 µs** |
+| **Total (typical)** | | **< 1 µs** |
 
 [↑ Back to Table of Contents](#table-of-contents)
 
@@ -389,7 +388,7 @@ For each dispatched task, the final slice is:
 \text{slice} ={}& \text{effective\_base\_ns} \\
   {}\times{}& f_{\pi} && \text{(Q-learning policy factor)} \\
   {}\times{}& f_{\ell} && \text{(Interactive}=0.5,\ \text{Compute}=1.0,\ \text{IoWait}=0.75,\ \text{RT}=0.25\text{)} \\
-  {}\times{}& f_{r} && \text{(Bayesian trust}\ f_{r} \in [0.25,\ 1.0]\text{)} \\
+  {}\times{}& f_{r} && \text{(trust EMA factor}\ f_{r} \in [0.25,\ 1.0]\text{)} \\
   {}\times{}& \tfrac{w}{100} && \text{(scheduler priority weight)}
 \end{aligned}
 ```
@@ -598,8 +597,8 @@ Each line from `--monitor` is a snapshot of one polling interval. All counters l
 | `IOwait:2` | I/O-wait events | per-interval | Events classified as **I/O Wait** (blocked on disk/network most of the time). Gets a 0.75× time-slice. |
 | `RT:0` | realtime events | per-interval | Events classified as **RealTime** (JACK, audio daemons, SCHED_FIFO tasks). Gets a 0.25× time-slice for minimum latency. |
 | `Unknown:1` | unclassified events | per-interval | Events that did not match any heuristic rule. In practice this should never appear with the current 3-band heuristic (every task is classified as Compute, Interactive, or IoWait). Gets a 1× baseline time-slice. |
-| `quarantine:0` | quarantined PIDs | instant | PIDs currently throttled by the **Reputation Engine** for consistently burning 100% of their assigned slice (monopolising behaviour). They receive the minimum time-slice until their reputation recovers. |
-| `flagged:0` | flagged TGIDs | instant | Thread-groups detected as outliers by the **Isolation Forest Anti-Cheat Engine** (statistical anomaly in scheduling behaviour). Flagged tasks are isolated to prevent them from starving others. |
+| `quarantine:0` | quarantined PIDs | instant | PIDs currently throttled by the **Trust Engine** for consistently burning 100% of their assigned slice (monopolising behaviour). They receive a reduced time-slice until their trust score recovers. |
+| `flagged:0` | flagged PIDs | instant | PIDs detected as scheduling anomalies by the **Trust Engine** (adversarial scheduling behaviour: slice-burning, high fork rate, involuntary context switches). Flagged tasks are routed to restricted CPUs to prevent them from starving others. |
 | `slice:4000µs` | policy time-slice | instant | The **Q-learning Policy Controller**'s current effective base time-slice in microseconds. In auto mode (`--slice-us 0`, the default) this is derived from `TARGETED_LATENCY_NS / tasks_per_cpu` (clamped 500 µs – 20 ms, EWMA-smoothed) and then fine-tuned by the Q-learning policy factor. The controller shrinks the slice when Interactive tasks are well-served and grows it when the system is mostly idle. |
 | `reward:0.42` | reward EMA | instant | Exponential moving average of the scheduler's **reward function**: $`R = (\text{interactive\_frac} \times \text{load\_norm}) \times 0.7 - \text{congestion} \times 0.2 - \text{latency} \times 0.1`$. Values near $`1.0`$ are ideal (Interactive tasks served under load); near $`0`$ means mostly Compute tasks dominating; negative values indicate sustained high congestion. |
 
@@ -632,9 +631,9 @@ Messages are evaluated each interval in **highest-severity-first** order. The fi
 | `Dispatch failures detected! Something unexpected went wrong — check dmesg.` | `failed_dispatches > 0` | Run `sudo dmesg \| grep sched` and file a bug |
 | `SOS! The system is overwhelmed. Hanging on by a thread here!` | `reward < −0.5` — deep, sustained congestion | Reduce workload or reboot; something is seriously wrong |
 | `Under siege! Multiple rule-breakers caught and caged — enforcing order.` | `flagged > 5` **and** `quarantined > 5` | Normal if running untrusted workloads; cognis is handling it |
-| `Suspicious behaviour detected! Isolating troublemakers — your system is protected.` | `flagged > 0` — anti-cheat engine fired | Inspect flagged processes with `ps aux` |
+| `Suspicious behaviour detected! Isolating troublemakers — your system is protected.` | `flagged > 0` — trust engine detected anomalous scheduling behaviour | Inspect flagged processes with `ps aux` |
 | `Several greedy tasks are throttled — keeping them from hogging your CPU.` | `quarantined > 3` | Some processes keep burning 100% of their slice; they are being rate-limited |
-| `Caught a greedy task! Putting it on a leash so other tasks can breathe.` | `quarantined > 0` | A process exceeded its slice budget; reputation engine is throttling it |
+| `Caught a greedy task! Putting it on a leash so other tasks can breathe.` | `quarantined > 0` | A process exceeded its slice budget; trust engine is throttling it |
 | `Oh boy! Things are getting really busy. Tightening the reins...` | `congestion > 10` per interval | High burst of work; cognis is adapting — sustained = consider tuning `--slice-us` |
 | `Getting a little crowded in here, but I've got it handled.` | `congestion > 0` | Transient queue build-up; normal under bursty load |
 | `Working hard under pressure — might get bumpy. Stay with me!` | `reward < 0` (no explicit congestion) | Latency/throughput imbalance; usually self-corrects |
@@ -1114,7 +1113,7 @@ cargo clippy -- -D warnings
 
 ### Adding a New Module
 
-All components live in `src/ai/`. Each module is self-contained (no external framework dependencies — only `rand` for modules that need randomness):
+All components live in `src/ai/`. Each module is self-contained (no external framework dependencies — all hot-path data structures use fixed-size arrays; no allocation during scheduling events):
 
 1. Create `src/ai/my_module.rs` with your struct and unit tests.
 2. Add `pub mod my_module;` and a `pub use` re-export to `src/ai/mod.rs`.

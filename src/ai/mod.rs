@@ -1,25 +1,22 @@
 // Copyright (c) scx_cognis contributors
 // SPDX-License-Identifier: GPL-2.0-only
 //
-// Scheduling policy modules — aggregates all sub-modules:
+// Scheduling AI modules — aggregates all sub-modules:
 //   - Heuristic task classifier (deterministic rules)
-//   - Isolation Forest anomaly detection (unsupervised ML)
-//   - A* load balancer (classical heuristic search)
-//   - Elman RNN burst predictor (fixed-weight recurrent model)
-//   - Bayesian reputation engine (Beta-distribution prior)
+//   - O(1) bitmask CPU selector (replaces A* load balancer)
+//   - Elman RNN burst predictor (fixed-weight recurrent model, zero-alloc table)
+//   - Trust table (combined reputation + anomaly detection, zero-alloc)
 //   - Q-learning policy controller (tabular reinforcement learning)
 
-pub mod anomaly;
 pub mod burst_predictor;
 pub mod classifier;
-pub mod load_balancer;
+pub mod cpu_selector;
 pub mod policy;
-pub mod reputation;
+pub mod trust;
 
 // Re-export the most commonly used types for convenience.
-pub use anomaly::AntiCheatEngine;
 pub use burst_predictor::BurstPredictor;
 pub use classifier::{HeuristicClassifier, TaskFeatures, TaskLabel};
-pub use load_balancer::{AStarLoadBalancer, CoreType, CpuState};
+pub use cpu_selector::{CoreType, CpuSelector, CpuState};
 pub use policy::{PolicyController, SchedulerSignal};
-pub use reputation::{ExitObservation, ReputationEngine, TRUST_THRESHOLD};
+pub use trust::{ExitObservation, TrustTable};

@@ -317,10 +317,9 @@ impl PolicyController {
     ///
     /// Reward signal (range ≈ −0.3 … +0.7):
     ///
-    ///   +  interactive_fraction × load_norm  ← primary goal: keep interactive
-    ///                                           tasks running under load
-    ///   −  congestion_rate / 100             ← penalise dispatch backlog
-    ///   −  latency_p99_norm                  ← penalise inference overhead
+    /// - `+interactive_fraction × load_norm` — primary goal: keep interactive tasks running under load
+    /// - `-congestion_rate / 100` — penalise dispatch backlog
+    /// - `-latency_p99_norm` — penalise inference overhead
     fn compute_reward(&self, sig: &SchedulerSignal) -> f64 {
         // Primary term: are interactive tasks actually getting CPU time?
         // Multiplied by load_norm so an idle system (load≈0) contributes ~0

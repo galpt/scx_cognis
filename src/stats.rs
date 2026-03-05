@@ -54,9 +54,9 @@ pub struct Metrics {
     pub nr_realtime: u64,
     #[stat(desc = "Tasks not yet classified (classifier still warming up)")]
     pub nr_unknown: u64,
-    #[stat(desc = "PIDs currently quarantined by reputation engine")]
+    #[stat(desc = "PIDs currently quarantined by the trust engine")]
     pub nr_quarantined: u64,
-    #[stat(desc = "TGIDs flagged by anti-cheat isolation forest")]
+    #[stat(desc = "PIDs flagged by the anomaly detection system")]
     pub nr_flagged: u64,
     #[stat(desc = "Current Q-learning policy time slice (µs)")]
     pub ai_slice_us: u64,

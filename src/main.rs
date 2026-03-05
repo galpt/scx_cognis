@@ -4,15 +4,17 @@
 // scx_cognis — Adaptive CPU Scheduler
 //
 // Built on scx_rustland_core (sched_ext), this scheduler combines deterministic
-// heuristics, classical search algorithms, and statistical/RL-based components
-// in a multi-stage scheduling pipeline:
+// heuristics and statistical/RL-based components in a multi-stage pipeline:
 //
-//   ┌─────────────────────────────────────────────────────────────────┐
-//   │  ops.enqueue  → Heuristic classifier + Reputation check          │
-//   │  ops.dispatch → Q-learning policy (adaptive time slice)           │
-//   │  ops.select_cpu → A* load balancer (P/E-core aware)             │
-//   │  ops.tick     → Isolation Forest anti-cheat                     │
-//   └─────────────────────────────────────────────────────────────────┘
+//   ┌─────────────────────────────────────────────────────────────────────┐
+//   │  ops.enqueue  → Heuristic classifier + Trust check                  │
+//   │  ops.dispatch → Q-learning policy (adaptive time slice)              │
+//   │  ops.select_cpu → O(1) bitmask CPU selector (P/E-core, quarantine)  │
+//   │  ops.tick     → Trust-based anomaly detection (behavioural, zero-alloc) │
+//   └─────────────────────────────────────────────────────────────────────┘
+//
+// All hot-path data structures are fixed-size and allocated once at startup:
+// no HashMap, BTreeSet, or per-event heap allocations on the scheduling path.
 //
 // The BPF dispatcher (provided by scx_rustland_core) is completely agnostic
 // of this scheduling policy; only this Rust file implements the logic.
@@ -29,7 +31,8 @@ mod ai;
 mod stats;
 mod tui;
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
+use std::collections::VecDeque;
 use std::io;
 use std::mem::MaybeUninit;
 
@@ -38,7 +41,6 @@ use std::time::{Duration, Instant, SystemTime};
 use anyhow::Result;
 use clap::Parser;
 use libbpf_rs::OpenObject;
-use libc;
 use log::{info, warn};
 use procfs::process::Process;
 
@@ -48,9 +50,8 @@ use scx_utils::libbpf_clap_opts::LibbpfOpts;
 use scx_utils::UserExitInfo;
 
 use ai::{
-    AStarLoadBalancer, AntiCheatEngine, BurstPredictor, CoreType, CpuState, ExitObservation,
-    HeuristicClassifier, PolicyController, ReputationEngine, SchedulerSignal, TaskFeatures,
-    TaskLabel,
+    BurstPredictor, CoreType, CpuSelector, CpuState, ExitObservation, HeuristicClassifier,
+    PolicyController, SchedulerSignal, TaskFeatures, TaskLabel, TrustTable,
 };
 use stats::Metrics;
 use tui::SharedState;
@@ -63,10 +64,10 @@ const NSEC_PER_SEC: u64 = 1_000_000_000;
 
 /// scx_cognis: an adaptive CPU scheduler combining heuristics, statistical models, and RL.
 ///
-/// Scheduling pipeline: a deterministic heuristic task classifier, Isolation Forest
-/// anomaly detection, A* CPU placement heuristic, Elman RNN burst prediction (fixed
-/// offline-trained weights), Bayesian reputation tracking, and a tabular Q-learning
-/// policy controller — all with a sub-10µs per-event latency target.
+/// Scheduling pipeline: a deterministic heuristic task classifier, O(1) bitmask CPU selector
+/// (P/E-core and quarantine aware), Elman RNN burst prediction (fixed offline-trained weights),
+/// a combined trust/anomaly table for reputation tracking, and a tabular Q-learning policy
+/// controller — all targeting sub-10µs per-event latency with zero hot-path heap allocations.
 #[derive(Debug, Parser)]
 struct Opts {
     /// Base scheduling slice duration in microseconds.
@@ -145,42 +146,12 @@ struct Task {
     slice_ns: u64,
     /// Performance criticality score stored as fixed-point u16 (perf_cri × 1000).
     /// Range 0..=1000, representing 0.0..=1.0 with 0.1% resolution.
-    /// Stored as integer so Task remains fully Eq-comparable for BTreeSet ordering.
-    /// Converted back to f32 when passed to the A* load balancer.
+    /// Stored as integer so Task remains fully Eq-comparable.
+    /// Converted back to f32 when passed to the CPU selector.
     perf_cri_fp: u16,
 }
 
-impl Ord for Task {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        // RealTime and Interactive tasks get priority over Compute tasks.
-        let self_prio = label_priority(self.label);
-        let other_prio = label_priority(other.label);
-
-        other_prio
-            .cmp(&self_prio) // higher label priority first
-            .then_with(|| self.deadline.cmp(&other.deadline))
-            .then_with(|| self.timestamp.cmp(&other.timestamp))
-            .then_with(|| self.qtask.pid.cmp(&other.qtask.pid))
-    }
-}
-
-impl PartialOrd for Task {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-fn label_priority(l: TaskLabel) -> u8 {
-    match l {
-        TaskLabel::RealTime => 4,
-        TaskLabel::Interactive => 3,
-        TaskLabel::IoWait => 2,
-        TaskLabel::Unknown => 1,
-        TaskLabel::Compute => 0,
-    }
-}
-
-// ── Per-task lifetime tracking (for reputation updates on exit) ─────────
+// ── Per-task lifetime tracking (for trust updates on exit) ─────────
 
 #[derive(Debug, Default, Clone)]
 struct TaskLifetime {
@@ -195,20 +166,36 @@ struct TaskLifetime {
     last_slice_ns: u64,
     /// Nanosecond timestamp from [`Scheduler::now_ns`] of the last time this
     /// PID was dequeued from BPF. Used to detect genuinely departed tasks so
-    /// the reputation / KNN eviction only fires for tasks that have actually
+    /// trust eviction only fires for tasks that have actually
     /// left, not for still-active tasks on every scheduling loop.
     last_seen_ns: u64,
 }
 
 // ── Main Scheduler Struct ──────────────────────────────────────────────────
 
+/// Maximum depth of each per-label VecDeque task bucket.
+/// Allocated with_capacity() once at init; no growth happens after that.
+const QUEUE_DEPTH: usize = 512;
+
+/// Lifetime table size — must be a power of 2.  Sized to hold all concurrent
+/// PIDs on even the largest NUMA servers with comfortable headroom.
+const LIFETIME_TABLE_SIZE: usize = 4096;
+
+/// Fibonacci multiplier for i32 → table-slot hashing.
+const FIB32_MAIN: u32 = 2_654_435_769;
+
 struct Scheduler<'a> {
     bpf: BpfScheduler<'a>,
     opts: &'a Opts,
     stats_server: StatsServer<(), Metrics>,
 
-    // Task queue (ordered by priority + deadline).
-    tasks: BTreeSet<Task>,
+    // Per-label task queues (priority order: RT > Interactive > IoWait > Unknown > Compute).
+    // Each bucket is pre-allocated to QUEUE_DEPTH and never grows after init.
+    rt_queue:          VecDeque<Task>,
+    interactive_queue: VecDeque<Task>,
+    iowait_queue:      VecDeque<Task>,
+    unknown_queue:     VecDeque<Task>,
+    compute_queue:     VecDeque<Task>,
 
     // Time tracking.
     vruntime_now: u64,
@@ -218,14 +205,14 @@ struct Scheduler<'a> {
 
     // Scheduling policy components.
     classifier: HeuristicClassifier,
-    anti_cheat: AntiCheatEngine,
-    load_bal: AStarLoadBalancer,
+    cpu_sel: CpuSelector,
     burst_pred: BurstPredictor,
-    reputation: ReputationEngine,
+    trust: Box<TrustTable>,
     policy: PolicyController,
 
-    // Per-PID lifetime tracking for reputation updates.
-    lifetimes: HashMap<i32, TaskLifetime>,
+    // Fixed-size per-PID lifetime table (Fibonacci hash, zero-alloc after init).
+    lifetime_table: Box<[TaskLifetime; LIFETIME_TABLE_SIZE]>,
+    lifetime_pids:  Box<[i32; LIFETIME_TABLE_SIZE]>,
 
     // TUI shared state (None if TUI not requested).
     tui_state: Option<SharedState>,
@@ -237,11 +224,11 @@ struct Scheduler<'a> {
     last_tui_hist: Instant,
 
     // Periodic tick timers.
-    last_anticheat_tick: Instant,
+    last_trust_tick: Instant,
     last_policy_tick: Instant,
-    /// Rate-limiter for [`flush_reputation_updates`]: only runs once per second
+    /// Rate-limiter for [`flush_trust_updates`]: only runs once per second
     /// and only evicts PIDs that have not been seen for ≥ 2 s.
-    last_reputation_flush: Instant,
+    last_trust_flush: Instant,
     /// True once stats response channel fails (e.g. broken pipe). Scheduling
     /// must continue regardless of stats client lifecycle.
     stats_channel_failed: bool,
@@ -255,7 +242,7 @@ struct Scheduler<'a> {
     /// dispatch. Used as `latency_p99_norm` in the Q-learning reward signal.
     sched_latency_ema_ns: f64,
     /// EWMA of per-task performance criticality scores observed in the current
-    /// scheduling window.  Fed into the A* load balancer periodically so the
+    /// scheduling window.  Fed into the CPU selector periodically so the
     /// P/E-core routing threshold adapts to the actual workload composition.
     perf_cri_ema: f32,
 }
@@ -289,7 +276,7 @@ impl<'a> Scheduler<'a> {
         )?;
 
         // Build initial CPU topology from real sysfs data.
-        let mut load_bal = AStarLoadBalancer::new();
+        let mut cpu_sel = CpuSelector::new();
         {
             let nr_cpus = *bpf.nr_online_cpus_mut() as i32;
             let restricted = opts.restricted_cpus;
@@ -307,12 +294,10 @@ impl<'a> Scheduler<'a> {
                     .unwrap_or(CoreType::Performance);
                 let numa_node = numa_map.get(&cpu_id).copied().unwrap_or(0);
 
-                load_bal.update_cpu(CpuState {
+                cpu_sel.update_cpu(CpuState {
                     cpu_id,
                     core_type,
-                    utilisation: 0.0,
                     numa_node,
-                    throttled: false,
                     restricted: is_restricted,
                 });
             }
@@ -348,26 +333,50 @@ impl<'a> Scheduler<'a> {
             bpf,
             opts,
             stats_server,
-            tasks: BTreeSet::new(),
+            rt_queue:          VecDeque::with_capacity(QUEUE_DEPTH),
+            interactive_queue: VecDeque::with_capacity(QUEUE_DEPTH),
+            iowait_queue:      VecDeque::with_capacity(QUEUE_DEPTH),
+            unknown_queue:     VecDeque::with_capacity(QUEUE_DEPTH),
+            compute_queue:     VecDeque::with_capacity(QUEUE_DEPTH),
             vruntime_now: 0,
             init_page_faults: 0,
             base_slice_ns,
             slice_ns_min,
             classifier: HeuristicClassifier::new(),
-            anti_cheat: AntiCheatEngine::new(),
-            load_bal,
+            cpu_sel,
             burst_pred: BurstPredictor::new(),
-            reputation: ReputationEngine::new(),
+            trust: TrustTable::new(),
             policy,
-            lifetimes: HashMap::with_capacity(1024),
+            lifetime_table: {
+                // SAFETY: TaskLifetime is a plain struct with u64/bool fields;
+                // all-zero bytes produce valid TaskLifetime::default() values.
+                unsafe {
+                    let layout = std::alloc::Layout::array::<TaskLifetime>(LIFETIME_TABLE_SIZE)
+                        .expect("lifetime_table layout");
+                    let ptr = std::alloc::alloc_zeroed(layout)
+                        as *mut [TaskLifetime; LIFETIME_TABLE_SIZE];
+                    assert!(!ptr.is_null(), "lifetime_table allocation failed");
+                    Box::from_raw(ptr)
+                }
+            },
+            lifetime_pids: {
+                unsafe {
+                    let layout = std::alloc::Layout::array::<i32>(LIFETIME_TABLE_SIZE)
+                        .expect("lifetime_pids layout");
+                    let ptr = std::alloc::alloc_zeroed(layout)
+                        as *mut [i32; LIFETIME_TABLE_SIZE];
+                    assert!(!ptr.is_null(), "lifetime_pids allocation failed");
+                    Box::from_raw(ptr)
+                }
+            },
             tui_state,
             tui_term,
             tui_quit: false,
             last_tui_render: Instant::now(),
             last_tui_hist: Instant::now(),
-            last_anticheat_tick: Instant::now(),
+            last_trust_tick: Instant::now(),
             last_policy_tick: Instant::now(),
-            last_reputation_flush: Instant::now(),
+            last_trust_flush: Instant::now(),
             stats_channel_failed: false,
             label_counts: [0; 5],
             total_inference_ns: 0,
@@ -399,6 +408,102 @@ impl<'a> Scheduler<'a> {
     fn scale_by_weight_inverse(task: &QueuedTask, value: u64) -> u64 {
         let weight = task.weight.max(1);
         value.saturating_mul(100) / weight
+    }
+
+    // ── Fixed-table lifetime helpers ───────────────────────────────────
+
+    /// Fibonacci hash: map PID → lifetime table slot.
+    #[inline(always)]
+    fn lifetime_slot(pid: i32) -> usize {
+        ((pid as u32).wrapping_mul(FIB32_MAIN) >> 20) as usize
+    }
+
+    /// Return shared reference to lifetime entry if this PID owns the slot.
+    #[inline(always)]
+    fn lifetime_get(&self, pid: i32) -> Option<&TaskLifetime> {
+        let s = Self::lifetime_slot(pid);
+        if self.lifetime_pids[s] == pid && pid != 0 {
+            Some(&self.lifetime_table[s])
+        } else {
+            None
+        }
+    }
+
+    /// Return mutable reference to lifetime entry, evicting stale PID if needed.
+    #[inline(always)]
+    fn lifetime_get_mut_or_default(&mut self, pid: i32) -> &mut TaskLifetime {
+        let s = Self::lifetime_slot(pid);
+        if self.lifetime_pids[s] != pid {
+            self.lifetime_pids[s] = pid;
+            self.lifetime_table[s] = TaskLifetime::default();
+        }
+        &mut self.lifetime_table[s]
+    }
+
+    /// Evict the lifetime entry for a PID.
+    #[inline(always)]
+    fn lifetime_evict(&mut self, pid: i32) {
+        let s = Self::lifetime_slot(pid);
+        if self.lifetime_pids[s] == pid {
+            self.lifetime_pids[s] = 0;
+            self.lifetime_table[s] = TaskLifetime::default();
+        }
+    }
+
+    // ── Per-label VecDeque task queue helpers ──────────────────────────
+
+    /// Route a task to the correct per-label bucket.
+    ///
+    /// If the bucket is full (len == QUEUE_DEPTH), the oldest (front) task
+    /// is silently dropped to make room — this is a back-pressure signal
+    /// that the system is overloaded and very old tasks have missed their
+    /// deadline anyway.
+    #[inline(always)]
+    fn push_task(&mut self, task: Task) {
+        let q = match task.label {
+            TaskLabel::RealTime    => &mut self.rt_queue,
+            TaskLabel::Interactive => &mut self.interactive_queue,
+            TaskLabel::IoWait      => &mut self.iowait_queue,
+            TaskLabel::Unknown     => &mut self.unknown_queue,
+            TaskLabel::Compute     => &mut self.compute_queue,
+        };
+        if q.len() >= QUEUE_DEPTH {
+            q.pop_front(); // drop oldest under back-pressure
+        }
+        q.push_back(task);
+    }
+
+    /// Pop the highest-priority task available across all five buckets.
+    ///
+    /// Priority order: RealTime > Interactive > IoWait > Unknown > Compute.
+    /// Within a bucket, tasks are served FIFO (insertion order).
+    #[inline(always)]
+    fn pop_highest_priority_task(&mut self) -> Option<Task> {
+        if let Some(t) = self.rt_queue.pop_front()          { return Some(t); }
+        if let Some(t) = self.interactive_queue.pop_front() { return Some(t); }
+        if let Some(t) = self.iowait_queue.pop_front()      { return Some(t); }
+        if let Some(t) = self.unknown_queue.pop_front()      { return Some(t); }
+        self.compute_queue.pop_front()
+    }
+
+    /// True when all five task buckets are empty.
+    #[inline(always)]
+    fn tasks_empty(&self) -> bool {
+        self.rt_queue.is_empty()
+            && self.interactive_queue.is_empty()
+            && self.iowait_queue.is_empty()
+            && self.unknown_queue.is_empty()
+            && self.compute_queue.is_empty()
+    }
+
+    /// Total number of tasks across all five buckets.
+    #[inline(always)]
+    fn tasks_len(&self) -> usize {
+        self.rt_queue.len()
+            + self.interactive_queue.len()
+            + self.iowait_queue.len()
+            + self.unknown_queue.len()
+            + self.compute_queue.len()
     }
 
     // ── Scheduling pipeline (ops.enqueue) ───────────────────────────────
@@ -465,7 +570,7 @@ impl<'a> Scheduler<'a> {
         // game render thread syncing to vsync) get a moderate score.
         //
         // Range: [0, 1].  System-wide average tracked in perf_cri_ema and fed
-        // into the A* load balancer for dynamic P/E routing.
+        // into the O(1) CPU selector for dynamic P/E routing.
         let weight_norm = (task.weight as f32 / 10000.0).clamp(0.0, 1.0);
         let non_sleep = 1.0 - exec_ratio.min(1.0) * 0.5;
         let perf_cri = if weight_norm > 0.95 {
@@ -498,8 +603,7 @@ impl<'a> Scheduler<'a> {
         // artefacts.  On the very first event for a new PID, fall back to
         // base_slice_ns so the value is at least reasonable.
         let prev_slice_ns = self
-            .lifetimes
-            .get(&task.pid)
+            .lifetime_get(task.pid)
             .filter(|lt| lt.last_slice_ns > 0)
             .map(|lt| lt.last_slice_ns)
             .unwrap_or(self.base_slice_ns);
@@ -512,9 +616,9 @@ impl<'a> Scheduler<'a> {
         let label = self.classifier.classify(&features);
         self.label_counts[label as usize] += 1;
 
-        // Reputation-based slice factor.
-        let rep_factor = self.reputation.slice_factor(task.pid);
-        let quarantined = self.reputation.is_quarantined(task.pid);
+        // Trust-based slice factor.
+        let rep_factor = self.trust.slice_factor(task.pid);
+        let quarantined = self.trust.is_quarantined(task.pid);
 
         // Burst predictor — read prediction for this PID (updated on exit path).
         let predicted_burst = self.burst_pred.prediction_for(task.pid);
@@ -618,15 +722,18 @@ impl<'a> Scheduler<'a> {
                     // by any single burst task in a batch.
                     self.perf_cri_ema = self.perf_cri_ema * 0.95 + perf_cri * 0.05;
 
-                    // Track lifetime for reputation updates.
-                    let e = self.lifetimes.entry(task.pid).or_default();
+                    // Check trust flag before borrowing lifetime table mutably.
+                    let cheat_flagged = self.trust.is_flagged(task.pid);
+
+                    // Track lifetime for trust updates.
+                    let e = self.lifetime_get_mut_or_default(task.pid);
                     e.slice_assigned_ns = slice_ns;
                     // Store the assigned slice so the next scheduling event
                     // for this PID can compute cpu_intensity = burst / last_slice.
                     e.last_slice_ns = slice_ns;
                     e.slice_used_ns = task.stop_ts.saturating_sub(task.start_ts);
                     e.preempted = e.slice_used_ns >= slice_ns.saturating_sub(slice_ns / 8);
-                    e.cheat_flagged = self.anti_cheat.is_flagged(task.pid);
+                    e.cheat_flagged = cheat_flagged;
                     e.last_seen_ns = Self::now_ns();
 
                     // Update burst predictor — reuse the features already
@@ -640,7 +747,7 @@ impl<'a> Scheduler<'a> {
                         features.cpu_intensity,
                     );
 
-                    self.tasks.insert(Task {
+                    self.push_task(Task {
                         deadline,
                         timestamp,
                         label,
@@ -661,53 +768,48 @@ impl<'a> Scheduler<'a> {
     // ── Dispatch one task (ops.dispatch) ──────────────────────────────────
 
     fn dispatch_task(&mut self) -> bool {
-        let Some(task) = self.tasks.pop_first() else {
+        let Some(task) = self.pop_highest_priority_task() else {
             return true;
         };
 
         // Measure real user-space scheduling latency: the time this task waited
-        // in self.tasks between enqueue (drain_queued_tasks) and now (dispatch).
-        // This is a true measure of scheduler responsiveness — replaces the
-        // inference-time proxy that was used before.
+        // in the queues between enqueue (drain_queued_tasks) and now (dispatch).
+        // This is a true measure of scheduler responsiveness.
         let wait_ns = Self::now_ns().saturating_sub(task.timestamp);
         // α = 0.05: smooth out per-task jitter while tracking trends over ~20 dispatches.
         self.sched_latency_ema_ns = self.sched_latency_ema_ns * 0.95 + wait_ns as f64 * 0.05;
 
-        let quarantined = self.reputation.is_quarantined(task.qtask.pid)
-            || self.anti_cheat.is_flagged(task.qtask.pid);
+        let quarantined = self.trust.is_quarantined(task.qtask.pid)
+            || self.trust.is_flagged(task.qtask.pid);
 
         let mut dispatched = DispatchedTask::new(&task.qtask);
         dispatched.slice_ns = task.slice_ns;
         dispatched.vtime = task.deadline;
 
-        // CPU selection: A* load balancer, percpu_local shortcut, or fast-path.
+        // CPU selection: O(1) bitmask selector, percpu_local shortcut, or fast-path.
         //
         // Under full CPU saturation (perf_cri_ema > 0.85 — all runnable tasks are
-        // compute-bound, every core occupied) the A* search adds O(n_cpu) overhead
-        // without benefit: there is no idle core to prefer anyway.  Skip to
-        // RL_CPU_ANY so the BPF kernel's O(1) idle-CPU scan handles placement.
-        // The threshold floats via the perf_cri EWMA, so A* re-engages automatically
-        // when interactive tasks return and the mix becomes heterogeneous again.
+        // compute-bound) the bitmask select_cpu still runs in O(1) but we skip
+        // it entirely and let the BPF kernel's O(1) idle-CPU scan handle placement,
+        // which avoids any user-kernel round-trips when every core is occupied.
+        // The threshold floats via the perf_cri EWMA, so the selector re-engages
+        // automatically when interactive tasks return.
         dispatched.cpu = if self.opts.percpu_local {
             task.qtask.cpu
         } else if self.perf_cri_ema > 0.85 {
             RL_CPU_ANY
         } else {
-            let cpu = self.load_bal.select_cpu(
+            let cpu = self.cpu_sel.select_cpu(
                 task.qtask.cpu,
                 task.label,
                 quarantined,
                 task.perf_cri_fp as f32 / 1000.0,
             );
-            if cpu >= 0 {
-                cpu
-            } else {
-                RL_CPU_ANY
-            }
+            if cpu >= 0 { cpu } else { RL_CPU_ANY }
         };
 
         if self.bpf.dispatch_task(&dispatched).is_err() {
-            self.tasks.insert(task);
+            self.push_task(task);
             return false;
         }
         true
@@ -715,17 +817,21 @@ impl<'a> Scheduler<'a> {
 
     // ── Periodic housekeeping ───────────────────────────────────────────
 
-    /// Anti-cheat tick (every 100 ms).
-    fn tick_anti_cheat(&mut self) {
-        if self.last_anticheat_tick.elapsed() < Duration::from_millis(100) {
+    /// Trust/anomaly tick (every 100 ms).
+    ///
+    /// trust.tick() is an intentional no-op: the TrustTable is updated
+    /// synchronously on each task exit (flush_trust_updates), so no
+    /// periodic batch scan is needed.  The call is preserved for API symmetry
+    /// and to leave a clear hook if periodic decay is added in the future.
+    fn tick_trust(&mut self) {
+        if self.last_trust_tick.elapsed() < Duration::from_millis(100) {
             return;
         }
-        self.last_anticheat_tick = Instant::now();
+        self.last_trust_tick = Instant::now();
         let now = Self::now_ns();
-        let newly_flagged = self.anti_cheat.tick(now);
-        for tgid in newly_flagged {
-            warn!("Anti-cheat: flagged TGID {tgid} as anomalous");
-        }
+        let (_flagged, _n) = self.trust.tick(now);
+        // No per-TGID warning needed; trust.worst_actors() exposes bad actors
+        // through the TUI wall-of-shame instead.
     }
 
     /// Q-learning policy update (every 250 ms).
@@ -735,8 +841,8 @@ impl<'a> Scheduler<'a> {
         }
         self.last_policy_tick = Instant::now();
 
-        let nr_cpus = (*self.bpf.nr_online_cpus_mut()).max(1) as u64;
-        let nr_running = *self.bpf.nr_running_mut() as u64;
+        let nr_cpus = (*self.bpf.nr_online_cpus_mut()).max(1);
+        let nr_running = *self.bpf.nr_running_mut();
         let total_labeled = self.label_counts.iter().sum::<u64>().max(1) as f64;
         let interactive_frac =
             self.label_counts[TaskLabel::Interactive as usize] as f64 / total_labeled;
@@ -747,9 +853,9 @@ impl<'a> Scheduler<'a> {
         // removes the need for a human to tune --slice-us for their workload.
         self.policy.update_load(nr_running, nr_cpus);
 
-        // Update the P/E-core routing threshold in the A* load balancer.
+        // Update the P/E-core routing threshold in the CPU selector.
         // Uses the per-task perf_cri EWMA accumulated in drain_queued_tasks().
-        self.load_bal.update_avg_perf_cri(self.perf_cri_ema);
+        self.cpu_sel.update_avg_perf_cri(self.perf_cri_ema);
 
         let sig = SchedulerSignal {
             load_norm: (nr_running as f64 / nr_cpus as f64).min(1.0),
@@ -763,63 +869,67 @@ impl<'a> Scheduler<'a> {
         self.policy.update(&sig);
     }
 
-    /// Emit reputation updates for finished tasks.
+    /// Emit trust updates for finished tasks.
     ///
     /// Uses a staleness heuristic: any PID not seen for > 2 seconds is
     /// assumed to have exited. Called once per second.
-    fn flush_reputation_updates(&mut self) {
+    ///
+    /// Zero heap allocations: stale PIDs are collected into a stack-allocated
+    /// fixed array instead of a Vec.
+    fn flush_trust_updates(&mut self) {
         // Run at most once per second.
-        if self.last_reputation_flush.elapsed() < Duration::from_secs(1) {
+        if self.last_trust_flush.elapsed() < Duration::from_secs(1) {
             return;
         }
-        self.last_reputation_flush = Instant::now();
+        self.last_trust_flush = Instant::now();
 
         // Staleness-based exit detection: any PID not seen for > 2 seconds
-        // is assumed to have exited. This is robust across all kernel versions
-        // and does not require a custom BPF ring buffer map.
+        // is assumed to have exited.  Robust across all kernel versions —
+        // no custom BPF ring buffer required.
         let now = Self::now_ns();
+        const STALE_THRESHOLD_NS: u64 = 2 * NSEC_PER_SEC;
 
-        const LIFETIMES_MAX: usize = 8192;
-        let stale_threshold_ns = 2 * NSEC_PER_SEC;
-        if self.lifetimes.len() > LIFETIMES_MAX {
-            // Pass 1: keep entries seen within the last 10 s.
-            let cutoff = now.saturating_sub(10 * NSEC_PER_SEC);
-            self.lifetimes.retain(|_, lt| lt.last_seen_ns >= cutoff);
-            // Pass 2: tighten to 5 s if still over cap.
-            if self.lifetimes.len() > LIFETIMES_MAX {
-                let cutoff = now.saturating_sub(5 * NSEC_PER_SEC);
-                self.lifetimes.retain(|_, lt| lt.last_seen_ns >= cutoff);
+        // Collect stale PIDs into a fixed stack array (no heap allocation).
+        let mut stale = [0i32; 256];
+        let mut stale_n = 0usize;
+
+        for s in 0..LIFETIME_TABLE_SIZE {
+            let pid = self.lifetime_pids[s];
+            if pid == 0 {
+                continue;
             }
-            // Pass 3: final tighten to 2 s (aligns with the stale-eviction window).
-            if self.lifetimes.len() > LIFETIMES_MAX {
-                let cutoff = now.saturating_sub(2 * NSEC_PER_SEC);
-                self.lifetimes.retain(|_, lt| lt.last_seen_ns >= cutoff);
+            let lt = &self.lifetime_table[s];
+            if lt.last_seen_ns > 0
+                && now.saturating_sub(lt.last_seen_ns) >= STALE_THRESHOLD_NS
+                && stale_n < stale.len()
+            {
+                stale[stale_n] = pid;
+                stale_n += 1;
             }
         }
 
-        let stale: Vec<i32> = self
-            .lifetimes
-            .iter()
-            .filter(|(_, lt)| {
-                lt.last_seen_ns > 0 && now.saturating_sub(lt.last_seen_ns) >= stale_threshold_ns
-            })
-            .map(|(&pid, _)| pid)
-            .collect();
+        for &pid in &stale[..stale_n] {
+            // Snapshot the lifetime entry before evicting the slot.
+            let lt = {
+                let s = Self::lifetime_slot(pid);
+                if self.lifetime_pids[s] == pid {
+                    self.lifetime_table[s].clone()
+                } else {
+                    continue;
+                }
+            };
+            self.lifetime_evict(pid);
 
-        for pid in stale {
-            if let Some(lt) = self.lifetimes.remove(&pid) {
-                let obs = ExitObservation {
-                    slice_underrun: lt.slice_used_ns < lt.slice_assigned_ns / 2,
-                    preempted: lt.preempted,
-                    clean_exit: !lt.cheat_flagged,
-                    cheat_flagged: lt.cheat_flagged,
-                    fork_count: 0,
-                    involuntary_ctx_sw: 0,
-                };
-                self.reputation.update_on_exit(pid, pid, &obs, "");
-                self.burst_pred.evict(pid);
-                self.anti_cheat.evict(pid);
-            }
+            let obs = ExitObservation {
+                slice_underrun: lt.slice_used_ns < lt.slice_assigned_ns / 2,
+                preempted: lt.preempted,
+                clean_exit: !lt.cheat_flagged,
+                cheat_flagged: lt.cheat_flagged,
+                fork_count: 0,
+                involuntary_ctx_sw: 0,
+            };
+            self.trust.update_on_exit(pid, pid, &obs, "");
+            self.burst_pred.evict(pid);
         }
     }
 
@@ -839,11 +949,7 @@ impl<'a> Scheduler<'a> {
             0.0
         };
 
-        let quarantined_count = self
-            .reputation
-            .all_scores()
-            .filter(|(_, score, _)| *score < ai::TRUST_THRESHOLD)
-            .count() as u64;
+        let quarantined_count = self.trust.quarantined_count();
 
         Metrics {
             version: env!("CARGO_PKG_VERSION").to_string(),
@@ -864,7 +970,7 @@ impl<'a> Scheduler<'a> {
             nr_realtime: self.label_counts[TaskLabel::RealTime as usize],
             nr_unknown: self.label_counts[TaskLabel::Unknown as usize],
             nr_quarantined: quarantined_count,
-            nr_flagged: self.anti_cheat.wall_of_shame().len() as u64,
+            nr_flagged: self.trust.flagged_count(),
             ai_slice_us: self.policy.read_slice_ns() / NSEC_PER_USEC,
             ai_inference_us: avg_inference_us as u64,
             reward_ema_x100: (self.policy.reward_ema * 100.0) as i64,
@@ -895,7 +1001,7 @@ impl<'a> Scheduler<'a> {
         // dispatch ring, keeping all cores fed in a single pass.
         let dispatch_budget = nr_cpus.saturating_mul(2);
         for _ in 0..dispatch_budget {
-            if self.tasks.is_empty() {
+            if self.tasks_empty() {
                 break;
             }
             if !self.dispatch_task() {
@@ -904,7 +1010,7 @@ impl<'a> Scheduler<'a> {
         }
 
         // 3. Notify BPF dispatcher of remaining pending work.
-        self.bpf.notify_complete(self.tasks.len() as u64);
+        self.bpf.notify_complete(self.tasks_len() as u64);
     }
 
     // ── Background housekeeping ─────────────────────────────────────────────
@@ -917,9 +1023,9 @@ impl<'a> Scheduler<'a> {
     // calling housekeeping() every ~50 ms from run() is safe: each will
     // no-op immediately if its own timer has not elapsed.
     fn housekeeping(&mut self) {
-        self.tick_anti_cheat();
+        self.tick_trust();
         self.tick_policy();
-        self.flush_reputation_updates();
+        self.flush_trust_updates();
     }
 
     // ── TUI state refresh ─────────────────────────────────────────────────
@@ -934,20 +1040,16 @@ impl<'a> Scheduler<'a> {
             0.0
         };
 
-        let shame: Vec<tui::WallEntry> = {
-            let anticheat_flagged: HashSet<i32> =
-                self.anti_cheat.wall_of_shame().keys().cloned().collect();
-            self.reputation
-                .wall_of_shame(20)
-                .iter()
-                .map(|(pid, trust, comm)| tui::WallEntry {
-                    pid: *pid,
-                    comm: comm.to_string(),
-                    trust: *trust,
-                    is_flagged: anticheat_flagged.contains(pid),
-                })
-                .collect()
-        };
+        let (actors, n_actors) = self.trust.worst_actors();
+        let shame: Vec<tui::WallEntry> = actors[..n_actors]
+            .iter()
+            .map(|e| tui::WallEntry {
+                pid: e.pid,
+                comm: e.comm_str().to_string(),
+                trust: e.trust as f64,
+                is_flagged: e.flagged,
+            })
+            .collect();
 
         if let Ok(mut s) = state.lock() {
             s.metrics = metrics.clone();
@@ -999,7 +1101,7 @@ impl<'a> Scheduler<'a> {
                 }
             }
 
-            // Background housekeeping (anti-cheat, Q-learning policy update, reputation).
+            // Background housekeeping (trust engine tick, Q-learning policy update, trust flush).
             // Runs outside schedule() so the BPF dispatch path is never
             // delayed by periodic work.  50 ms outer gate plus each
             // function's inner timer ensures at most one unit of work

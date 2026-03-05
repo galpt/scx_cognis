@@ -8,10 +8,12 @@
 //   2. System overview (running/queued tasks, CPUs, dispatch/congestion stats).
 //   3. Task classification breakdown (interactive/compute/io/rt gauges).
 //   4. AI policy state (Q-learning reward EMA, slice, inference latency).
-//   5. Latency chart (rolling 120-sample inference latency line chart).
-//   6. Reputation "Wall of Shame" — flagged/quarantined processes.
+//   5. Scheduling latency chart (rolling 120-sample line chart).
+//   6. Trust "Wall of Shame" — flagged/quarantined processes.
+//
+// All history buffers use HistoryRing — a fixed-size circular array that
+// never reallocates after init (zero-alloc after DashboardState creation).
 
-use std::collections::VecDeque;
 use std::io;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -33,6 +35,51 @@ use ratatui::{
 
 use crate::stats::Metrics;
 
+// ── HistoryRing ────────────────────────────────────────────────────────────
+
+/// Fixed-size circular ring buffer for f64 time-series data.
+///
+/// Replaces `VecDeque<f64>` in DashboardState: the ring is allocated once
+/// at `DashboardState::default()` and never re-allocates thereafter.
+#[derive(Debug, Clone)]
+pub struct HistoryRing {
+    buf: [f64; HISTORY_LEN],
+    head: usize,
+    len: usize,
+}
+
+impl HistoryRing {
+    pub const fn new() -> Self {
+        Self { buf: [0.0; HISTORY_LEN], head: 0, len: 0 }
+    }
+
+    /// Append a value, overwriting the oldest when full.
+    pub fn push(&mut self, v: f64) {
+        self.buf[self.head] = v;
+        self.head = (self.head + 1) % HISTORY_LEN;
+        if self.len < HISTORY_LEN {
+            self.len += 1;
+        }
+    }
+
+    /// Iterate values in chronological order (oldest first).
+    pub fn iter_ordered(&self) -> impl Iterator<Item = f64> + '_ {
+        let start = if self.len < HISTORY_LEN { 0 } else { self.head };
+        (0..self.len).map(move |i| self.buf[(start + i) % HISTORY_LEN])
+    }
+
+    /// Maximum value in the ring, defaulting to `default` if empty.
+    pub fn max_or(&self, default: f64) -> f64 {
+        self.iter_ordered().fold(default, f64::max)
+    }
+}
+
+impl Default for HistoryRing {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ── Dashboard State ────────────────────────────────────────────────────────
 
 const HISTORY_LEN: usize = 120; // ~2 minutes at 1 Hz
@@ -46,42 +93,47 @@ pub struct WallEntry {
 }
 
 /// All mutable state the dashboard needs to render.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct DashboardState {
     pub metrics: Metrics,
     pub inference_us: f64, // Most recent inference latency (µs)
-    pub inference_hist: VecDeque<f64>,
-    pub reward_hist: VecDeque<f64>,
-    pub throughput_hist: VecDeque<f64>,
+    pub inference_hist: HistoryRing,
+    pub reward_hist: HistoryRing,
+    pub throughput_hist: HistoryRing,
     pub wall_of_shame: Vec<WallEntry>,
-    pub ai_slice_hist: VecDeque<u64>,
+    /// AI slice history stored as u64 microseconds in a fixed ring buffer.
+    pub ai_slice_hist: [u64; HISTORY_LEN],
+    pub ai_slice_head: usize,
+    pub ai_slice_len: usize,
+}
+
+impl Default for DashboardState {
+    fn default() -> Self {
+        Self {
+            metrics: Metrics::default(),
+            inference_us: 0.0,
+            inference_hist: HistoryRing::new(),
+            reward_hist: HistoryRing::new(),
+            throughput_hist: HistoryRing::new(),
+            wall_of_shame: Vec::new(),
+            ai_slice_hist: [0u64; HISTORY_LEN],
+            ai_slice_head: 0,
+            ai_slice_len: 0,
+        }
+    }
 }
 
 impl DashboardState {
     pub fn push_history(&mut self) {
-        push_bounded(&mut self.inference_hist, self.inference_us, HISTORY_LEN);
-        push_bounded(
-            &mut self.reward_hist,
-            self.metrics.reward_ema_x100 as f64 / 100.0,
-            HISTORY_LEN,
-        );
-        push_bounded(
-            &mut self.throughput_hist,
-            self.metrics.nr_user_dispatches as f64,
-            HISTORY_LEN,
-        );
-        push_bounded(
-            &mut self.ai_slice_hist,
-            self.metrics.ai_slice_us,
-            HISTORY_LEN,
-        );
-    }
-}
-
-fn push_bounded<T>(q: &mut VecDeque<T>, v: T, max: usize) {
-    q.push_back(v);
-    while q.len() > max {
-        q.pop_front();
+        self.inference_hist.push(self.inference_us);
+        self.reward_hist.push(self.metrics.reward_ema_x100 as f64 / 100.0);
+        self.throughput_hist.push(self.metrics.nr_user_dispatches as f64);
+        // Push AI slice into the fixed u64 ring.
+        self.ai_slice_hist[self.ai_slice_head] = self.metrics.ai_slice_us;
+        self.ai_slice_head = (self.ai_slice_head + 1) % HISTORY_LEN;
+        if self.ai_slice_len < HISTORY_LEN {
+            self.ai_slice_len += 1;
+        }
     }
 }
 
@@ -222,7 +274,7 @@ fn draw_classification(f: &mut Frame, area: Rect, m: &Metrics) {
         gauge_line("I/O Wait   ", m.nr_iowait, total, Color::Blue),
         gauge_line("RealTime   ", m.nr_realtime, total, Color::Magenta),
         Line::from(format!(
-            "  Quarantined PIDs:   {}   │  Flagged TGIDs:  {}",
+            "  Quarantined PIDs:   {}   │  Flagged PIDs:  {}",
             m.nr_quarantined, m.nr_flagged
         )),
     ];
@@ -293,16 +345,12 @@ fn draw_ai_policy(f: &mut Frame, area: Rect, state: &DashboardState) {
 fn draw_latency_chart(f: &mut Frame, area: Rect, state: &DashboardState) {
     let data: Vec<(f64, f64)> = state
         .inference_hist
-        .iter()
+        .iter_ordered()
         .enumerate()
-        .map(|(i, &v)| (i as f64, v))
+        .map(|(i, v)| (i as f64, v))
         .collect();
 
-    let max_y = state
-        .inference_hist
-        .iter()
-        .cloned()
-        .fold(10.0_f64, f64::max);
+    let max_y = state.inference_hist.max_or(10.0);
     let max_x = data.len().max(1) as f64;
 
     let datasets = vec![Dataset::default()
@@ -367,7 +415,7 @@ fn draw_wall_of_shame(f: &mut Frame, area: Rect, entries: &[WallEntry]) {
     }
 
     let list = List::new(items).block(Block::default().borders(Borders::ALL).title(Span::styled(
-        " Reputation Wall of Shame ",
+        " Trust Wall of Shame ",
         Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
     )));
     f.render_widget(list, area);
@@ -480,7 +528,9 @@ impl Clone for DashboardState {
             reward_hist: self.reward_hist.clone(),
             throughput_hist: self.throughput_hist.clone(),
             wall_of_shame: self.wall_of_shame.clone(),
-            ai_slice_hist: self.ai_slice_hist.clone(),
+            ai_slice_hist: self.ai_slice_hist,
+            ai_slice_head: self.ai_slice_head,
+            ai_slice_len: self.ai_slice_len,
         }
     }
 }
