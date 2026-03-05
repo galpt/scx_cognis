@@ -189,13 +189,14 @@ Labels influence the base time-slice multiplier and feed into the Trust Engine a
 
 #### O(1) CPU Selector
 
-Selects the optimal CPU for each task using a 64-bit bitmask in O(1) time (a single TZCNT instruction). Three candidate sets are maintained:
+Selects the optimal CPU for each task using a 64-bit bitmask in O(1) time (a single TZCNT instruction). Four candidate sets are maintained:
 
-| Mask | Purpose |
-|:---|:---|
-| `p_mask` | P-core (Performance) CPUs |
-| `restricted_mask` | CPUs reserved for quarantined tasks |
-| `all_mask` | All reachable CPUs |
+| Mask | Lifetime | Purpose |
+|:---|:---|:---|
+| `p_mask` | static (set once at init) | P-core (Performance) CPUs |
+| `restricted_mask` | static (set once at init) | CPUs reserved for quarantined tasks |
+| `all_mask` | static (set once at init) | All online CPUs |
+| `idle_mask` | **dynamic** (reset each dispatch window) | CPUs not yet dispatched to this scheduling cycle |
 
 CPU type is read from sysfs at scheduler startup:
 
@@ -206,13 +207,18 @@ CPU type is read from sysfs at scheduler startup:
 
 On non-hybrid CPUs (AMD, homogeneous Intel, VMs) the sysfs entries are absent and all CPUs are treated as Performance-class.
 
+`idle_mask` is reset to `all_mask` at the start of every `schedule()` call and cleared bit-by-bit as tasks are dispatched to specific CPUs, producing effective round-robin load distribution within each scheduling window.
+
 Routing logic (evaluated in order):
 
-1. **Quarantine** — flagged task → `restricted_mask` only.
-2. **RealTime** — always routed to `p_mask` (guaranteed P-core for minimum latency).
-3. **perf_cri ≥ avg_perf_cri** → `p_mask`. The `avg_perf_cri` threshold is a system-wide EWMA (α = 0.15, updated each tick). It floats with the live workload mix — a render-heavy workload raises the threshold, reserving P-cores for the most critical threads.
-4. **perf_cri < avg_perf_cri** → E-cores (`all_mask & ~p_mask`), falling back to `all_mask` on homogeneous systems.
-5. **No winner** → `RL_CPU_ANY` (kernel-side placement fallback).
+0. **Fast-path: system fully CPU-saturated** — if the system-wide `perf_cri_ema > 0.85` (EWMA of per-task criticality) the selector is bypassed and `RL_CPU_ANY` is returned immediately. At peak compute saturation the BPF kernel's built-in idle-CPU scanner is faster than a user-space round-trip.
+1. **Quarantine** — flagged task → eligible pool is `restricted_mask` only; normal tasks use `all_mask & ~restricted_mask`.
+2. **Core-type preference** — `RealTime` tasks always target `p_mask`; other tasks compare `perf_cri` against the system-wide EWMA `avg_perf_cri` (α = 0.15, updated each 250 ms tick): `perf_cri ≥ avg_perf_cri` → P-core preferred; `perf_cri < avg_perf_cri` → E-core preferred.
+3. **Idle CPU of preferred core type** (`idle_mask & type_mask & pool`) — best case: a genuinely free CPU of the right type.
+4. **Any idle CPU** (`idle_mask & pool`) — relax core-type constraint; any unoccupied CPU in the eligible pool.
+5. **`prev_cpu` if eligible** — no idle CPUs left this window; return the task's home CPU to preserve CPU affinity and cache warmth. Critical for kworkers and CPU-affine threads.
+6. **Any eligible CPU** — last resort (pool non-empty but prev_cpu ineligible).
+7. **`RL_CPU_ANY`** — only if `all_mask == 0` (topology not yet initialised) or the eligible pool is empty.
 
 [↑ Back to Table of Contents](#table-of-contents)
 
@@ -300,7 +306,7 @@ flowchart TD
     end
 
     subgraph Pipeline["Scheduling Pipeline"]
-        P1["`**dequeue** → heuristic classify → trust check → Elman RNN headroom hint`"]
+        P1["`**enqueue** → heuristic classify → trust check → Elman RNN headroom hint`"]
         P2["`**select_cpu** → O(1) bitmask CPU select`"]
         P3["`**dispatch** → Q-learning policy slice read`"]
         P4["`**tick** → trust engine tick`"]
@@ -561,7 +567,7 @@ scx_cognis --monitor 0.5
 
 > [!NOTE]
 > 1. If the scheduler was started **without** the provided service file (e.g. a manually launched instance), the socket may be root-only. In that case prefix with `sudo`.
-> 2. The version is displayed inline at the start of every output line (`[cognis v1.0.2] ...`), so you can confirm which release is running without stopping the service. Use `scx_cognis --version` for a one-shot version check when the scheduler is not running.
+> 2. The version is displayed inline at the start of every output line (`[cognis v1.1.2] ...`), so you can confirm which release is running without stopping the service. Use `scx_cognis --version` for a one-shot version check when the scheduler is not running.
 
 [↑ Back to Table of Contents](#table-of-contents)
 
@@ -574,14 +580,14 @@ Each line from `--monitor` is a snapshot of one polling interval. All counters l
 #### Full Output Format
 
 ```
-[cognis v1.0.2] tldr: Rest assured! I'm keeping your system responsive.   | r:  5/16  q:1 /0   | pf:0 | d→u:312   k:140 c:0  b:0  f:0  | cong:0 | 🧠 Interactive:18  Compute:3  IOwait:2  RT:0  Unknown:0 | quarantine:0 flagged:0 | slice:4000µs reward:0.42
+[cognis v1.1.2] tldr: Rest assured! I'm keeping your system responsive.   | r:  5/16  q:1 /0   | pf:0 | d→u:312   k:140 c:0  b:0  f:0  | cong:0 | 🧠 Interactive:18  Compute:3  IOwait:2  RT:0  Unknown:0 | quarantine:0 flagged:0 | slice:4000µs reward:0.42
 ```
 
 #### Column Reference
 
 | Column | Full Name | Type | Meaning |
 |:---|:---|:---|:---|
-| `v1.0.2` (header) | version | static | Scheduler version embedded in every monitor line, matching the GitHub release tag. Identical to the output of `scx_cognis --version`. |
+| `v1.1.2` (header) | version | static | Scheduler version embedded in every monitor line, matching the GitHub release tag. Identical to the output of `scx_cognis --version`. |
 | `tldr: ...` | human summary | computed | One-line plain-English summary of current system health. Changes every interval based on load, reward, congestion, and threat level. See the [TLDR message reference](#tldr-message-reference) below. |
 | `r: 5/16` | running / online CPUs | instant | Tasks actively executing right now out of total online CPUs. High ratios (≥ 0.8) mean the system is busy. |
 | `q:1 /0` | queued / scheduled | instant | `queued` = tasks handed by the kernel to userspace and waiting for a dispatch decision; `scheduled` = tasks that have been ordered but not yet sent back to BPF. Under normal load both stay near 0. |
