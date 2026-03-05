@@ -242,9 +242,7 @@ Continuously tunes the global base time-slice using tabular Q-learning ($`\text{
 
 The reward signal is:
 
-$$
-R = (\text{interactive_frac} \times \text{load_norm}) \times 0.7 - \text{congestion} \times 0.2 - \text{latency} \times 0.1
-$$
+$`R = (\text{interactive_frac} \times \text{load_norm}) \times 0.7 - \text{congestion} \times 0.2 - \text{latency} \times 0.1`$
 
 clamped to $`[-1.0,\ +1.0]`$, where `interactive_frac` is the fraction of currently-queued Interactive tasks and `load_norm` is CPU utilisation (0–1). This produces a meaningful gradient: the policy learns to **shrink** when Compute tasks dominate (low `interactive_frac`) and **keep/grow** only when Interactive tasks are well-served.
 
@@ -343,9 +341,7 @@ If the user-space daemon crashes or stops responding, `scx_rustland_core`'s buil
 
 The Q-learning controller optimises the global base time-slice using the following reward signal computed every 250 ms:
 
-$$
-R = (\text{interactive_frac} \times \text{load_norm}) \times 0.7 - \text{congestion} \times 0.2 - \text{latency} \times 0.1
-$$
+$`R = (\text{interactive_frac} \times \text{load_norm}) \times 0.7 - \text{congestion} \times 0.2 - \text{latency} \times 0.1`$
 
 clamped to $`[-1.0,\ +1.0]`$.
 
@@ -365,7 +361,7 @@ The Q-learning controller's maximum output is capped at `base_slice_ns` (the use
 
 For each dispatched task, the final slice is:
 
-$$
+$`
 \begin{aligned}
 \text{slice} ={}& \text{base_slice_ns} \\
   {}\times{}& f_{\pi} && \text{(Q-learning policy factor)} \\
@@ -373,7 +369,7 @@ $$
   {}\times{}& f_{r} && \text{(Bayesian trust}\ f_{r} \in [0.25,\ 1.0]\text{)} \\
   {}\times{}& \tfrac{w}{100} && \text{(scheduler priority weight)}
 \end{aligned}
-$$
+`$
 
 clamped to $`[\text{slice_ns_min},\ 8 \times \text{base_slice_ns}]`$.
 
