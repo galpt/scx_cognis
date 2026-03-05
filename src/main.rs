@@ -38,6 +38,7 @@ use std::time::{Duration, Instant, SystemTime};
 use anyhow::Result;
 use clap::Parser;
 use libbpf_rs::OpenObject;
+use libc;
 use log::{info, warn};
 use procfs::process::Process;
 
@@ -483,7 +484,10 @@ impl<'a> Scheduler<'a> {
         }
     }
 
-    fn ai_classify_and_enqueue(&mut self, task: &mut QueuedTask) -> (u64, u64, TaskLabel, f32) {
+    fn ai_classify_and_enqueue(
+        &mut self,
+        task: &mut QueuedTask,
+    ) -> (u64, u64, TaskLabel, f32, TaskFeatures) {
         let t0 = Self::now_ns();
 
         let nr_cpus = (*self.bpf.nr_online_cpus_mut()).max(1) as i32;
@@ -596,7 +600,7 @@ impl<'a> Scheduler<'a> {
         self.total_inference_ns += elapsed;
         self.inference_samples += 1;
 
-        (deadline, slice, label, features.perf_cri)
+        (deadline, slice, label, features.perf_cri, features)
     }
 
     // ── Drain queued tasks (runs scheduling pipeline per task) ──────────────
@@ -605,7 +609,7 @@ impl<'a> Scheduler<'a> {
         loop {
             match self.bpf.dequeue_task() {
                 Ok(Some(mut task)) => {
-                    let (deadline, slice_ns, label, perf_cri) =
+                    let (deadline, slice_ns, label, perf_cri, features) =
                         self.ai_classify_and_enqueue(&mut task);
                     let timestamp = Self::now_ns();
 
@@ -625,14 +629,10 @@ impl<'a> Scheduler<'a> {
                     e.cheat_flagged = self.anti_cheat.is_flagged(task.pid);
                     e.last_seen_ns = Self::now_ns();
 
-                    // Update burst predictor with observed burst.
+                    // Update burst predictor — reuse the features already
+                    // computed during classification to avoid a redundant second
+                    // compute_features() call on the hot dispatch path.
                     let burst_ns = task.stop_ts.saturating_sub(task.start_ts);
-                    let nr_cpus_exit = (*self.bpf.nr_online_cpus_mut()).max(1) as i32;
-                    // Use the newly-assigned slice_ns as prev_slice for the
-                    // burst predictor features (acceptable approximation here
-                    // since the predictor uses exec_ratio, not cpu_intensity).
-                    let features =
-                        Self::compute_features(&task, self.base_slice_ns, slice_ns, nr_cpus_exit);
                     self.burst_pred.observe_and_predict(
                         task.pid,
                         burst_ns,
@@ -680,9 +680,18 @@ impl<'a> Scheduler<'a> {
         dispatched.slice_ns = task.slice_ns;
         dispatched.vtime = task.deadline;
 
-        // CPU selection: A* or percpu_local shortcut.
+        // CPU selection: A* load balancer, percpu_local shortcut, or fast-path.
+        //
+        // Under full CPU saturation (perf_cri_ema > 0.85 — all runnable tasks are
+        // compute-bound, every core occupied) the A* search adds O(n_cpu) overhead
+        // without benefit: there is no idle core to prefer anyway.  Skip to
+        // RL_CPU_ANY so the BPF kernel's O(1) idle-CPU scan handles placement.
+        // The threshold floats via the perf_cri EWMA, so A* re-engages automatically
+        // when interactive tasks return and the mix becomes heterogeneous again.
         dispatched.cpu = if self.opts.percpu_local {
             task.qtask.cpu
+        } else if self.perf_cri_ema > 0.85 {
+            RL_CPU_ANY
         } else {
             let cpu = self.load_bal.select_cpu(
                 task.qtask.cpu,
@@ -879,7 +888,13 @@ impl<'a> Scheduler<'a> {
         // By filling the BPF dispatch list with up to nr_cpus tasks at once,
         // every runnable CPU gets a task in a single round-trip.
         let nr_cpus = (*self.bpf.nr_online_cpus_mut()).max(1) as usize;
-        for _ in 0..nr_cpus {
+        // Dispatch up to 2× nr_cpus per cycle.  When nr_cpus tasks wake
+        // simultaneously (common under burst or compute-saturated workloads),
+        // a 1× budget forces an extra schedule() round-trip for the overflow.
+        // 2× absorbs typical burst spikes without over-committing the BPF
+        // dispatch ring, keeping all cores fed in a single pass.
+        let dispatch_budget = nr_cpus.saturating_mul(2);
+        for _ in 0..dispatch_budget {
             if self.tasks.is_empty() {
                 break;
             }
@@ -942,6 +957,27 @@ impl<'a> Scheduler<'a> {
     }
 
     fn run(&mut self) -> Result<UserExitInfo> {
+        // Elevate this thread to SCHED_FIFO so the userspace scheduler can
+        // always preempt ordinary tasks when dispatch decisions are needed.
+        //
+        // Without this, 100%-CPU workloads starve the scheduler thread: the BPF
+        // kernel fallback takes over (k >> d→u), cores go idle waiting for
+        // userspace to catch up, and desktop interactivity collapses under load.
+        //
+        // Priority 1 is the minimum FIFO level — it beats SCHED_NORMAL but
+        // yields to any higher-priority RT thread (e.g. audio daemons at
+        // SCHED_FIFO 80+), so we don't interfere with real latency-critical work.
+        unsafe {
+            let param = libc::sched_param { sched_priority: 1 };
+            if libc::sched_setscheduler(0, libc::SCHED_FIFO, &param) != 0 {
+                warn!(
+                    "Could not set SCHED_FIFO (errno {}); continuing with \
+                     SCHED_NORMAL — performance may degrade under CPU saturation",
+                    *libc::__errno_location()
+                );
+            }
+        }
+
         let (res_ch, req_ch) = self.stats_server.channels();
         let mut last_housekeeping = Instant::now();
 
