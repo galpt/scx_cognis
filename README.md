@@ -1,8 +1,6 @@
 # scx_cognis
 
-"Cognis" (from Latin *cognōscere*) — to learn, to know — is a Linux CPU scheduler with adaptive scheduling policy, combining deterministic heuristics, O(1) bitmask CPU selection, trust-based anomaly detection, and tabular reinforcement learning.
-
-`scx_cognis` is a Linux CPU scheduler built on the [`sched_ext`](https://www.kernel.org/doc/html/latest/scheduler/sched-ext.html) framework and [`scx_rustland_core`](https://crates.io/crates/scx_rustland_core). It combines a deterministic task classifier, a zero-alloc trust engine, tabular Q-learning, and an Elman RNN burst predictor — all running in user-space Rust with a sub-5 µs per-event inference target. Every hot-path data structure is a fixed-size array; no heap allocation occurs during scheduling events.
+"Cognis" (from Latin *cognōscere*) — to learn, to know — is a Linux CPU scheduler built on the [`sched_ext`](https://www.kernel.org/doc/html/latest/scheduler/sched-ext.html) framework and [`scx_rustland_core`](https://crates.io/crates/scx_rustland_core), running entirely in user-space Rust. It combines deterministic heuristics with O(1) bitmask CPU selection, an Elman RNN burst predictor, a zero-alloc trust engine, and a tabular Q-learning policy controller — targeting a sub-10 µs per-event inference overhead. Per-PID state lives in fixed-size arrays; task queues are pre-allocated ring buffers; no heap allocation occurs during scheduling events.
 
 ---
 
