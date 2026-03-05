@@ -336,7 +336,7 @@ The pipeline runs **synchronously on the hot scheduling path** for the per-task 
 |:---|:---|:---|
 | Heuristic classify | $`O(1)`$ — 4 comparisons | < 0.05 µs |
 | Trust check | $`O(1)`$ fixed-table lookup | < 0.1 µs |
-| Burst predictor | $`O(H \cdot X) = O(12)`$ matmul | < 0.1 µs |
+| Burst predictor | $`O(1)`$ EMA table read (enqueue); $`O(H \cdot X) = O(12)`$ RNN update (dispatch) | < 0.1 µs |
 | O(1) CPU select | $`O(1)`$ bitmask TZCNT | < 0.01 µs |
 | Q-learning slice read | $`O(1)`$ atomic read | < 0.05 µs |
 | **Total (typical)** | | **< 1 µs** |
