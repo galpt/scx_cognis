@@ -833,6 +833,7 @@ impl<'a> Scheduler<'a> {
             .count() as u64;
 
         Metrics {
+            version: env!("CARGO_PKG_VERSION").to_string(),
             nr_running: *self.bpf.nr_running_mut(),
             nr_cpus: *self.bpf.nr_online_cpus_mut(),
             nr_queued: *self.bpf.nr_queued_mut(),

@@ -18,6 +18,8 @@ use serde::Serialize;
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Stats)]
 #[stat(top)]
 pub struct Metrics {
+    #[stat(desc = "Scheduler version (matches the release tag)")]
+    pub version: String,
     #[stat(desc = "Number of online CPUs")]
     pub nr_cpus: u64,
     #[stat(desc = "Tasks currently running")]
@@ -164,8 +166,9 @@ impl Metrics {
     pub fn format<W: Write>(&self, w: &mut W) -> Result<()> {
         writeln!(
             w,
-            "[cognis] tldr: {:<55} | r:{:>3}/{:<3} q:{:<3}/{:<3} | pf:{:<4} | d→u:{:<6} k:{:<4} c:{:<4} b:{:<4} f:{:<4} | cong:{:<4} | \
+            "[cognis v{}] tldr: {:<55} | r:{:>3}/{:<3} q:{:<3}/{:<3} | pf:{:<4} | d→u:{:<6} k:{:<4} c:{:<4} b:{:<4} f:{:<4} | cong:{:<4} | \
              🧠 Interactive:{:<4} Compute:{:<4} IOwait:{:<4} RT:{:<4} Unknown:{:<4} | quarantine:{} flagged:{} | slice:{}µs reward:{:.2}",
+            self.version,
             self.tldr(),
             self.nr_running,
             self.nr_cpus,

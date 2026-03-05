@@ -554,6 +554,8 @@ scx_cognis --monitor 1.0
 scx_cognis --monitor 0.5
 ```
 
+The version is displayed inline at the start of every output line (`[cognis v1.0.2] ...`), so you can confirm which release is running without stopping the service. Use `scx_cognis --version` for a one-shot version check when the scheduler is not running.
+
 > [!NOTE]
 > If the scheduler was started **without** the provided service file (e.g. a manually launched instance), the socket may be root-only. In that case prefix with `sudo`.
 
@@ -568,13 +570,14 @@ Each line from `--monitor` is a snapshot of one polling interval. All counters l
 #### Full Output Format
 
 ```
-[cognis] tldr: Rest assured! I'm keeping your system responsive.        | r:  5/16  q:1 /0   | pf:0 | d→u:312   k:140 c:0  b:0  f:0  | cong:0 | 🧠 Interactive:18  Compute:3  IOwait:2  RT:0  Unknown:0 | quarantine:0 flagged:0 | slice:4000µs reward:0.42
+[cognis v1.0.2] tldr: Rest assured! I'm keeping your system responsive.   | r:  5/16  q:1 /0   | pf:0 | d→u:312   k:140 c:0  b:0  f:0  | cong:0 | 🧠 Interactive:18  Compute:3  IOwait:2  RT:0  Unknown:0 | quarantine:0 flagged:0 | slice:4000µs reward:0.42
 ```
 
 #### Column Reference
 
 | Column | Full Name | Type | Meaning |
 |:---|:---|:---|:---|
+| `v1.0.2` (header) | version | static | Scheduler version embedded in every monitor line, matching the GitHub release tag. Identical to the output of `scx_cognis --version`. |
 | `tldr: ...` | human summary | computed | One-line plain-English summary of current system health. Changes every interval based on load, reward, congestion, and threat level. See the [TLDR message reference](#tldr-message-reference) below. |
 | `r: 5/16` | running / online CPUs | instant | Tasks actively executing right now out of total online CPUs. High ratios (≥ 0.8) mean the system is busy. |
 | `q:1 /0` | queued / scheduled | instant | `queued` = tasks handed by the kernel to userspace and waiting for a dispatch decision; `scheduled` = tasks that have been ordered but not yet sent back to BPF. Under normal load both stay near 0. |
