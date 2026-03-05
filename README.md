@@ -377,7 +377,7 @@ The Q-learning controller's output is capped at `effective_base_ns()` — the au
 The **base slice** is determined by the `PolicyController` each tick:
 
 ```math
-\text{base\_slice\_ns} = \operatorname{clamp}\!\left(\frac{\text{TARGETED\_LATENCY\_NS}\,(15\,\text{ms})}{\text{tasks\_per\_cpu}},\; 500\,\mu\text{s},\; 20\,\text{ms}\right)
+\text{base\_slice\_ns} = \text{clamp}\!\left(\frac{\text{TARGETED\_LATENCY\_NS}\,(15\,\text{ms})}{\text{tasks\_per\_cpu}},\; 500\,\mu\text{s},\; 20\,\text{ms}\right)
 ```
 
 smoothed with a 0.7/0.3 EWMA to avoid jitter. This **auto-compute mode** is the default (`--slice-us 0`). Passing a non-zero `--slice-us N` value caps the slice at `N` µs — it acts as a safety ceiling, not a fixed target.
