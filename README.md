@@ -277,33 +277,32 @@ Panels:
 
 ### Architecture
 
-```
-┌───────────────────────────────────────────────────────────────────┐
-│  Linux Kernel  (sched_ext BPF backend — scx_rustland_core)        │
-│                                                                   │
-│  ┌────────────────────────┐   ring buffer   ┌──────────────────┐  │
-│  │ BPF dispatcher         │ ─────────────▶  │  User-space      │  │
-│  │ (scx_rustland_core)    │ ◀─────────────  │  Scheduler       │  │
-│  └────────────────────────┘   user ring     │  (scx_cognis)    │  │
-│                                             └──────────────────┘  │
-└───────────────────────────────────────────────────────────────────┘
-                                     │
-┌────────────────────────────────────▼──────────────────────────────┐
-│                        Scheduling Pipeline                        │
-│                                                                   │
-│  dequeue     → heuristic classify                                 │
-│              → Bayesian reputation check                          │
-│              → Elman RNN headroom hint                            │
-│  select_cpu  → A* topology search                                 │
-│  dispatch    → Q-learning policy slice read                       │
-│  tick        → Isolation Forest anti-cheat                        │
-└───────────────────────────────────────────────────────────────────┘
-                                     │
-┌────────────────────────────────────▼──────────────────────────────┐
-│                       ratatui TUI Dashboard                       │
-│  Arc<Mutex<DashboardState>>  (lock-free reads                     │
-│  on hot path via AtomicU64 slice)                                 │
-└───────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    subgraph Kernel["Linux Kernel — sched_ext BPF backend (scx_rustland_core)"]
+        direction LR
+        BPF["`BPF dispatcher
+        *(scx_rustland_core)*`"]
+        US["`User-space Scheduler
+        *(scx_cognis)*`"]
+        BPF -- "ring buffer" --> US
+        US -- "user ring" --> BPF
+    end
+
+    subgraph Pipeline["Scheduling Pipeline"]
+        P1["`**dequeue** → heuristic classify → Bayesian reputation check → Elman RNN headroom hint`"]
+        P2["`**select_cpu** → A\* topology search`"]
+        P3["`**dispatch** → Q-learning policy slice read`"]
+        P4["`**tick** → Isolation Forest anti-cheat`"]
+    end
+
+    subgraph TUI["ratatui TUI Dashboard"]
+        DS["`Arc&lt;Mutex&lt;DashboardState&gt;&gt;
+        lock-free reads on hot path via AtomicU64 slice`"]
+    end
+
+    Kernel --> Pipeline
+    Pipeline --> TUI
 ```
 
 ### Pipeline Details
