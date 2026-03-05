@@ -605,7 +605,8 @@ impl<'a> Scheduler<'a> {
         loop {
             match self.bpf.dequeue_task() {
                 Ok(Some(mut task)) => {
-                    let (deadline, slice_ns, label, perf_cri) = self.ai_classify_and_enqueue(&mut task);
+                    let (deadline, slice_ns, label, perf_cri) =
+                        self.ai_classify_and_enqueue(&mut task);
                     let timestamp = Self::now_ns();
 
                     // Update per-task perf_cri EWMA for the load balancer threshold.
@@ -683,9 +684,12 @@ impl<'a> Scheduler<'a> {
         dispatched.cpu = if self.opts.percpu_local {
             task.qtask.cpu
         } else {
-            let cpu = self
-                .load_bal
-                .select_cpu(task.qtask.cpu, task.label, quarantined, task.perf_cri_fp as f32 / 1000.0);
+            let cpu = self.load_bal.select_cpu(
+                task.qtask.cpu,
+                task.label,
+                quarantined,
+                task.perf_cri_fp as f32 / 1000.0,
+            );
             if cpu >= 0 {
                 cpu
             } else {

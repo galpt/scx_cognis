@@ -152,7 +152,13 @@ impl AStarLoadBalancer {
     ///                  label→core-type mapping and adapts to the actual workload.
     ///
     /// Returns the selected `cpu_id`, or `RL_CPU_ANY` (-1) as a fallback.
-    pub fn select_cpu(&self, prev_cpu: i32, label: TaskLabel, quarantine: bool, perf_cri: f32) -> i32 {
+    pub fn select_cpu(
+        &self,
+        prev_cpu: i32,
+        label: TaskLabel,
+        quarantine: bool,
+        perf_cri: f32,
+    ) -> i32 {
         if self.cpus.is_empty() {
             return -1; // RL_CPU_ANY
         }

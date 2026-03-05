@@ -294,7 +294,8 @@ impl PolicyController {
         // slice within this window or restore it — it never inflates above the
         // auto-computed ceiling.  This means on a heavily-loaded system the max
         // slice automatically shrinks to give all tasks a fair turn.
-        let new_slice = ((self.current_slice_ns as f64 * ratio) as u64).clamp(min_slice, effective_max);
+        let new_slice =
+            ((self.current_slice_ns as f64 * ratio) as u64).clamp(min_slice, effective_max);
 
         self.current_slice_ns = new_slice;
         self.prev_state = state;
@@ -360,7 +361,7 @@ mod tests {
     #[test]
     fn slice_stays_in_bounds() {
         let mut ctrl = PolicyController::new(20_000_000); // 20 ms base
-        // Simulate a load of 4 tasks across 2 CPUs → 2 tasks/cpu → 7.5 ms auto-base.
+                                                          // Simulate a load of 4 tasks across 2 CPUs → 2 tasks/cpu → 7.5 ms auto-base.
         ctrl.update_load(4, 2);
         let sig = SchedulerSignal {
             load_norm: 0.8,
