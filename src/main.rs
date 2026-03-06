@@ -35,6 +35,7 @@ mod tui;
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::mem::MaybeUninit;
+use std::panic::{self, AssertUnwindSafe};
 
 use std::time::{Duration, Instant, SystemTime};
 
@@ -60,6 +61,9 @@ use tui::SharedState;
 const SCHEDULER_NAME: &str = "Cognis";
 const NSEC_PER_USEC: u64 = 1_000;
 const NSEC_PER_SEC: u64 = 1_000_000_000;
+const RESTART_BACKOFF: Duration = Duration::from_millis(250);
+const RAPID_FAILURE_WINDOW: Duration = Duration::from_secs(30);
+const RAPID_FAILURE_LIMIT: u32 = 20;
 
 // ── CLI Options ────────────────────────────────────────────────────────────
 
@@ -1387,6 +1391,20 @@ fn elevate_scheduler_thread() {
     }
 }
 
+fn panic_payload_to_string(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(msg) = payload.downcast_ref::<&'static str>() {
+        (*msg).to_string()
+    } else if let Some(msg) = payload.downcast_ref::<String>() {
+        msg.clone()
+    } else {
+        "unknown panic payload".to_string()
+    }
+}
+
+fn is_runtime_exit_error(err: &anyhow::Error) -> bool {
+    err.to_string().starts_with("EXIT:")
+}
+
 // ── CPU topology helpers ──────────────────────────────────────────────────
 
 // ONLINE_CPUS removed – nr_online_cpus is queried live from the BPF scheduler.
@@ -1528,11 +1546,77 @@ fn main() -> Result<()> {
 
     // Main scheduler loop with restart support.
     let mut open_object = MaybeUninit::uninit();
+    let mut rapid_failures = 0u32;
+    let mut last_failure_at: Option<Instant> = None;
+
     loop {
         elevate_scheduler_thread();
-        let mut sched = Scheduler::init(&opts, &mut open_object)?;
-        if !sched.run()?.should_restart() {
-            break;
+
+        let loop_result = panic::catch_unwind(AssertUnwindSafe(|| -> Result<bool> {
+            let mut sched = Scheduler::init(&opts, &mut open_object)?;
+            Ok(sched.run()?.should_restart())
+        }));
+
+        match loop_result {
+            Ok(Ok(true)) => continue,
+            Ok(Ok(false)) => break,
+            Ok(Err(err)) if is_runtime_exit_error(&err) => {
+                let now = Instant::now();
+                rapid_failures = if last_failure_at
+                    .is_some_and(|prev| now.duration_since(prev) <= RAPID_FAILURE_WINDOW)
+                {
+                    rapid_failures.saturating_add(1)
+                } else {
+                    1
+                };
+                last_failure_at = Some(now);
+
+                if rapid_failures > RAPID_FAILURE_LIMIT {
+                    anyhow::bail!(
+                        "refusing to auto-restart after {} rapid runtime failures in {:?}: {}",
+                        rapid_failures,
+                        RAPID_FAILURE_WINDOW,
+                        err
+                    );
+                }
+
+                warn!(
+                    "runtime failure detected (attempt {}/{} in {:?}): {}; restarting after {:?}",
+                    rapid_failures, RAPID_FAILURE_LIMIT, RAPID_FAILURE_WINDOW, err, RESTART_BACKOFF
+                );
+                std::thread::sleep(RESTART_BACKOFF);
+            }
+            Ok(Err(err)) => return Err(err),
+            Err(payload) => {
+                let now = Instant::now();
+                rapid_failures = if last_failure_at
+                    .is_some_and(|prev| now.duration_since(prev) <= RAPID_FAILURE_WINDOW)
+                {
+                    rapid_failures.saturating_add(1)
+                } else {
+                    1
+                };
+                last_failure_at = Some(now);
+
+                if rapid_failures > RAPID_FAILURE_LIMIT {
+                    anyhow::bail!(
+                        "refusing to auto-restart after {} rapid scheduler panics in {:?}: {}",
+                        rapid_failures,
+                        RAPID_FAILURE_WINDOW,
+                        panic_payload_to_string(payload.as_ref())
+                    );
+                }
+
+                warn!(
+                    "scheduler panic detected (attempt {}/{} in {:?}): {}; restarting after {:?}",
+                    rapid_failures,
+                    RAPID_FAILURE_LIMIT,
+                    RAPID_FAILURE_WINDOW,
+                    panic_payload_to_string(payload.as_ref()),
+                    RESTART_BACKOFF
+                );
+                std::thread::sleep(RESTART_BACKOFF);
+            }
         }
     }
 
