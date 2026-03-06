@@ -35,13 +35,3 @@ scx_rustland_core = "2.4.10"
 
 [features]
 enable_backtrace = []
-
-# ── Vendor patches ────────────────────────────────────────────────────────────
-#
-# scx_rustland_core embeds assets/bpf/main.bpf.c and writes it to the project
-# root on every cargo build, which would overwrite our custom BPF fixes.
-# The vendor fork keeps the same public API but ships our patched main.bpf.c:
-#   1. ops.dispatch: per-CPU DSQ consumed before usersched (fixes kworker stall)
-#   2. dispatch_task: RL_CPU_ANY path increments nr_user_dispatches (fixes d→u:0)
-[patch.crates-io]
-scx_rustland_core = { path = "vendor/scx_rustland_core" }

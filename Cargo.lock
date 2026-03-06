@@ -1284,6 +1284,8 @@ dependencies = [
 [[package]]
 name = "scx_rustland_core"
 version = "2.4.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8439b99f0d07d10ecf876cbd4d25588523ae4cc9961f47b830bcb95388dc5938"
 dependencies = [
  "anyhow",
  "libbpf-rs",

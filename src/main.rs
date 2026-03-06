@@ -409,6 +409,59 @@ impl<'a> Scheduler<'a> {
         value.saturating_mul(100) / weight
     }
 
+    /// Returns true if the task's comm identifies a kernel worker thread.
+    ///
+    /// The upstream BPF backend fast-dispatches strictly per-CPU kthreads
+    /// (`PF_KTHREAD && nr_cpus_allowed == 1`) before they reach Rust.  On
+    /// Linux >= 6.13 the workqueue subsystem reworked per-CPU worker affinity:
+    /// nominally per-CPU workers such as `kworker/N:M` may now carry
+    /// `nr_cpus_allowed > 1` and fall through to the Rust scheduling loop.
+    /// The heuristic classifier assigns them `Compute` (high cpu_intensity,
+    /// low exec_ratio — they burst through slices without sleeping) — the
+    /// lowest-priority bucket — where they starve behind Interactive and IoWait
+    /// traffic until the 5 s sched_ext watchdog fires.
+    ///
+    /// This function detects such threads from their comm name and the caller
+    /// forces them into the `RealTime` bucket so they are always dispatched
+    /// before any user-space task.
+    ///
+    /// Zero allocation — operates directly on the fixed `[c_char; 16]` byte
+    /// array.  Bounded by `TASK_COMM_LEN` (16 bytes) — O(1).
+    #[inline(always)]
+    fn is_kernel_worker(task: &QueuedTask) -> bool {
+        // Reinterpret c_char (i8 on Linux) as bytes for ASCII comparison.
+        let bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(task.comm.as_ptr() as *const u8, task.comm.len())
+        };
+        let len = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+        let s = &bytes[..len];
+
+        // Kernel threads that embed '/' in their comm name:
+        //   kworker/N:M, kworker/uN:M, ksoftirqd/N, rcuop/N, rcuog/N,
+        //   migration/N, irq/N-name, idle_inject/N, cpuhp/N, watchdog/N.
+        if s.contains(&b'/') {
+            return true;
+        }
+
+        // Kernel daemons whose comm name does not include '/'.
+        const KPREFIXES: &[&[u8]] = &[
+            b"kswapd",
+            b"khugepaged",
+            b"kcompactd",
+            b"kthreadd",
+            b"kdevtmpfs",
+            b"kauditd",
+            b"kcryptd",
+            b"kblockd",
+        ];
+        for prefix in KPREFIXES {
+            if s.starts_with(prefix) {
+                return true;
+            }
+        }
+        false
+    }
+
     // ── Fixed-table lifetime helpers ───────────────────────────────────
 
     /// Fibonacci hash: map PID → lifetime table slot.
@@ -480,29 +533,27 @@ impl<'a> Scheduler<'a> {
     ///
     /// # Anti-starvation
     ///
-    /// Strict bucket priority causes lower-priority tasks to starve when
-    /// higher-priority traffic is sustained.  The critical case is unbound
-    /// kernel workers (`kworker/uN:M`, `nr_cpus_allowed > 1`): they are routed
-    /// through the Rust scheduler (not the BPF per-CPU fast-path), can be
-    /// classified as `Compute` due to CPU-intensive burst behaviour, and then
-    /// wait indefinitely behind a stream of Interactive/IoWait tasks — until
-    /// the sched_ext watchdog fires (`EXIT: runnable task stall` at 5 s).
+    /// Kernel workers (kworker/N:M, ksoftirqd/N, etc.) are force-classified
+    /// as `RealTime` in `ai_classify_and_enqueue` and therefore land in the
+    /// highest-priority bucket by construction — no starvation rescue needed
+    /// for them.
     ///
-    /// Fix: before applying the normal priority order, scan the front of every
-    /// non-RT bucket.  Any task that has been waiting longer than
-    /// `STARVATION_NS` (500 ms = 10× below the 5 s watchdog) is returned
-    /// immediately, regardless of its label priority.  Buckets are checked from
-    /// lowest to highest priority so the most-starved task wins when multiple
-    /// buckets cross the threshold simultaneously.
+    /// The starvation threshold here is a defence-in-depth for user tasks
+    /// that might accumulate unexpected wait time in lower-priority buckets
+    /// under sustained high-priority load.  Any task waiting longer than
+    /// `STARVATION_NS` (100 ms = 50× below the 5 s watchdog) is promoted
+    /// immediately regardless of its label.  Buckets are scanned from
+    /// lowest to highest so the most-starved task wins when multiple
+    /// buckets breach the threshold simultaneously.
     ///
     /// Cost: one `now_ns()` vDSO call + four saturating-subtract comparisons
     /// per dispatch — O(1), < 50 ns total.
     #[inline(always)]
     fn pop_highest_priority_task(&mut self) -> Option<Task> {
-        // 100 ms = 50× safety margin below the 5 s sched_ext watchdog.
-        // Reduced from 500 ms after the BPF kthread fix so that any task
-        // that unexpectedly reaches a low-priority bucket is rescued well
-        // before the watchdog, even under worst-case queue depths.
+        // 100 ms — 50× safety margin below the 5 s sched_ext watchdog.
+        // Reduced from 500 ms since kernel workers are now force-classified as
+        // RealTime and should not reach lower-priority buckets.  The 100 ms
+        // threshold acts as a defence-in-depth for any unexpected user task.
         const STARVATION_NS: u64 = 100_000_000;
         let now = Self::now_ns();
 
@@ -678,9 +729,22 @@ impl<'a> Scheduler<'a> {
         // Build features.
         let features = Self::compute_features(task, self.base_slice_ns, prev_slice_ns, nr_cpus);
 
+        // Detect kernel workers before the label is computed.
+        // Unbound kthreads (nr_cpus_allowed > 1 on Linux >= 6.13) are not
+        // caught by the BPF per-CPU fast-dispatch guard and reach Rust, where
+        // the heuristic misclassifies them as Compute (CPU-intensive burst,
+        // low exec_ratio).  Forcing them into RealTime ensures they are always
+        // dispatched before user tasks and never trip the sched_ext watchdog.
+        let is_kworker = Self::is_kernel_worker(task);
+
         // Classify using the deterministic heuristic only.
         // Stateless, O(1), no feedback loop — see src/ai/classifier.rs.
-        let label = self.classifier.classify(&features);
+        // Kernel workers bypass classification and are always RealTime.
+        let label = if is_kworker {
+            TaskLabel::RealTime
+        } else {
+            self.classifier.classify(&features)
+        };
         self.label_counts[label as usize] += 1;
 
         // Trust-based slice factor.
@@ -771,7 +835,10 @@ impl<'a> Scheduler<'a> {
         self.total_inference_ns += elapsed;
         self.inference_samples += 1;
 
-        (deadline, slice, label, features.perf_cri, features)
+        // Kernel workers need the fastest available CPU (P-core) to complete
+        // their bounded kernel operations with minimal latency.
+        let ret_perf_cri = if is_kworker { 1.0f32 } else { features.perf_cri };
+        (deadline, slice, label, ret_perf_cri, features)
     }
 
     // ── Drain queued tasks (runs scheduling pipeline per task) ──────────────
