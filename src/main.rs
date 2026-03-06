@@ -9,7 +9,7 @@
 //   ┌─────────────────────────────────────────────────────────────────────┐
 //   │  ops.enqueue  → Heuristic classifier + Trust check                  │
 //   │  ops.dispatch → Q-learning policy (adaptive time slice)              │
-//   │  ops.select_cpu → O(1) bitmask CPU selector (P/E-core, quarantine)  │
+//   │  ops.select_cpu → kernel idle-CPU query (bpf.select_cpu → pick_idle_cpu) │
 //   │  ops.tick     → Trust-based anomaly detection (behavioural, zero-alloc) │
 //   └─────────────────────────────────────────────────────────────────────┘
 //
@@ -32,7 +32,6 @@ mod stats;
 mod task_queue;
 mod tui;
 
-use std::collections::{HashMap, HashSet};
 use std::io;
 use std::mem::MaybeUninit;
 use std::panic::{self, AssertUnwindSafe};
@@ -51,8 +50,8 @@ use scx_utils::libbpf_clap_opts::LibbpfOpts;
 use scx_utils::UserExitInfo;
 
 use ai::{
-    BurstPredictor, CoreType, CpuSelector, CpuState, ExitObservation, HeuristicClassifier,
-    PolicyController, SchedulerSignal, TaskFeatures, TaskLabel, TrustTable, SHAME_MAX,
+    BurstPredictor, ExitObservation, HeuristicClassifier, PolicyController, SchedulerSignal,
+    TaskFeatures, TaskLabel, TrustTable, SHAME_MAX,
 };
 use stats::Metrics;
 use task_queue::{QueuePush, TaskQueue};
@@ -69,10 +68,11 @@ const RAPID_FAILURE_LIMIT: u32 = 20;
 
 /// scx_cognis: an adaptive CPU scheduler combining heuristics, statistical models, and RL.
 ///
-/// Scheduling pipeline: a deterministic heuristic task classifier, O(1) bitmask CPU selector
-/// (P/E-core and quarantine aware), Elman RNN burst prediction (fixed offline-trained weights),
-/// a combined trust/anomaly table for reputation tracking, and a tabular Q-learning policy
-/// controller — all targeting sub-10µs per-event latency with zero hot-path heap allocations.
+/// Scheduling pipeline: a deterministic heuristic task classifier, Elman RNN burst prediction
+/// (fixed offline-trained weights), a combined trust/anomaly table for reputation tracking, and
+/// a tabular Q-learning policy controller — all targeting sub-10µs per-event latency with zero
+/// hot-path heap allocations. CPU placement delegates to the kernel's own idle-CPU query
+/// (bpf.select_cpu → pick_idle_cpu) for guaranteed accuracy on every dispatch.
 #[derive(Debug, Parser)]
 struct Opts {
     /// Base scheduling slice duration in microseconds.
@@ -105,10 +105,6 @@ struct Opts {
     /// Enable verbose output (BPF details + tracefs events).
     #[clap(short = 'v', long, action = clap::ArgAction::SetTrue)]
     verbose: bool,
-
-    /// Number of restricted CPUs reserved for quarantined tasks (0 = disable quarantine).
-    #[clap(long, default_value = "1")]
-    restricted_cpus: usize,
 
     /// Launch the ratatui TUI dashboard.
     #[clap(short = 't', long, action = clap::ArgAction::SetTrue)]
@@ -151,11 +147,6 @@ struct Task {
     /// when they reach Rust with a widened affinity mask on newer kernels.
     is_kernel_worker: bool,
     slice_ns: u64,
-    /// Performance criticality score stored as fixed-point u16 (perf_cri × 1000).
-    /// Range 0..=1000, representing 0.0..=1.0 with 0.1% resolution.
-    /// Stored as integer so Task remains fully Eq-comparable.
-    /// Converted back to f32 when passed to the CPU selector.
-    perf_cri_fp: u16,
 }
 
 // ── Per-task lifetime tracking (for trust updates on exit) ─────────
@@ -216,7 +207,6 @@ struct Scheduler<'a> {
 
     // Scheduling policy components.
     classifier: HeuristicClassifier,
-    cpu_sel: CpuSelector,
     burst_pred: BurstPredictor,
     trust: Box<TrustTable>,
     policy: PolicyController,
@@ -252,10 +242,6 @@ struct Scheduler<'a> {
     /// (enqueue → dispatch), in nanoseconds. Updated on every successful
     /// dispatch. Used as `latency_p99_norm` in the Q-learning reward signal.
     sched_latency_ema_ns: f64,
-    /// EWMA of per-task performance criticality scores observed in the current
-    /// scheduling window.  Fed into the CPU selector periodically so the
-    /// P/E-core routing threshold adapts to the actual workload composition.
-    perf_cri_ema: f32,
 }
 
 impl<'a> Scheduler<'a> {
@@ -275,7 +261,7 @@ impl<'a> Scheduler<'a> {
 
         let policy = PolicyController::new(base_slice_ns);
 
-        let mut bpf = BpfScheduler::init(
+        let bpf = BpfScheduler::init(
             open_object,
             opts.libbpf.clone().into_bpf_open_opts(),
             opts.exit_dump_len,
@@ -285,34 +271,6 @@ impl<'a> Scheduler<'a> {
             slice_ns_min,
             "cognis",
         )?;
-
-        // Build initial CPU topology from real sysfs data.
-        let mut cpu_sel = CpuSelector::new();
-        {
-            let nr_cpus = *bpf.nr_online_cpus_mut() as i32;
-            let restricted = opts.restricted_cpus;
-
-            // Read P/E-core and NUMA assignments once at startup.
-            let core_type_map = build_core_type_map(nr_cpus);
-            let numa_map = build_numa_map();
-
-            for cpu_id in 0..nr_cpus {
-                // The last `restricted_cpus` CPUs are reserved for quarantined tasks.
-                let is_restricted = cpu_id >= nr_cpus - restricted as i32;
-                let core_type = core_type_map
-                    .get(&cpu_id)
-                    .copied()
-                    .unwrap_or(CoreType::Performance);
-                let numa_node = numa_map.get(&cpu_id).copied().unwrap_or(0);
-
-                cpu_sel.update_cpu(CpuState {
-                    cpu_id,
-                    core_type,
-                    numa_node,
-                    restricted: is_restricted,
-                });
-            }
-        }
 
         let tui_state = if opts.tui {
             Some(tui::new_shared_state())
@@ -354,7 +312,6 @@ impl<'a> Scheduler<'a> {
             base_slice_ns,
             slice_ns_min,
             classifier: HeuristicClassifier::new(),
-            cpu_sel,
             burst_pred: BurstPredictor::new(),
             trust: TrustTable::new(),
             policy,
@@ -392,7 +349,6 @@ impl<'a> Scheduler<'a> {
             total_inference_ns: 0,
             inference_samples: 0,
             sched_latency_ema_ns: 0.0,
-            perf_cri_ema: 0.5, // start at midpoint; adapts after first policy tick
         })
     }
 
@@ -708,31 +664,7 @@ impl<'a> Scheduler<'a> {
             1.0
         };
 
-        // Performance criticality: how much would this task benefit from a
-        // fast P-core vs an efficient E-core?
-        //
-        // Approximation from observable burst statistics:
-        //   - Tasks that use lots of CPU (high cpu_intensity) AND spend little
-        //     time sleeping (low exec_ratio) are the most performance-sensitive:
-        //     compilers, video encoders, physics simulations.
-        //   - RealTime tasks always get max perf_cri.
-        //   - I/O-bound tasks (low cpu_intensity) score low: CPU speed barely
-        //     matters when the task is blocked on disk/network most of the time.
-        //
-        // Formula: blend cpu_intensity weight (0.7) with a non-sleep penalty
-        // (0.3) so tasks that are CPU-heavy AND never sleep get a high score
-        // while tasks that are CPU-heavy BUT frequently sleep (e.g. a 120fps
-        // game render thread syncing to vsync) get a moderate score.
-        //
-        // Range: [0, 1].  System-wide average tracked in perf_cri_ema and fed
-        // into the O(1) CPU selector for dynamic P/E routing.
         let weight_norm = (task.weight as f32 / 10000.0).clamp(0.0, 1.0);
-        let non_sleep = 1.0 - exec_ratio.min(1.0) * 0.5;
-        let perf_cri = if weight_norm > 0.95 {
-            1.0f32 // RealTime tasks unconditionally need the fastest core.
-        } else {
-            (cpu_intensity * 0.7 + non_sleep * 0.3).clamp(0.0, 1.0)
-        };
 
         TaskFeatures {
             runnable_ratio,
@@ -740,14 +672,13 @@ impl<'a> Scheduler<'a> {
             exec_ratio,
             weight_norm,
             cpu_affinity: (task.nr_cpus_allowed as f32 / (nr_cpus as f32).max(1.0)).clamp(0.0, 1.0),
-            perf_cri,
         }
     }
 
     fn ai_classify_and_enqueue(
         &mut self,
         task: &mut QueuedTask,
-    ) -> (u64, u64, TaskLabel, f32, TaskFeatures, bool) {
+    ) -> (u64, u64, TaskLabel, TaskFeatures, bool) {
         let t0 = Self::now_ns();
 
         let nr_cpus = (*self.bpf.nr_online_cpus_mut()).max(1) as i32;
@@ -872,14 +803,7 @@ impl<'a> Scheduler<'a> {
         self.total_inference_ns += elapsed;
         self.inference_samples += 1;
 
-        // Kernel workers need the fastest available CPU (P-core) to complete
-        // their bounded kernel operations with minimal latency.
-        let ret_perf_cri = if is_kworker {
-            1.0f32
-        } else {
-            features.perf_cri
-        };
-        (deadline, slice, label, ret_perf_cri, features, is_kworker)
+        (deadline, slice, label, features, is_kworker)
     }
 
     // ── Drain queued tasks (runs scheduling pipeline per task) ──────────────
@@ -906,14 +830,9 @@ impl<'a> Scheduler<'a> {
 
             match self.bpf.dequeue_task() {
                 Ok(Some(mut task)) => {
-                    let (deadline, slice_ns, label, perf_cri, features, is_kernel_worker) =
+                    let (deadline, slice_ns, label, features, is_kernel_worker) =
                         self.ai_classify_and_enqueue(&mut task);
                     let timestamp = Self::now_ns();
-
-                    // Update per-task perf_cri EWMA for the load balancer threshold.
-                    // α = 0.05: tracks the running average without being dominated
-                    // by any single burst task in a batch.
-                    self.perf_cri_ema = self.perf_cri_ema * 0.95 + perf_cri * 0.05;
 
                     // Check trust flag before borrowing lifetime table mutably.
                     let cheat_flagged = self.trust.is_flagged(task.pid);
@@ -946,7 +865,6 @@ impl<'a> Scheduler<'a> {
                         label,
                         is_kernel_worker,
                         slice_ns,
-                        perf_cri_fp: (perf_cri * 1000.0).clamp(0.0, 1000.0) as u16,
                         qtask: task,
                     });
 
@@ -1067,10 +985,6 @@ impl<'a> Scheduler<'a> {
         // This mirrors LAVD's slice = targeted_latency / nr_tasks approach and
         // removes the need for a human to tune --slice-us for their workload.
         self.policy.update_load(nr_running, nr_cpus);
-
-        // Update the P/E-core routing threshold in the CPU selector.
-        // Uses the per-task perf_cri EWMA accumulated in drain_queued_tasks().
-        self.cpu_sel.update_avg_perf_cri(self.perf_cri_ema);
 
         let sig = SchedulerSignal {
             load_norm: (nr_running as f64 / nr_cpus as f64).min(1.0),
@@ -1389,96 +1303,6 @@ fn install_terminal_panic_hook() {
         tui::emergency_restore_terminal();
         default_hook(panic_info);
     }));
-}
-
-// ── CPU topology helpers ──────────────────────────────────────────────────
-
-// ONLINE_CPUS removed – nr_online_cpus is queried live from the BPF scheduler.
-
-// ── Topology helpers (sysfs-based, no heuristics) ─────────────────────────
-
-/// Parse a Linux cpulist string such as "0-3,6,8-11" into a set of CPU IDs.
-fn parse_cpulist(s: &str) -> HashSet<i32> {
-    let mut set = HashSet::new();
-    for part in s.trim().split(',') {
-        let part = part.trim();
-        if let Some((lo, hi)) = part.split_once('-') {
-            if let (Ok(a), Ok(b)) = (lo.trim().parse::<i32>(), hi.trim().parse::<i32>()) {
-                for id in a..=b {
-                    set.insert(id);
-                }
-            }
-        } else if let Ok(id) = part.parse::<i32>() {
-            set.insert(id);
-        }
-    }
-    set
-}
-
-/// Read a sysfs cpulist file and return the set of CPU IDs it contains.
-fn read_cpulist_file(path: &str) -> HashSet<i32> {
-    std::fs::read_to_string(path)
-        .map(|s| parse_cpulist(&s))
-        .unwrap_or_default()
-}
-
-/// Build a map from `cpu_id → NUMA node` by reading
-/// `/sys/devices/system/node/nodeN/cpulist` for every node present.
-/// Returns an empty map on single-socket or non-NUMA systems (all CPUs
-/// will default to node 0 in the caller).
-fn build_numa_map() -> HashMap<i32, u32> {
-    let mut map = HashMap::new();
-    let Ok(entries) = std::fs::read_dir("/sys/devices/system/node") else {
-        return map;
-    };
-    for entry in entries.flatten() {
-        let raw = entry.file_name();
-        let name = raw.to_string_lossy();
-        if !name.starts_with("node") {
-            continue;
-        }
-        let node_id: u32 = match name["node".len()..].parse() {
-            Ok(n) => n,
-            Err(_) => continue,
-        };
-        let cpulist_path = format!("{}/cpulist", entry.path().display());
-        for cpu_id in read_cpulist_file(&cpulist_path) {
-            map.insert(cpu_id, node_id);
-        }
-    }
-    map
-}
-
-/// Build a map from `cpu_id → CoreType` using the kernel's hybrid-topology
-/// sysfs entries:
-///
-/// - `/sys/devices/cpu_atom/cpus`  — Intel Atom / E-cores (Efficient)
-/// - `/sys/devices/cpu_core/cpus`  — Intel Core / P-cores (Performance)
-///
-/// On AMD, pure-Intel, or VM systems where these entries do not exist the
-/// file reads return empty sets and every CPU is treated as Performance
-/// (homogeneous topology).
-fn build_core_type_map(nr_cpus: i32) -> HashMap<i32, CoreType> {
-    let atom_cpus = read_cpulist_file("/sys/devices/cpu_atom/cpus");
-    let core_cpus = read_cpulist_file("/sys/devices/cpu_core/cpus");
-    let hybrid = !atom_cpus.is_empty() || !core_cpus.is_empty();
-
-    let mut map = HashMap::new();
-    for cpu_id in 0..nr_cpus {
-        let ct = if hybrid {
-            if atom_cpus.contains(&cpu_id) {
-                CoreType::Efficient
-            } else {
-                // Listed in cpu_core set, or not listed in either (treat as P-core).
-                CoreType::Performance
-            }
-        } else {
-            // Non-hybrid topology (AMD, homogeneous Intel, VMs).
-            CoreType::Performance
-        };
-        map.insert(cpu_id, ct);
-    }
-    map
 }
 
 // ── Entry point ────────────────────────────────────────────────────────────

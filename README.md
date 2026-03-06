@@ -13,7 +13,7 @@
   - [Pipeline Overview](#pipeline-overview)
   - [Component Details](#component-details)
     - [Heuristic Task Classifier](#heuristic-task-classifier)
-    - [O(1) CPU Selector](#o1-cpu-selector)
+    - [CPU Placement — Kernel Idle-CPU Query](#cpu-placement--kernel-idle-cpu-query)
     - [Elman RNN Burst Predictor](#elman-rnn-burst-predictor)
     - [Trust Engine](#trust-engine)
     - [Q-learning Policy Controller](#q-learning-policy-controller)
@@ -137,7 +137,7 @@ test result: ok. 29 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fin
 > [!TIP]
 > **What to expect from scx_cognis?**
 >
-> Cognis is designed to keep interactive threads — games, audio, desktop UI — responsive even when the rest of the system is under heavy CPU or I/O load. On every scheduling event it classifies each thread as RealTime, Interactive, IoWait, or Compute (`Unknown` remains a reserved metrics bucket and is not emitted by the current heuristic) and dispatches it to a matching priority queue: game threads and audio daemons are dequeued and run before background compilers or encoders, and they receive shorter, more frequent CPU slices (Interactive: 0.5× base, RealTime: 0.25× base) so they are never held up waiting for a CPU-bound worker to exhaust its slice. On hybrid CPUs (Intel Core Ultra, Raptor Lake), RealTime tasks always target performance cores, while other tasks are steered by `perf_cri` relative to the system-wide average rather than by a fixed label→core rule. On non-hybrid CPUs, all online CPUs are treated as performance-class. A trust-based engine monitors every thread's behaviour: tasks that repeatedly burn their full slice without yielding (background miners, misbehaving workers) lose trust and are quarantined to a restricted CPU, freeing the rest of the system for responsive work.
+> Cognis is designed to keep interactive threads — games, audio, desktop UI — responsive even when the rest of the system is under heavy CPU or I/O load. On every scheduling event it classifies each thread as RealTime, Interactive, IoWait, or Compute (`Unknown` remains a reserved metrics bucket and is not emitted by the current heuristic) and dispatches it to a matching priority queue: game threads and audio daemons are dequeued and run before background compilers or encoders, and they receive shorter, more frequent CPU slices (Interactive: 0.5× base, RealTime: 0.25× base) so they are never held up waiting for a CPU-bound worker to exhaust its slice. CPU placement delegates to the kernel's own `pick_idle_cpu()` via `bpf.select_cpu()`, which atomically claims a genuinely idle CPU at dispatch time. A trust-based engine monitors every thread's behaviour: tasks that repeatedly burn their full slice without yielding (background miners, misbehaving workers) lose trust and receive a reduced time-slice, freeing CPU bandwidth for responsive work.
 >
 > Batch-workload throughput is intentionally traded off for responsiveness. If your goal is raw CPU throughput (compilers, encoders, benchmarks), the default EEVDF scheduler usually wins; Cognis's advantage is lower scheduling latency for threads that wake up, do a little work, and sleep again.
 
@@ -148,7 +148,7 @@ Every scheduling decision passes through a multi-stage pipeline. The hot path is
 ```
 ops.enqueue   →  Rust kthread check  →  Heuristic Classifier  →  Trust Check  →  Burst Predictor
 ops.dispatch  →  Q-learning Policy (adaptive time slice)
-ops.select_cpu → O(1) CPU Selector  (P/E-core bitmask, quarantine-aware)
+ops.select_cpu → kernel idle-CPU query  (bpf.select_cpu → pick_idle_cpu, atomic)
 ops.tick      →  Trust Engine tick  (no-op; prepared for future anomaly detection)
 schedule loop →  Trust Engine flush          (staleness-based, every 1 s)
 ```
@@ -173,7 +173,7 @@ schedule loop →  Trust Engine flush          (staleness-based, every 1 s)
 
 Dynamically labels each PID as `Interactive`, `Compute`, `IoWait`, or `RealTime` using a
 deterministic heuristic evaluated on every `ops.enqueue` event. `Unknown` remains a reserved
-metrics bucket but is not produced by the current classifier. Six task features are tracked:
+metrics bucket but is not produced by the current classifier. Five task features are tracked:
 
 | Feature | Description |
 |:---|:---|
@@ -182,7 +182,6 @@ metrics bucket but is not produced by the current classifier. Six task features 
 | `exec_ratio` | $`\text{burst\_ns} / \text{exec\_runtime}`$ — freshness: near $`1.0`$ = just woke; near $`0.0`$ = spinning without sleeping |
 | `weight_norm` | Normalised scheduler weight (priority) |
 | `cpu_affinity` | Allowed CPUs / total online CPUs |
-| `perf_cri` | Performance criticality score $`\in [0,1]`$: $`\text{cpu\_intensity}\times 0.7 + (1 - \text{exec\_ratio}\times 0.5)\times 0.3`$. RealTime tasks are hard-capped to $`1.0`$. Used by the O(1) CPU selector to route tasks to P/E-cores. |
 
 The primary classification feature is `cpu_intensity`. `prev_assigned_slice_ns` is the slice allocated to this PID on its previous scheduling event (stored in `TaskLifetime`). On first event, `base_slice_ns` is used as fallback. This makes classification stable and loop-free from the second event onward:
 
@@ -204,38 +203,16 @@ Labels influence the base time-slice multiplier and feed into the Trust Engine a
 
 [↑ Back to Table of Contents](#table-of-contents)
 
-#### O(1) CPU Selector
+#### CPU Placement — Kernel Idle-CPU Query
 
-Selects the optimal CPU for each task using a 64-bit bitmask in O(1) time (a single TZCNT instruction). Four candidate sets are maintained:
+For every task that reaches `dispatch_task()`, Cognis calls `bpf.select_cpu(pid, prev_cpu, flags)`, which invokes the sched_ext kernel helper `rs_select_cpu` → `pick_idle_cpu()`. This atomically test-and-clears the kernel's own idle bit for the chosen CPU, guaranteeing the returned CPU is genuinely idle at the moment of dispatch — not merely idle in a stale per-cycle bitmask.
 
-| Mask | Lifetime | Purpose |
-|:---|:---|:---|
-| `p_mask` | static (set once at init) | P-core (Performance) CPUs |
-| `restricted_mask` | static (set once at init) | CPUs reserved for quarantined tasks |
-| `all_mask` | static (set once at init) | All online CPUs |
-| `idle_mask` | **dynamic** (reset each dispatch window) | CPUs not yet dispatched to this scheduling cycle |
+If no idle CPU is found (all CPUs busy), `RL_CPU_ANY` is returned and BPF places the task using its own internal load balancer.
 
-CPU type is read from sysfs at scheduler startup:
+Per-CPU tasks (`ops.select_cpu`; kernel workers with `nr_cpus_allowed == 1`) bypass this path and are pinned directly to their affinity CPU — identical to the scx_rustland reference pattern.
 
-| Topology data | Source |
-|:---|:---|
-| Performance / Efficiency core classification | `/sys/devices/cpu_core/cpus`, `/sys/devices/cpu_atom/cpus` (Intel hybrid) |
-| NUMA node per CPU | `/sys/devices/system/node/nodeN/cpulist` |
-
-On non-hybrid CPUs (AMD, homogeneous Intel, VMs) the sysfs entries are absent and all CPUs are treated as Performance-class.
-
-`idle_mask` is reset to `all_mask` at the start of every `schedule()` call and cleared bit-by-bit as tasks are dispatched to specific CPUs, producing effective round-robin load distribution within each scheduling window.
-
-Routing logic (evaluated in order):
-
-0. **Fast-path: system fully CPU-saturated** — if the system-wide `perf_cri_ema > 0.85` (EWMA of per-task criticality) the selector is bypassed and `RL_CPU_ANY` is returned immediately. At peak compute saturation the BPF kernel's built-in idle-CPU scanner is faster than a user-space round-trip.
-1. **Quarantine** — flagged task → eligible pool is `restricted_mask` only; normal tasks use `all_mask & ~restricted_mask`.
-2. **Core-type preference** — `RealTime` tasks always target `p_mask`; other tasks compare `perf_cri` against the system-wide EWMA `avg_perf_cri` (α = 0.15, updated each 250 ms tick): `perf_cri ≥ avg_perf_cri` → P-core preferred; `perf_cri < avg_perf_cri` → E-core preferred.
-3. **Idle CPU of preferred core type** (`idle_mask & type_mask & pool`) — best case: a genuinely free CPU of the right type.
-4. **Any idle CPU** (`idle_mask & pool`) — relax core-type constraint; any unoccupied CPU in the eligible pool.
-5. **`prev_cpu` if eligible** — no idle CPUs left this window; return the task's home CPU to preserve CPU affinity and cache warmth. Critical for kworkers and CPU-affine threads.
-6. **Any eligible CPU** — last resort (pool non-empty but prev_cpu ineligible).
-7. **`RL_CPU_ANY`** — only if `all_mask == 0` (topology not yet initialised) or the eligible pool is empty.
+> [!NOTE]
+> **Why not a userspace bitmask?** A per-cycle bitmask that resets to "all CPUs idle" each `schedule()` call is stale by construction: dispatching to a CPU that is still running the previous cycle's task leaves the new task waiting in `cpu_to_dsq(X)` until that CPU calls `ops.dispatch`. Under sustained load this accumulates into runnable-task stalls that exceed the 5-second sched_ext watchdog, causing a hard crash. The kernel idle bit is the authoritative source of truth; using it directly eliminates the class of watchdog stall crashes that motivated the bitmask approach.
 
 [↑ Back to Table of Contents](#table-of-contents)
 
@@ -256,7 +233,7 @@ Maintains a trust score (`f32` in `[-1.0, 1.0]`) for each PID in a zero-alloc fi
 | Cooperative (yields within slice, clean exit, low fork rate) | Trust score increases (EWMA update toward `+1.0`) |
 | Adversarial (slice burned, cheat flag, high fork count, involuntary ctx-switch) | Trust score decreases (EWMA update toward `−1.0`) |
 
-Tasks below the `−0.35` quarantine threshold receive a reduced slice factor (`f_r` clamped to `[0.25, 1.0]`) and are routed exclusively to restricted CPUs by the O(1) CPU selector.
+Tasks below the `−0.35` quarantine threshold receive a reduced slice factor (`f_r` clamped to `[0.25, 1.0]`), cutting the CPU time they can consume each cycle.
 
 The trust engine also exposes a `worst_actors()` snapshot (up to 20 entries) for the TUI "Trust Wall of Shame" panel.
 
@@ -324,7 +301,7 @@ flowchart TD
 
     subgraph Pipeline["Scheduling Pipeline"]
         P1["`**enqueue** → heuristic classify → trust check → Elman RNN headroom hint`"]
-        P2["`**select_cpu** → O(1) bitmask CPU select`"]
+        P2["`**select_cpu** → kernel idle-CPU query (bpf.select_cpu → pick_idle_cpu)`"]
         P3["`**dispatch** → Q-learning policy slice read`"]
         P4["`**tick** → trust engine tick`"]
     end
@@ -340,7 +317,7 @@ flowchart TD
 
 ### Pipeline Details
 
-The pipeline runs **synchronously on the hot scheduling path** for the per-task steps (heuristic classify, trust check, burst predictor read, O(1) CPU select, Q-learning slice read). Heavier operations (trust engine ticks, Q-table updates) run on **periodic timers** off the hot path.
+The pipeline runs **synchronously on the hot scheduling path** for the per-task steps (heuristic classify, trust check, burst predictor read, kernel idle-CPU query, Q-learning slice read). Heavier operations (trust engine ticks, Q-table updates) run on **periodic timers** off the hot path.
 
 | Step | Hot Path? | Frequency |
 |:---|:---|:---|
@@ -348,7 +325,7 @@ The pipeline runs **synchronously on the hot scheduling path** for the per-task 
 | Heuristic classify | ✅ Yes | every `ops.enqueue` (user tasks only) |
 | Trust check | ✅ Yes | every `ops.enqueue` (user tasks only) |
 | Burst predictor read | ✅ Yes | every `ops.enqueue` (user tasks only) |
-| O(1) CPU select | ✅ Yes | every `ops.select_cpu` |
+| Kernel idle-CPU query | ✅ Yes | every `ops.select_cpu` |
 | Q-learning slice read | ✅ Yes | every `ops.dispatch` (atomic read) |
 | Trust engine tick | ❌ No | every 100 ms |
 | Q-table update | ❌ No | every 250 ms |
@@ -362,7 +339,7 @@ The pipeline runs **synchronously on the hot scheduling path** for the per-task 
 | Heuristic classify | $`O(1)`$ — 4 comparisons | < 0.05 µs |
 | Trust check | $`O(1)`$ fixed-table lookup | < 0.1 µs |
 | Burst predictor | $`O(1)`$ EMA table read (enqueue); $`O(H \cdot X) = O(12)`$ RNN update (dispatch) | < 0.1 µs |
-| O(1) CPU select | $`O(1)`$ bitmask TZCNT | < 0.01 µs |
+| Kernel idle-CPU query | $`O(1)`$ kernel `pick_idle_cpu()` | < 0.01 µs |
 | Anti-starvation check | $`O(1)`$ — 100 ms threshold; one `now_ns()` vDSO call + four comparisons per dispatch | < 0.05 µs |
 | Q-learning slice read | $`O(1)`$ atomic read | < 0.05 µs |
 | **Total (typical)** | | **< 1 µs** |
@@ -557,8 +534,6 @@ Options:
           Exit debug dump buffer length; 0 = default [default: 0]
   -v, --verbose
           Enable verbose output (BPF details and tracefs events)
-      --restricted-cpus <RESTRICTED_CPUS>
-          CPUs reserved for quarantined tasks (0 = disable quarantine) [default: 1]
   -t, --tui
           Launch the ratatui TUI dashboard
       --stats <STATS>
@@ -709,7 +684,7 @@ sudo sh install.sh
 | `--build-from-source` | Compile the binary locally instead of downloading a pre-built archive |
 | `--dry-run` | Print every action that *would* be taken without making any changes |
 | `--force` | Skip all interactive confirmation prompts |
-| `--flags "..."` | Custom scheduler flags written to `SCX_FLAGS` in `/etc/default/scx` (e.g. `--restricted-cpus 2`) |
+| `--flags "..."` | Custom scheduler flags written to `SCX_FLAGS` in `/etc/default/scx` (e.g. `--verbose`) |
 
 **Examples:**
 
@@ -721,7 +696,7 @@ sudo sh install.sh
 sudo sh install.sh --dry-run
 
 # Install a specific version with custom flags, no prompts:
-sudo sh install.sh --version v0.1.5 --flags "--restricted-cpus 2" --force
+sudo sh install.sh --version v0.1.5 --flags "--verbose" --force
 
 # Build and install from the local source tree:
 sudo sh install.sh --build-from-source
@@ -859,7 +834,7 @@ sudo nano /etc/default/scx
 
 # Set the scheduler to scx_cognis:
 SCX_SCHEDULER=scx_cognis
-SCX_FLAGS="--restricted-cpus 1"
+SCX_FLAGS=""
 
 # Restart the scx service to apply:
 sudo systemctl restart scx
@@ -965,7 +940,7 @@ ConditionKernelVersion=>=6.12
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/scx_cognis --restricted-cpus 1
+ExecStart=/usr/local/bin/scx_cognis
 Restart=on-failure
 RestartSec=5
 KillMode=process
