@@ -33,6 +33,7 @@ use ratatui::{
     Frame, Terminal,
 };
 
+use crate::ai::SHAME_MAX;
 use crate::stats::Metrics;
 
 // ── HistoryRing ────────────────────────────────────────────────────────────
@@ -88,12 +89,26 @@ impl Default for HistoryRing {
 
 const HISTORY_LEN: usize = 120; // ~2 minutes at 1 Hz
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, Copy)]
 pub struct WallEntry {
     pub pid: i32,
-    pub comm: String,
+    pub comm: [u8; 16],
     pub trust: f64,
     pub is_flagged: bool,
+}
+
+impl WallEntry {
+    pub const ZERO: Self = Self {
+        pid: 0,
+        comm: [0; 16],
+        trust: 0.0,
+        is_flagged: false,
+    };
+
+    pub fn comm_str(&self) -> &str {
+        let end = self.comm.iter().position(|&b| b == 0).unwrap_or(16);
+        std::str::from_utf8(&self.comm[..end]).unwrap_or("?")
+    }
 }
 
 /// All mutable state the dashboard needs to render.
@@ -104,7 +119,8 @@ pub struct DashboardState {
     pub inference_hist: HistoryRing,
     pub reward_hist: HistoryRing,
     pub throughput_hist: HistoryRing,
-    pub wall_of_shame: Vec<WallEntry>,
+    pub wall_of_shame: [WallEntry; SHAME_MAX],
+    pub wall_len: usize,
     /// AI slice history stored as u64 microseconds in a fixed ring buffer.
     pub ai_slice_hist: [u64; HISTORY_LEN],
     pub ai_slice_head: usize,
@@ -119,7 +135,8 @@ impl Default for DashboardState {
             inference_hist: HistoryRing::new(),
             reward_hist: HistoryRing::new(),
             throughput_hist: HistoryRing::new(),
-            wall_of_shame: Vec::new(),
+            wall_of_shame: [WallEntry::ZERO; SHAME_MAX],
+            wall_len: 0,
             ai_slice_hist: [0u64; HISTORY_LEN],
             ai_slice_head: 0,
             ai_slice_len: 0,
@@ -140,6 +157,11 @@ impl DashboardState {
         if self.ai_slice_len < HISTORY_LEN {
             self.ai_slice_len += 1;
         }
+    }
+
+    pub fn set_wall_of_shame(&mut self, entries: &[WallEntry; SHAME_MAX], len: usize) {
+        self.wall_of_shame = *entries;
+        self.wall_len = len.min(SHAME_MAX);
     }
 }
 
@@ -207,7 +229,7 @@ pub fn draw(frame: &mut Frame, state: &DashboardState) {
         .split(body[1]);
 
     draw_latency_chart(frame, right[0], state);
-    draw_wall_of_shame(frame, right[1], &state.wall_of_shame);
+    draw_wall_of_shame(frame, right[1], &state.wall_of_shame[..state.wall_len]);
 }
 
 fn draw_header(f: &mut Frame, area: Rect, m: &Metrics) {
@@ -242,7 +264,7 @@ fn draw_overview(f: &mut Frame, area: Rect, m: &Metrics) {
         0
     };
 
-    let items: Vec<Line> = vec![
+    let items = [
         Line::from(format!(
             "  Dispatched (user/kernel/fail):  {} / {} / {}",
             m.nr_user_dispatches, m.nr_kernel_dispatches, m.nr_failed_dispatches
@@ -267,14 +289,14 @@ fn draw_overview(f: &mut Frame, area: Rect, m: &Metrics) {
             .fg(Color::Yellow)
             .add_modifier(Modifier::BOLD),
     ));
-    let para = Paragraph::new(items).block(block);
+    let para = Paragraph::new(Vec::from(items)).block(block);
     f.render_widget(para, area);
 }
 
 fn draw_classification(f: &mut Frame, area: Rect, m: &Metrics) {
     let total = (m.nr_interactive + m.nr_compute + m.nr_iowait + m.nr_realtime).max(1);
 
-    let items: Vec<Line> = vec![
+    let items = [
         gauge_line("Interactive", m.nr_interactive, total, Color::Green),
         gauge_line("Compute    ", m.nr_compute, total, Color::Red),
         gauge_line("I/O Wait   ", m.nr_iowait, total, Color::Blue),
@@ -290,7 +312,7 @@ fn draw_classification(f: &mut Frame, area: Rect, m: &Metrics) {
             .fg(Color::Yellow)
             .add_modifier(Modifier::BOLD),
     ));
-    let para = Paragraph::new(items).block(block);
+    let para = Paragraph::new(Vec::from(items)).block(block);
     f.render_widget(para, area);
 }
 
@@ -312,7 +334,7 @@ fn draw_ai_policy(f: &mut Frame, area: Rect, state: &DashboardState) {
         Color::Red
     };
 
-    let items: Vec<Line> = vec![
+    let items = [
         Line::from(vec![
             Span::raw("  Q-learning Reward: "),
             Span::styled(format!("{:+.4}", reward), Style::default().fg(reward_color)),
@@ -344,27 +366,28 @@ fn draw_ai_policy(f: &mut Frame, area: Rect, state: &DashboardState) {
             .fg(Color::Yellow)
             .add_modifier(Modifier::BOLD),
     ));
-    let para = Paragraph::new(items).block(block);
+    let para = Paragraph::new(Vec::from(items)).block(block);
     f.render_widget(para, area);
 }
 
 fn draw_latency_chart(f: &mut Frame, area: Rect, state: &DashboardState) {
-    let data: Vec<(f64, f64)> = state
-        .inference_hist
-        .iter_ordered()
-        .enumerate()
-        .map(|(i, v)| (i as f64, v))
-        .collect();
+    let mut data = [(0.0f64, 0.0f64); HISTORY_LEN];
+    let mut data_len = 0usize;
+    for (i, v) in state.inference_hist.iter_ordered().enumerate() {
+        data[data_len] = (i as f64, v);
+        data_len += 1;
+    }
 
     let max_y = state.inference_hist.max_or(10.0);
-    let max_x = data.len().max(1) as f64;
+    let max_x = data_len.max(1) as f64;
+    let data = &data[..data_len];
 
     let datasets = vec![Dataset::default()
         .name("Inference µs")
         .marker(symbols::Marker::Dot)
         .graph_type(GraphType::Line)
         .style(Style::default().fg(Color::Cyan))
-        .data(&data)];
+        .data(data)];
 
     let chart = Chart::new(datasets)
         .block(
@@ -402,8 +425,7 @@ fn draw_wall_of_shame(f: &mut Frame, area: Rect, entries: &[WallEntry]) {
             .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
     )]));
 
-    let mut items = vec![header];
-    for e in entries.iter().take(area.height as usize - 4) {
+    let items = std::iter::once(header).chain(entries.iter().take(area.height as usize - 4).map(|e| {
         let flag = if e.is_flagged {
             " ⚠ CHEAT"
         } else {
@@ -414,11 +436,11 @@ fn draw_wall_of_shame(f: &mut Frame, area: Rect, entries: &[WallEntry]) {
         } else {
             Color::Yellow
         };
-        items.push(ListItem::new(Line::from(vec![Span::styled(
-            format!(" {:<7} {:<20} {:.2} {}", e.pid, e.comm, e.trust, flag),
+        ListItem::new(Line::from(vec![Span::styled(
+            format!(" {:<7} {:<20} {:.2} {}", e.pid, e.comm_str(), e.trust, flag),
             Style::default().fg(color),
-        )])));
-    }
+        )]))
+    }));
 
     let list = List::new(items).block(Block::default().borders(Borders::ALL).title(Span::styled(
         " Trust Wall of Shame ",
@@ -533,7 +555,8 @@ impl Clone for DashboardState {
             inference_hist: self.inference_hist.clone(),
             reward_hist: self.reward_hist.clone(),
             throughput_hist: self.throughput_hist.clone(),
-            wall_of_shame: self.wall_of_shame.clone(),
+            wall_of_shame: self.wall_of_shame,
+            wall_len: self.wall_len,
             ai_slice_hist: self.ai_slice_hist,
             ai_slice_head: self.ai_slice_head,
             ai_slice_len: self.ai_slice_len,

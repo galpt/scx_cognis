@@ -19,4 +19,4 @@ pub use burst_predictor::BurstPredictor;
 pub use classifier::{HeuristicClassifier, TaskFeatures, TaskLabel};
 pub use cpu_selector::{CoreType, CpuSelector, CpuState};
 pub use policy::{PolicyController, SchedulerSignal};
-pub use trust::{ExitObservation, TrustTable};
+pub use trust::{ExitObservation, TrustTable, SHAME_MAX};

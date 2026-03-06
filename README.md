@@ -1,6 +1,6 @@
 # scx_cognis
 
-"Cognis" (from Latin *cognōscere*) — to learn, to know — is a Linux CPU scheduler built on the [`sched_ext`](https://www.kernel.org/doc/html/latest/scheduler/sched-ext.html) framework and [`scx_rustland_core`](https://crates.io/crates/scx_rustland_core), running entirely in user-space Rust. It combines deterministic heuristics with O(1) bitmask CPU selection, an Elman RNN burst predictor, a zero-alloc trust engine, and a tabular Q-learning policy controller — targeting a sub-10 µs per-event inference overhead. Per-PID state lives in fixed-size arrays; task queues are pre-allocated ring buffers; no heap allocation occurs during scheduling events.
+"Cognis" (from Latin *cognōscere*) — to learn, to know — is a Linux CPU scheduler built on the [`sched_ext`](https://www.kernel.org/doc/html/latest/scheduler/sched-ext.html) framework and [`scx_rustland_core`](https://crates.io/crates/scx_rustland_core), running entirely in user-space Rust. It combines deterministic heuristics with O(1) bitmask CPU selection, an Elman RNN burst predictor, a zero-alloc trust engine, and a tabular Q-learning policy controller — targeting a sub-10 µs per-event inference overhead. Per-PID state lives in fixed-size arrays; task queues use fixed-capacity `TaskQueue` FIFOs with one inline deferred slot per label, allocated once at init; no heap allocation occurs on the scheduling hot path after `Scheduler::init()` returns.
 
 ---
 
@@ -78,12 +78,12 @@
 
 ## Status
 
-Stable — all 25 unit tests pass on every commit. The scheduler builds cleanly from crates.io with no external SCM dependencies, and has been run successfully on production workloads on `sched_ext`-enabled kernels (≥ 6.12).
+Stable — all 29 unit tests pass on every commit. The scheduler builds cleanly from crates.io with no external SCM dependencies, and has been run successfully on production workloads on `sched_ext`-enabled kernels (≥ 6.12).
 
 ### Test Results
 
 ```
-running 25 tests
+running 29 tests
 test ai::burst_predictor::tests::different_pids_independent ........ ok
 test ai::burst_predictor::tests::evict_removes_state .............. ok
 test ai::burst_predictor::tests::predicts_nonzero_after_warmup .... ok
@@ -109,8 +109,12 @@ test ai::trust::tests::slice_factor_ranges ........................ ok
 test ai::trust::tests::str_to_comm_truncates_at_15 ................ ok
 test ai::trust::tests::worst_actors_finds_low_trust_entries ........ ok
 test ai::policy::tests::slice_stays_in_bounds ..................... ok
+test task_queue::tests::deferred_slot_preserves_fifo_order ........ ok
+test task_queue::tests::push_pop_fifo ............................. ok
+test task_queue::tests::second_deferred_push_is_rejected .......... ok
+test task_queue::tests::wraparound_preserves_order ................ ok
 
-test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 29 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 ```
 
 ### Tested Platforms
@@ -135,7 +139,7 @@ test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fin
 > [!TIP]
 > **What to expect from scx_cognis?**
 >
-> Cognis is designed to keep interactive threads — games, audio, desktop UI — responsive even when the rest of the system is under heavy CPU or I/O load. On every scheduling event it classifies each thread as RealTime, Interactive, IoWait, Compute, or Unknown and dispatches it to a matching priority queue: game threads and audio daemons are dequeued and run before background compilers or encoders, and they receive shorter, more frequent CPU slices (Interactive: 0.5× base, RealTime: 0.25× base) so they are never held up waiting for a CPU-bound worker to exhaust its slice. On hybrid CPUs (Intel Core Ultra, Raptor Lake), Interactive and RealTime threads are automatically routed to performance cores; Compute threads are sent to efficiency cores — no manual CPU pinning needed. A trust-based engine monitors every thread's behaviour: tasks that repeatedly burn their full slice without yielding (background miners, misbehaving workers) lose trust and are quarantined to a restricted CPU, freeing the rest of the system for responsive work.
+> Cognis is designed to keep interactive threads — games, audio, desktop UI — responsive even when the rest of the system is under heavy CPU or I/O load. On every scheduling event it classifies each thread as RealTime, Interactive, IoWait, or Compute (`Unknown` remains a reserved metrics bucket and is not emitted by the current heuristic) and dispatches it to a matching priority queue: game threads and audio daemons are dequeued and run before background compilers or encoders, and they receive shorter, more frequent CPU slices (Interactive: 0.5× base, RealTime: 0.25× base) so they are never held up waiting for a CPU-bound worker to exhaust its slice. On hybrid CPUs (Intel Core Ultra, Raptor Lake), Interactive and RealTime threads are automatically routed to performance cores; Compute threads are sent to efficiency cores — no manual CPU pinning needed. A trust-based engine monitors every thread's behaviour: tasks that repeatedly burn their full slice without yielding (background miners, misbehaving workers) lose trust and are quarantined to a restricted CPU, freeing the rest of the system for responsive work.
 >
 > Fair-share throughput for batch workloads is preserved — just not maximised. If your goal is raw CPU throughput (compilers, encoders, benchmarks), the default EEVDF scheduler wins; cognis's advantage is consistent low scheduling latency for threads that wake up, do a little work, and sleep again.
 
@@ -169,8 +173,9 @@ schedule loop →  Trust Engine flush          (staleness-based, every 1 s)
 
 #### Heuristic Task Classifier
 
-Dynamically labels each PID as `Interactive`, `Compute`, `IoWait`, `RealTime`, or `Unknown` using a
-deterministic heuristic evaluated on every `ops.enqueue` event. Six task features are tracked:
+Dynamically labels each PID as `Interactive`, `Compute`, `IoWait`, or `RealTime` using a
+deterministic heuristic evaluated on every `ops.enqueue` event. `Unknown` remains a reserved
+metrics bucket but is not produced by the current classifier. Six task features are tracked:
 
 | Feature | Description |
 |:---|:---|
@@ -610,11 +615,11 @@ Each line from `--monitor` is a snapshot of one polling interval. All counters l
 | `q:1 /0` | queued / scheduled | instant | `queued` = tasks handed by the kernel to userspace and waiting for a dispatch decision; `scheduled` = tasks that have been ordered but not yet sent back to BPF. Under normal load both stay near 0. |
 | `pf:0` | major page faults | per-interval | **Major** page faults (hard faults requiring disk I/O) inside the scheduler process per interval. Non-zero means the scheduler binary itself was partially swapped to disk — this causes real latency spikes and indicates memory pressure. Minor faults (normal anonymous-memory mapping) are intentionally excluded. Should always be **0** on a healthy system. |
 | `d→u:312` | user dispatches | per-interval | Tasks dispatched **by the Cognis userspace scheduler** in this interval. The primary work-done counter. |
-| `k:140` | kernel dispatches | per-interval | Tasks dispatched **by the kernel fallback path** (e.g. idle tasks, kthreads). A high ratio of `k` to `d→u` is normal. |
+| `k:140` | kernel dispatches | per-interval | Tasks dispatched **by the kernel fallback path** (e.g. idle tasks, kthreads). Sustained `k >> d→u` means Cognis is falling behind and the kernel is doing most of the scheduling work. |
 | `c:0` | cancel dispatches | per-interval | Dispatches cancelled before execution (task exited or migrated away). Usually 0. |
 | `b:0` | bounce dispatches | per-interval | Dispatches that had to be redirected to a different DSQ (CPU affinity conflict). Occasional bounces are fine; sustained high values suggest affinity misconfiguration. |
 | `f:0` | failed dispatches | per-interval | Dispatches that errored out entirely. Should always be **0**. |
-| `cong:0` | congestion events | per-interval | Times the scheduler's internal queue was full and had to drop or defer work. Sustained non-zero values indicate scheduler overload. |
+| `cong:0` | congestion events | per-interval | Times the scheduler's internal queue saturated and had to defer additional intake temporarily. Runnable tasks are retained locally; sustained non-zero values indicate scheduler overload. |
 | `Interactive:18` | interactive events | per-interval | Scheduling events classified as **Interactive** (latency-sensitive: games, HID, GUI). Gets a 0.5× time-slice to stay responsive. |
 | `Compute:3` | compute events | per-interval | Events classified as **Compute** (CPU-bound: compilers, encoders). Gets a 1× baseline time-slice (CPU-bound; pre-empted less often by design). |
 | `IOwait:2` | I/O-wait events | per-interval | Events classified as **I/O Wait** (blocked on disk/network most of the time). Gets a 0.75× time-slice. |
@@ -658,7 +663,7 @@ Messages are evaluated each interval in **highest-severity-first** order. The fi
 | `Several greedy tasks are throttled — keeping them from hogging your CPU.` | `quarantined > 3` | Some processes keep burning 100% of their slice; they are being rate-limited |
 | `Caught a greedy task! Putting it on a leash so other tasks can breathe.` | `quarantined > 0` | A process exceeded its slice budget; trust engine is throttling it |
 | `Oh boy! Things are getting really busy. Tightening the reins...` | `congestion > 10` per interval | High burst of work; cognis is adapting — sustained = consider tuning `--slice-us` |
-| `Getting a little crowded in here, but I've got it handled.` | `congestion > 0` | Transient queue build-up; normal under bursty load |
+| `Getting a little crowded in here, but I've got it handled.` | `congestion > 0` | Transient queue build-up; Cognis deferred intake briefly without dropping runnable work |
 | `Working hard under pressure — might get bumpy. Stay with me!` | `reward < 0` (no explicit congestion) | Latency/throughput imbalance; usually self-corrects |
 | `Your CPU is at full throttle! Giving compute tasks the runway they need.` | `load ≥ 85%`, compute-dominated | CPU-bound workload (compilation, encoding); expected behaviour |
 | `Busy but responsive! Juggling lots of interactive tasks like a pro.` | `load ≥ 85%`, interactive-dominated | Heavy desktop/gaming load; cognis is prioritising responsiveness |

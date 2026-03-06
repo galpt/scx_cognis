@@ -29,9 +29,9 @@ use bpf::*;
 
 mod ai;
 mod stats;
+mod task_queue;
 mod tui;
 
-use std::collections::VecDeque;
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::mem::MaybeUninit;
@@ -51,9 +51,10 @@ use scx_utils::UserExitInfo;
 
 use ai::{
     BurstPredictor, CoreType, CpuSelector, CpuState, ExitObservation, HeuristicClassifier,
-    PolicyController, SchedulerSignal, TaskFeatures, TaskLabel, TrustTable,
+    PolicyController, SchedulerSignal, TaskFeatures, TaskLabel, TrustTable, SHAME_MAX,
 };
 use stats::Metrics;
+use task_queue::{QueuePush, TaskQueue};
 use tui::SharedState;
 
 const SCHEDULER_NAME: &str = "Cognis";
@@ -131,12 +132,11 @@ struct Opts {
 
 // ── Task record ────────────────────────────────────────────────────────────
 
-/// A task in the user-space scheduler queue.
+/// A task in the user-space scheduler queues.
 ///
-/// Ordering: RealTime > Interactive > IoWait > Unknown > Compute (by label
-/// priority), then by earliest deadline, then by arrival timestamp.  This
-/// ensures latency-sensitive tasks always run before batch/compute work while
-/// the vtime deadline provides fairness within each priority band.
+/// Tasks are partitioned into per-label FIFO rings. `deadline` is retained for
+/// dispatch-time vtime handoff to BPF, while queue ordering stays O(1):
+/// RealTime > Interactive > IoWait > Unknown > Compute, FIFO within each band.
 #[derive(Debug, PartialEq, Eq, Clone)]
 struct Task {
     qtask: QueuedTask,
@@ -173,13 +173,12 @@ struct TaskLifetime {
 
 // ── Main Scheduler Struct ──────────────────────────────────────────────────
 
-/// Initial capacity of each per-label VecDeque task bucket.
+/// Fixed capacity of each per-label task ring.
 ///
-/// This is intentionally sized to the same order of magnitude as the upstream
-/// kernel→userspace ring buffer (`MAX_ENQUEUED_TASKS = 4096`). It is a capacity
-/// hint, not a hard cap: silently dropping runnable tasks from userspace state
-/// can strand them until the sched_ext watchdog fires.
-const QUEUE_DEPTH: usize = 4096;
+/// This is intentionally much larger than the upstream kernel→userspace ring
+/// buffer depth so the userspace side can absorb bursts without reallocating.
+/// One ring is allocated once per label at init and never grows afterwards.
+const QUEUE_DEPTH: usize = 16_384;
 
 /// Lifetime table size — must be a power of 2.  Sized to hold all concurrent
 /// PIDs on even the largest NUMA servers with comfortable headroom.
@@ -193,14 +192,14 @@ struct Scheduler<'a> {
     opts: &'a Opts,
     stats_server: StatsServer<(), Metrics>,
 
-    // Per-label task queues (priority order: RT > Interactive > IoWait > Unknown > Compute).
-    // Each bucket is pre-allocated to QUEUE_DEPTH to avoid early reallocations,
-    // but may grow further under extreme bursts rather than dropping runnable tasks.
-    rt_queue: VecDeque<Task>,
-    interactive_queue: VecDeque<Task>,
-    iowait_queue: VecDeque<Task>,
-    unknown_queue: VecDeque<Task>,
-    compute_queue: VecDeque<Task>,
+    // Per-label fixed-capacity task queues (priority order: RT > Interactive > IoWait > Unknown > Compute).
+    // Each queue has one inline deferred slot so a single saturation event can
+    // be absorbed without losing a runnable task.
+    rt_queue: TaskQueue<Task>,
+    interactive_queue: TaskQueue<Task>,
+    iowait_queue: TaskQueue<Task>,
+    unknown_queue: TaskQueue<Task>,
+    compute_queue: TaskQueue<Task>,
 
     // Time tracking.
     vruntime_now: u64,
@@ -269,16 +268,16 @@ impl<'a> Scheduler<'a> {
 
         let policy = PolicyController::new(base_slice_ns);
 
-        let mut bpf = BpfScheduler::init(
+        let mut bpf = BpfScheduler::init(BpfInitArgs {
             open_object,
-            opts.libbpf.clone().into_bpf_open_opts(),
-            opts.exit_dump_len,
-            opts.partial,
-            opts.verbose,
-            true, // built-in idle CPU selection
-            slice_ns_min,
-            "cognis",
-        )?;
+            open_opts: opts.libbpf.clone().into_bpf_open_opts(),
+            exit_dump_len: opts.exit_dump_len,
+            partial: opts.partial,
+            debug: opts.verbose,
+            builtin_idle: true,
+            slice_ns: slice_ns_min,
+            name: "cognis",
+        })?;
 
         // Build initial CPU topology from real sysfs data.
         let mut cpu_sel = CpuSelector::new();
@@ -338,11 +337,11 @@ impl<'a> Scheduler<'a> {
             bpf,
             opts,
             stats_server,
-            rt_queue: VecDeque::with_capacity(QUEUE_DEPTH),
-            interactive_queue: VecDeque::with_capacity(QUEUE_DEPTH),
-            iowait_queue: VecDeque::with_capacity(QUEUE_DEPTH),
-            unknown_queue: VecDeque::with_capacity(QUEUE_DEPTH),
-            compute_queue: VecDeque::with_capacity(QUEUE_DEPTH),
+            rt_queue: TaskQueue::with_capacity(QUEUE_DEPTH),
+            interactive_queue: TaskQueue::with_capacity(QUEUE_DEPTH),
+            iowait_queue: TaskQueue::with_capacity(QUEUE_DEPTH),
+            unknown_queue: TaskQueue::with_capacity(QUEUE_DEPTH),
+            compute_queue: TaskQueue::with_capacity(QUEUE_DEPTH),
             vruntime_now: 0,
             init_page_faults: 0,
             base_slice_ns,
@@ -506,25 +505,66 @@ impl<'a> Scheduler<'a> {
         }
     }
 
-    // ── Per-label VecDeque task queue helpers ──────────────────────────
+    // ── Per-label fixed-capacity task queue helpers ────────────────────
+
+    #[inline(always)]
+    fn queue_is_starved(front: Option<&Task>, now: u64) -> bool {
+        const STARVATION_NS: u64 = 100_000_000;
+        front.is_some_and(|t| now.saturating_sub(t.timestamp) >= STARVATION_NS)
+    }
+
+    #[inline(always)]
+    fn has_deferred_tasks(&self) -> bool {
+        self.rt_queue.has_deferred()
+            || self.interactive_queue.has_deferred()
+            || self.iowait_queue.has_deferred()
+            || self.unknown_queue.has_deferred()
+            || self.compute_queue.has_deferred()
+    }
 
     /// Route a task to the correct per-label bucket.
     ///
-    /// Correctness is more important than keeping bucket length artificially
-    /// bounded: silently dropping a runnable task here can leave it undispatched
-    /// until the sched_ext watchdog aborts the scheduler.  The BPF side already
-    /// has explicit back-pressure handling when the ring buffer is full, so the
-    /// userspace side must preserve every task it accepted.
+    /// Buckets are allocated once at scheduler init and never resized. If a
+    /// primary bucket is momentarily full, one inline deferred slot absorbs the
+    /// extra task so the scheduler never drops runnable work on local queue
+    /// saturation.
     #[inline(always)]
     fn push_task(&mut self, task: Task) {
-        let q = match task.label {
-            TaskLabel::RealTime => &mut self.rt_queue,
-            TaskLabel::Interactive => &mut self.interactive_queue,
-            TaskLabel::IoWait => &mut self.iowait_queue,
-            TaskLabel::Unknown => &mut self.unknown_queue,
-            TaskLabel::Compute => &mut self.compute_queue,
+        let label = task.label;
+        let pid = task.qtask.pid;
+        let (result, capacity) = {
+            let q = match label {
+                TaskLabel::RealTime => &mut self.rt_queue,
+                TaskLabel::Interactive => &mut self.interactive_queue,
+                TaskLabel::IoWait => &mut self.iowait_queue,
+                TaskLabel::Unknown => &mut self.unknown_queue,
+                TaskLabel::Compute => &mut self.compute_queue,
+            };
+            (q.push_back(task), q.capacity())
         };
-        q.push_back(task);
+
+        match result {
+            Ok(QueuePush::Primary) => {}
+            Ok(QueuePush::Deferred) => {
+                let congested = self.bpf.nr_sched_congested_mut();
+                *congested = congested.saturating_add(1);
+                warn!(
+                    "userspace task queue saturated for pid {} (label {:?}, capacity {}); deferred intake without dropping runnable work",
+                    pid,
+                    label,
+                    capacity
+                );
+            }
+            Err(task) => {
+                warn!(
+                    "userspace task queue invariant violated for pid {} (label {:?}, capacity {}); no free deferred slot remained",
+                    task.qtask.pid,
+                    task.label,
+                    capacity
+                );
+                debug_assert!(false, "deferred queue invariant violated");
+            }
+        }
     }
 
     /// Pop the highest-priority task available across all five buckets,
@@ -566,36 +606,18 @@ impl<'a> Scheduler<'a> {
         // Anti-starvation promotion — only reached when rt_queue is empty.
         // Buckets are scanned from lowest → highest priority so the most-starved
         // task wins when multiple buckets breach the threshold simultaneously.
-        // 100 ms = 50× safety margin below the 5 s sched_ext watchdog.
-        const STARVATION_NS: u64 = 100_000_000;
         let now = Self::now_ns();
 
-        if self
-            .compute_queue
-            .front()
-            .map_or(false, |t| now.saturating_sub(t.timestamp) >= STARVATION_NS)
-        {
+        if Self::queue_is_starved(self.compute_queue.front(), now) {
             return self.compute_queue.pop_front();
         }
-        if self
-            .unknown_queue
-            .front()
-            .map_or(false, |t| now.saturating_sub(t.timestamp) >= STARVATION_NS)
-        {
+        if Self::queue_is_starved(self.unknown_queue.front(), now) {
             return self.unknown_queue.pop_front();
         }
-        if self
-            .iowait_queue
-            .front()
-            .map_or(false, |t| now.saturating_sub(t.timestamp) >= STARVATION_NS)
-        {
+        if Self::queue_is_starved(self.iowait_queue.front(), now) {
             return self.iowait_queue.pop_front();
         }
-        if self
-            .interactive_queue
-            .front()
-            .map_or(false, |t| now.saturating_sub(t.timestamp) >= STARVATION_NS)
-        {
+        if Self::queue_is_starved(self.interactive_queue.front(), now) {
             return self.interactive_queue.pop_front();
         }
 
@@ -859,6 +881,14 @@ impl<'a> Scheduler<'a> {
         let mut drained = 0usize;
 
         while drained < max_batch {
+            // Once any queue has a deferred task, stop pulling more work from
+            // BPF until the dispatch phase folds that deferred task back into
+            // its primary FIFO. This prevents any runnable task from being
+            // removed from the kernel ring without a guaranteed local slot.
+            if self.has_deferred_tasks() {
+                break;
+            }
+
             // Never keep draining if a RealTime task is already pending in the
             // userspace queues.  This bounds enqueue-side work before the next
             // dispatch and prevents kworkers from sitting behind a long burst of
@@ -1244,20 +1274,20 @@ impl<'a> Scheduler<'a> {
         };
 
         let (actors, n_actors) = self.trust.worst_actors();
-        let shame: Vec<tui::WallEntry> = actors[..n_actors]
-            .iter()
-            .map(|e| tui::WallEntry {
-                pid: e.pid,
-                comm: e.comm_str().to_string(),
-                trust: e.trust as f64,
-                is_flagged: e.flagged,
-            })
-            .collect();
+        let mut shame = [tui::WallEntry::ZERO; SHAME_MAX];
+        for (dst, src) in shame.iter_mut().zip(actors.iter()).take(n_actors) {
+            *dst = tui::WallEntry {
+                pid: src.pid,
+                comm: src.comm,
+                trust: src.trust as f64,
+                is_flagged: src.flagged,
+            };
+        }
 
         if let Ok(mut s) = state.lock() {
             s.metrics = metrics.clone();
             s.inference_us = avg_us;
-            s.wall_of_shame = shame;
+            s.set_wall_of_shame(&shame, n_actors);
         }
     }
 
