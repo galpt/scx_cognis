@@ -425,22 +425,23 @@ fn draw_wall_of_shame(f: &mut Frame, area: Rect, entries: &[WallEntry]) {
             .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
     )]));
 
-    let items = std::iter::once(header).chain(entries.iter().take(area.height as usize - 4).map(|e| {
-        let flag = if e.is_flagged {
-            " ⚠ CHEAT"
-        } else {
-            "        "
-        };
-        let color = if e.trust < 0.2 {
-            Color::Red
-        } else {
-            Color::Yellow
-        };
-        ListItem::new(Line::from(vec![Span::styled(
-            format!(" {:<7} {:<20} {:.2} {}", e.pid, e.comm_str(), e.trust, flag),
-            Style::default().fg(color),
-        )]))
-    }));
+    let items =
+        std::iter::once(header).chain(entries.iter().take(area.height as usize - 4).map(|e| {
+            let flag = if e.is_flagged {
+                " ⚠ CHEAT"
+            } else {
+                "        "
+            };
+            let color = if e.trust < 0.2 {
+                Color::Red
+            } else {
+                Color::Yellow
+            };
+            ListItem::new(Line::from(vec![Span::styled(
+                format!(" {:<7} {:<20} {:.2} {}", e.pid, e.comm_str(), e.trust, flag),
+                Style::default().fg(color),
+            )]))
+        }));
 
     let list = List::new(items).block(Block::default().borders(Borders::ALL).title(Span::styled(
         " Trust Wall of Shame ",
