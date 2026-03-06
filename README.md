@@ -386,7 +386,7 @@ The script is opinionated about what to watch: not just `bogo ops/s`, but also f
 
 ### Reference results
 
-The checked-in benchmark notes in `benchmarks_results.md` currently record the following comparison on a Lenovo IdeaPad Gaming 3 15ARH7 running CachyOS with a `6.19.5-3-cachyos` kernel. Those notes were gathered from a `v1.3.6` benchmark run, so treat the table as a repository reference snapshot rather than a promise that every later release will reproduce the same numbers.
+The table below comes from one recorded comparison on a Lenovo IdeaPad Gaming 3 15ARH7 running CachyOS with a `6.19.5-3-cachyos` kernel. It reflects a `v1.3.6` benchmark run, so treat it as a concrete reference point for this machine and workload rather than a promise that every later release or every other system will reproduce the same numbers.
 
 | Phase | Metric | Baseline | Cognis | Delta |
 |:--|:--|--:|--:|--:|
