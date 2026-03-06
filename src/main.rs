@@ -982,7 +982,9 @@ impl<'a> Scheduler<'a> {
         // α = 0.05: smooth out per-task jitter while tracking trends over ~20 dispatches.
         self.sched_latency_ema_ns = self.sched_latency_ema_ns * 0.95 + wait_ns as f64 * 0.05;
 
-        let quarantined =
+        // Quarantine status reduces task slice (enforced in ai_classify_and_enqueue);
+        // CPU-level isolation is now delegated to the kernel via bpf.select_cpu().
+        let _quarantined =
             self.trust.is_quarantined(task.qtask.pid) || self.trust.is_flagged(task.qtask.pid);
 
         let mut dispatched = DispatchedTask::new(&task.qtask);
@@ -998,41 +1000,32 @@ impl<'a> Scheduler<'a> {
             task.deadline
         };
 
-        // CPU selection: O(1) bitmask selector, percpu_local shortcut, or fast-path.
+        // CPU selection — use the kernel-aware idle CPU query (same pattern as
+        // scx_rustland).  bpf.select_cpu() calls rs_select_cpu → pick_idle_cpu()
+        // which atomically test-and-clears the CPU's kernel idle bit.  This
+        // guarantees the returned CPU is genuinely idle right now, preventing
+        // the stale-bitmask problem where tasks are dispatched to specific CPUs
+        // that are actually still running the previous cycle's work; those tasks
+        // would sit in cpu_to_dsq(X) waiting for CPU X to call ops.dispatch,
+        // the root cause of the 5-second watchdog / runnable-task stall crashes.
         //
-        // Under full CPU saturation (perf_cri_ema > 0.85 — all runnable tasks are
-        // compute-bound) the bitmask select_cpu still runs in O(1) but we skip
-        // it entirely and let the BPF kernel's O(1) idle-CPU scan handle placement,
-        // which avoids any user-kernel round-trips when every core is occupied.
-        // The threshold floats via the perf_cri EWMA, so the selector re-engages
-        // automatically when interactive tasks return.
+        // Per-CPU tasks (percpu_local mode) and true single-CPU kworkers bypass
+        // this and go directly to their target CPU — identical to rustland.
         dispatched.cpu = if self.opts.percpu_local || task.is_kernel_worker {
             task.qtask.cpu
-        } else if self.perf_cri_ema > 0.85 {
-            RL_CPU_ANY
         } else {
-            let cpu = self.cpu_sel.select_cpu(
-                task.qtask.cpu,
-                task.label,
-                quarantined,
-                task.perf_cri_fp as f32 / 1000.0,
-            );
-            if cpu >= 0 {
-                cpu
-            } else {
-                RL_CPU_ANY
+            match self
+                .bpf
+                .select_cpu(task.qtask.pid, task.qtask.cpu, task.qtask.flags)
+            {
+                cpu if cpu >= 0 => cpu,
+                _ => RL_CPU_ANY,
             }
         };
 
         if self.bpf.dispatch_task(&dispatched).is_err() {
             self.push_task(task);
             return false;
-        }
-        // Mark the target CPU busy so the next select_cpu() call in this
-        // dispatch window won't pick the same CPU again (round-robin effect).
-        // Skipped for RL_CPU_ANY dispatches — BPF distributes those itself.
-        if dispatched.cpu >= 0 {
-            self.cpu_sel.mark_busy(dispatched.cpu);
         }
         true
     }
@@ -1217,29 +1210,14 @@ impl<'a> Scheduler<'a> {
         let drain_budget = nr_cpus.saturating_mul(4);
         self.drain_queued_tasks(drain_budget.max(1));
 
-        // 2. Batch-dispatch up to nr_cpus tasks in a single schedule() call.
+        // 2. Batch-dispatch up to 2× nr_cpus tasks in a single schedule() call.
         //
-        // Previously only ONE task was dispatched per cycle.  With 16+ workers
-        // all runnable simultaneously, the remaining 15 had to wait for the
-        // next BPF dispatch callback.  Rather than waiting, the BPF fell back
-        // to its kernel-side fallback path, producing the k >> d→u symptom
-        // (kernel dispatches >> user-space dispatches) and leaving CPUs idle.
-        //
-        // By filling the BPF dispatch list with up to nr_cpus tasks at once,
-        // every runnable CPU gets a task in a single round-trip.
-        // Reset the idle-CPU bitmask so that each dispatch window starts with
-        // all CPUs considered available.  As tasks are dispatched to specific
-        // CPUs, those CPUs are marked busy one-by-one, producing round-robin
-        // distribution across the eligible pool within each schedule() call.
-        // Without this reset, select_cpu() always returns CPU 0 (trailing_zeros
-        // of a static all_mask), pinning every task to the same CPU and causing
-        // kworker affinity stalls that trip the sched_ext watchdog.
-        self.cpu_sel.reset_idle();
-        // Dispatch up to 2× nr_cpus per cycle.  When nr_cpus tasks wake
-        // simultaneously (common under burst or compute-saturated workloads),
-        // a 1× budget forces an extra schedule() round-trip for the overflow.
-        // 2× absorbs typical burst spikes without over-committing the BPF
-        // dispatch ring, keeping all cores fed in a single pass.
+        // CPU selection now goes through bpf.select_cpu() which atomically
+        // test-and-clears the kernel idle bit, so we no longer need to maintain
+        // a userspace "idle_mask" bitmask (the old approach was the root cause
+        // of the watchdog stalls: it picked CPUs that appeared idle to Cognis
+        // but were still busy in the kernel).  The reset_idle / mark_busy calls
+        // are therefore removed; correctness is fully delegated to the kernel.
         let dispatch_budget = nr_cpus.saturating_mul(2);
         for _ in 0..dispatch_budget {
             if self.tasks_empty() {
