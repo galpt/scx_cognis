@@ -525,39 +525,48 @@ impl<'a> Scheduler<'a> {
     }
 
     /// Pop the highest-priority task available across all five buckets,
-    /// with anti-starvation promotion.
+    /// with anti-starvation promotion for lower-priority buckets.
     ///
-    /// Normal priority order: RealTime > Interactive > IoWait > Unknown > Compute.
+    /// Priority order: RealTime > Interactive > IoWait > Unknown > Compute.
     /// Within a bucket, tasks are served FIFO (insertion order).
     ///
-    /// # Anti-starvation
+    /// # Guarantee for RealTime tasks
     ///
-    /// Kernel workers (kworker/N:M, ksoftirqd/N, etc.) are force-classified
-    /// as `RealTime` in `ai_classify_and_enqueue` and therefore land in the
-    /// highest-priority bucket by construction — no starvation rescue needed
-    /// for them.
+    /// `rt_queue` is checked **unconditionally first**, before any starvation
+    /// promotion logic.  This ensures kernel workers (kworker/N:M,
+    /// ksoftirqd/N, etc.) and SCHED_FIFO/RR tasks are dispatched immediately
+    /// even under compute-saturated load where every other bucket would
+    /// otherwise continuously trigger the anti-starvation threshold.
     ///
-    /// The starvation threshold here is a defence-in-depth for user tasks
-    /// that might accumulate unexpected wait time in lower-priority buckets
-    /// under sustained high-priority load.  Any task waiting longer than
-    /// `STARVATION_NS` (100 ms = 50× below the 5 s watchdog) is promoted
-    /// immediately regardless of its label.  Buckets are scanned from
-    /// lowest to highest so the most-starved task wins when multiple
-    /// buckets breach the threshold simultaneously.
+    /// # Anti-starvation (lower-priority buckets only)
+    ///
+    /// Any user task that has waited longer than `STARVATION_NS` (100 ms —
+    /// 50× below the 5 s sched_ext watchdog) is promoted immediately.
+    /// Buckets are scanned from lowest to highest priority so the most-starved
+    /// task wins when multiple buckets breach the threshold simultaneously.
     ///
     /// Cost: one `now_ns()` vDSO call + four saturating-subtract comparisons
     /// per dispatch — O(1), < 50 ns total.
     #[inline(always)]
     fn pop_highest_priority_task(&mut self) -> Option<Task> {
-        // 100 ms — 50× safety margin below the 5 s sched_ext watchdog.
-        // Reduced from 500 ms since kernel workers are now force-classified as
-        // RealTime and should not reach lower-priority buckets.  The 100 ms
-        // threshold acts as a defence-in-depth for any unexpected user task.
+        // RealTime tasks (kernel workers, SCHED_FIFO/RR) are UNCONDITIONALLY
+        // highest priority.  They must be checked BEFORE any anti-starvation
+        // logic so that no starvation promotion for lower-priority buckets can
+        // ever delay a kworker.  Under compute-saturated load the starvation
+        // checks used to run first, continuously popping Compute tasks that
+        // had crossed the 100 ms threshold, leaving kworkers in rt_queue
+        // unserved for 5+ seconds until the kernel watchdog fired.
+        if let Some(t) = self.rt_queue.pop_front() {
+            return Some(t);
+        }
+
+        // Anti-starvation promotion — only reached when rt_queue is empty.
+        // Buckets are scanned from lowest → highest priority so the most-starved
+        // task wins when multiple buckets breach the threshold simultaneously.
+        // 100 ms = 50× safety margin below the 5 s sched_ext watchdog.
         const STARVATION_NS: u64 = 100_000_000;
         let now = Self::now_ns();
 
-        // Check buckets from lowest → highest priority so the most-starved
-        // bucket wins when multiple buckets are simultaneously over threshold.
         if self
             .compute_queue
             .front()
@@ -587,10 +596,7 @@ impl<'a> Scheduler<'a> {
             return self.interactive_queue.pop_front();
         }
 
-        // Normal priority order.
-        if let Some(t) = self.rt_queue.pop_front() {
-            return Some(t);
-        }
+        // Normal priority order for non-starved tasks.
         if let Some(t) = self.interactive_queue.pop_front() {
             return Some(t);
         }
@@ -921,7 +927,16 @@ impl<'a> Scheduler<'a> {
 
         let mut dispatched = DispatchedTask::new(&task.qtask);
         dispatched.slice_ns = task.slice_ns;
-        dispatched.vtime = task.deadline;
+        // RealTime tasks (kworkers, SCHED_FIFO/RR) get vtime = 0 so they are
+        // inserted at the front of BPF's vtime-ordered SHARED_DSQ.  Without
+        // this, a kworker with a large exec_runtime would sort *behind* regular
+        // tasks whose vtimes are near the global minimum, causing BPF-level
+        // starvation even after the Rust scheduler dispatches them first.
+        dispatched.vtime = if matches!(task.label, TaskLabel::RealTime) {
+            0
+        } else {
+            task.deadline
+        };
 
         // CPU selection: O(1) bitmask selector, percpu_local shortcut, or fast-path.
         //
