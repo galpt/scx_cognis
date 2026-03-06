@@ -4,9 +4,9 @@ Sometimes a Linux desktop feels fine right up until it doesn't. A browser starts
 
 `scx_cognis` is an experiment in pushing back on that failure mode.
 
-It is a Rust userspace scheduler built on top of `sched_ext` and `scx_rustland_core`. The current code combines a deterministic task classifier, a fixed-size trust table, a compact burst predictor, and a tabular Q-learning slice controller. The goal is not to be magical. The goal is simpler: keep interactive work responsive under pressure without turning the scheduler itself into the problem.
+It is a Rust userspace scheduler built on top of `sched_ext` and `scx_rustland_core`. Cognis combines a deterministic task classifier, a fixed-size trust table, a compact burst predictor, and a tabular Q-learning slice controller. The goal is not to be magical. The goal is simpler: keep interactive work responsive under pressure without turning the scheduler itself into the problem.
 
-That framing matters, because this repository is still exactly what its code says it is: **an attempt at an intelligent CPU scheduler**. It is stable enough to build, test, benchmark, and run on `sched_ext`-enabled systems, but it is still an implementation-driven project rather than a broadly validated production scheduler.
+That framing matters, because Cognis is still exactly what it says it is: **an attempt at an intelligent CPU scheduler**. It is stable enough to build, test, benchmark, and run on `sched_ext`-enabled systems, but it is still an implementation-driven project rather than a broadly validated production scheduler.
 
 ---
 
@@ -15,7 +15,7 @@ That framing matters, because this repository is still exactly what its code say
 - [Status](#status)
 - [Setting the Stage](#setting-the-stage)
   - [Why this project exists](#why-this-project-exists)
-  - [What the repository contains today](#what-the-repository-contains-today)
+  - [What Cognis does today](#what-cognis-does-today)
   - [Where Cognis fits among sched_ext schedulers](#where-cognis-fits-among-sched_ext-schedulers)
 - [How Cognis Works](#how-cognis-works)
   - [The hot path in one pass](#the-hot-path-in-one-pass)
@@ -49,10 +49,10 @@ That framing matters, because this repository is still exactly what its code say
 
 - Language/runtime model: Rust 2021 userspace scheduler on top of `sched_ext`
 - Core dependencies include `scx_rustland_core = 2.4.10`, `libbpf-rs = 0.26.0-beta.1`, `ratatui = 0.26`, and `crossterm = 0.27`
-- CI workflows in this repository currently cover Ubuntu, Arch Linux, and CachyOS compile/test paths
-- Unit tests in the current tree: 29
+- CI workflows currently cover Ubuntu, Arch Linux, and CachyOS compile/test paths
+- Unit tests: 29
 
-At the time of this rewrite, the README has been aligned to the code in `src/`, the current scripts in the repository root, and the current workflow files under `.github/workflows/`.
+This README describes the scheduler behavior, scripts, and workflows currently shipped with the project.
 
 ### CI coverage at a glance
 
@@ -76,9 +76,9 @@ The project exists because “throughput is fine” and “the machine still fee
 
 When a system is under mixed load, a scheduler has to make a constant stream of small choices: which task looks interactive, which one is really just chewing CPU, whether a short slice or a longer one is the better trade, and how much work the scheduler can do before it becomes overhead itself. `scx_cognis` is a hands-on attempt to make those choices explicit in userspace, where the policy is easier to inspect and change.
 
-### What the repository contains today
+### What Cognis does today
 
-Today, the scheduler in this repository does a few concrete things:
+Today, Cognis does a few concrete things:
 
 1. It classifies each scheduling event using a deterministic heuristic.
 2. It dispatches normal user tasks to the shared dispatch queue so any eligible CPU can pick them up.
@@ -94,11 +94,11 @@ One of the easiest ways to misunderstand a scheduler is to assume they are all t
 
 They are not.
 
-The reference trees bundled alongside this project make that pretty clear. Some schedulers are primarily there to teach or to provide a clean starting point. Some are trying to be highly tunable across architectures. Some are explicitly chasing interactive performance, but do most of their work in BPF. Cognis sits in a narrower lane than that.
+That is especially true in the wider `sched_ext` ecosystem. Some schedulers are primarily there to teach or to provide a clean starting point. Some are trying to be highly tunable across architectures. Some are explicitly chasing interactive performance, but do most of their work in BPF. Cognis sits in a narrower lane than that.
 
 If you want the short answer, it is this: **Cognis is for people who want an interactive-first userspace scheduler for a desktop or workstation, and who specifically want the scheduling policy to be inspectable, hackable, and opinionated rather than generic.**
 
-That puts it in a different place from several of the referenced schedulers:
+That puts it in a different place from several well-known `sched_ext` schedulers:
 
 | Scheduler | What it is trying to be | When Cognis is the better fit |
 |:--|:--|:--|
@@ -156,7 +156,7 @@ ops.select_cpu -> idle-CPU hinting in BPF, while user-task placement still goes 
 
 This is one of the most important behavioral details in the current design.
 
-Older Cognis iterations tried to dispatch user tasks toward per-CPU DSQs. The current code does not. In `dispatch_task()`, user tasks are sent to `RL_CPU_ANY`, which means the BPF side places them in the shared dispatch queue. Kernel workers and explicit `--percpu-local` tasks are the main exceptions.
+Older Cognis iterations tried to dispatch user tasks toward per-CPU DSQs. The current scheduler does not. In `dispatch_task()`, user tasks are sent to `RL_CPU_ANY`, which means the BPF side places them in the shared dispatch queue. Kernel workers and explicit `--percpu-local` tasks are the main exceptions.
 
 That choice is there for a reason. The comments in `src/main.rs` document the failure mode plainly: pinning userspace-managed work to a CPU-specific DSQ could interact badly with the userspace scheduler thread itself and lead to stalls serious enough to trip the `sched_ext` watchdog. Sending regular user work through the shared queue avoids that class of stall by letting any available CPU drain it.
 
@@ -248,7 +248,7 @@ The TUI exits on `q` or `Esc`.
 <p align="center">
 	<img src="https://github.com/galpt/scx_cognis/blob/main/img/cognis-ratatui.png" alt="scx_cognis TUI" style="max-width:100%;height:auto;" />
 	<br/>
-	<em>The current ratatui dashboard shipped by this repository.</em>
+  <em>The current ratatui dashboard shipped with Cognis.</em>
 </p>
 
 [↑ Back to Table of Contents](#table-of-contents)
@@ -262,7 +262,7 @@ The TUI exits on `q` or `Esc`.
 To run the scheduler itself, you need:
 
 - Linux with `sched_ext` support enabled
-- in practice, this repository currently documents kernel support as `>= 6.12`
+- in practice, Cognis currently targets kernels with `sched_ext` support at `>= 6.12`
 - a toolchain capable of building the Rust and BPF pieces
 
 For a source build, the repository scripts and workflows currently assume packages in the `clang`/`llvm`, `libbpf`, `libelf`, `zlib`, `libseccomp`, and `pkg-config` family.
@@ -313,7 +313,7 @@ If the scheduler is already running and exporting stats, you can watch it with:
 scx_cognis --monitor 1.0
 ```
 
-The installer and service configuration in this repository are set up so that, when installed through the provided service flow, the stats socket at `/run/scx/root/stats` is intended to be reachable by non-root users.
+The installer and service configuration are set up so that, when installed through the provided service flow, the stats socket at `/run/scx/root/stats` is intended to be reachable by non-root users.
 
 ### Selected command-line options
 
@@ -340,7 +340,7 @@ The current CLI in `src/main.rs` includes these user-facing options:
 
 ### Using install.sh
 
-The repository ships a root-level installer script in [install.sh](install.sh).
+The project ships a root-level installer script in [install.sh](install.sh).
 
 In its current form, that script can:
 
@@ -397,7 +397,7 @@ sudo sh uninstall.sh --force
 
 - **CachyOS / Arch**: the installer will try to use `scx-manager` when appropriate, and otherwise falls back to writing the needed service file itself.
 - **Ubuntu / Debian**: the installer writes a service file if one is not already present.
-- **Other systemd-based distributions**: the installer may still work, but the generic path is less opinionated and less tested by the scripts in this repository.
+- **Other systemd-based distributions**: the installer may still work, but the generic path is less opinionated and less tested than the distro-specific paths above.
 
 [↑ Back to Table of Contents](#table-of-contents)
 
@@ -437,7 +437,7 @@ The table below comes from one recorded comparison on a Lenovo IdeaPad Gaming 3 
 | Mixed VM | bogo ops/s (real) | 24,555.34 | 24,566.91 | +0.0% |
 | Mixed VM | bogo ops/s (usr) | 14,789.09 | 14,021.45 | -5.2% |
 
-The repository also includes the two comparison screenshots used in the benchmark section:
+The two screenshots below show the comparison used in this benchmark section:
 
 <p align="center">
 	<img src="https://github.com/galpt/scx_cognis/blob/main/img/baseline-cpu-usage.png" alt="Benchmark baseline CPU usage" style="max-width:100%;height:auto;" />
@@ -455,7 +455,7 @@ The repository also includes the two comparison screenshots used in the benchmar
 
 The useful point of the benchmark is not “Cognis always produces a larger benchmark number.” The more honest reading is narrower than that.
 
-On the recorded reference machine, the benchmark script's latest checked-in numbers stayed close to baseline while Cognis was tuned for responsiveness-first behavior. That is encouraging, but it is still only one machine, one governor configuration, and one set of runs.
+On the recorded reference machine, the numbers above stayed close to baseline while Cognis was tuned for responsiveness-first behavior. That is encouraging, but it is still only one machine, one governor configuration, and one set of runs.
 
 If you want numbers you can trust on your own hardware, keep the governor fixed, run both modes multiple times, and compare medians. Then watch the Aquarium while you do it. The whole project makes a lot more sense when you look at throughput and interaction quality at the same time.
 
@@ -465,13 +465,13 @@ If you want numbers you can trust on your own hardware, keep the governor fixed,
 
 ## Limitations
 
-The current code is capable, but it is not shy about its limits.
+The scheduler is capable, but it is not shy about its limits.
 
 - The burst predictor uses fixed compile-time weights rather than online learning.
 - The Q-learning controller is deliberately small and bounded; it is a practical policy knob, not a grand adaptive intelligence layer.
 - Runtime behavior still depends heavily on kernel version, workload shape, CPU topology, and how `sched_ext` behaves on the target machine.
 - CI can prove build/test health, but not real `sched_ext` runtime behavior.
-- Some benchmark and policy conclusions in this repository are still best read as evidence about the current implementation, not as universal scheduler laws.
+- Some benchmark and policy conclusions in this README are still best read as evidence about the current implementation, not as universal scheduler laws.
 
 [↑ Back to Table of Contents](#table-of-contents)
 
