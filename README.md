@@ -16,6 +16,7 @@ That framing matters, because this repository is still exactly what its code say
 - [Setting the Stage](#setting-the-stage)
   - [Why this project exists](#why-this-project-exists)
   - [What the repository contains today](#what-the-repository-contains-today)
+  - [Where Cognis fits among sched_ext schedulers](#where-cognis-fits-among-sched_ext-schedulers)
 - [How Cognis Works](#how-cognis-works)
   - [The hot path in one pass](#the-hot-path-in-one-pass)
   - [Why user tasks go through SHARED_DSQ](#why-user-tasks-go-through-shared_dsq)
@@ -86,6 +87,43 @@ Today, the scheduler in this repository does a few concrete things:
 5. It exports live metrics and can render them in a terminal dashboard.
 
 Just as important are the things it does **not** currently do. It does not claim to be a general replacement for the kernel default on every machine. It does not train models online. It does not hide that some of its policy choices are still implementation-specific and benchmark-driven.
+
+### Where Cognis fits among sched_ext schedulers
+
+One of the easiest ways to misunderstand a scheduler is to assume they are all trying to win the same contest.
+
+They are not.
+
+The reference trees bundled alongside this project make that pretty clear. Some schedulers are primarily there to teach or to provide a clean starting point. Some are trying to be highly tunable across architectures. Some are explicitly chasing interactive performance, but do most of their work in BPF. Cognis sits in a narrower lane than that.
+
+If you want the short answer, it is this: **Cognis is for people who want an interactive-first userspace scheduler for a desktop or workstation, and who specifically want the scheduling policy to be inspectable, hackable, and opinionated rather than generic.**
+
+That puts it in a different place from several of the referenced schedulers:
+
+| Scheduler | What it is trying to be | When Cognis is the better fit |
+|:--|:--|:--|
+| `scx_rust_scheduler` | A basic FIFO Rust scheduler template built to help developers learn and experiment | Choose Cognis if you want an actual interactive-first policy with classification, trust tracking, adaptive slices, monitoring, and a TUI rather than a minimal starting point |
+| `scx_rustland` | A readable all-Rust userspace scheduler that prioritizes interactive workloads and doubles as a template | Choose Cognis if you want to stay in the same userspace-Rust family but want a more opinionated desktop/workstation policy with per-event labels, trust-based throttling, burst prediction, and richer observability |
+| `scx_bpfland` | An interactive-first scheduler similar in spirit to Rustland, but with the scheduling policy pushed fully into BPF for production use | Choose Cognis if you care more about policy readability and rapid userspace iteration than about moving as much of the scheduler as possible into BPF |
+| `scx_lavd` | A latency-criticality-aware scheduler aimed at interactive workloads like gaming while still targeting high throughput and low tail latency | Choose Cognis if you want a smaller, easier-to-reason-about userspace policy that is explicitly experimental and easier to modify than a more production-oriented BPF-first design |
+| `scx_rusty` | A flexible multi-domain hybrid scheduler that can be tuned across architectures and workloads | Choose Cognis if your problem is not “I need a broadly tunable topology-aware scheduler,” but “my desktop should stay responsive while mixed background work is happening” |
+| `scx_layered` | A highly configurable scheduler for layer-based policies, service isolation, cgroup-driven CPU allocation, and workload-specific tuning | Choose Cognis if you do not want to design layer configs and CPU allocation policies, and instead want one built-in policy focused on interactive desktop responsiveness |
+
+That leads to a practical rule of thumb.
+
+Reach for Cognis when your workload looks like this:
+
+- gaming while builds, VMs, or stress workloads are active
+- desktop interaction under mixed CPU and I/O pressure
+- browser, compositor, audio, streaming, and shell activity competing with background compute
+- experimentation where you want to change policy logic in Rust without dropping down into a larger BPF-first scheduler design
+
+Cognis is probably **not** what you are looking for when your workload looks like this:
+
+- you want the smallest possible starter scheduler to learn `sched_ext`
+- you need a more clearly production-oriented scheduler from the main `scx` tree
+- you need topology-heavy tuning across LLC, NUMA, or service layers
+- you want a scheduler whose primary value is broad configurability rather than a built-in desktop/workstation policy
 
 [↑ Back to Table of Contents](#table-of-contents)
 
