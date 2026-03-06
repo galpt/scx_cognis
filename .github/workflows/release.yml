@@ -88,6 +88,9 @@ jobs:
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
 
+      - name: Update scx_rustland_core to latest compatible version
+        run: cargo update -p scx_rustland_core
+
       - name: cargo test
         run: cargo test --all -- --nocapture
 
@@ -111,6 +114,9 @@ jobs:
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Update scx_rustland_core to latest compatible version
+        run: cargo update -p scx_rustland_core
+
       - name: cargo check
         run: cargo check --all
 
@@ -133,6 +139,9 @@ jobs:
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Update scx_rustland_core to latest compatible version
+        run: cargo update -p scx_rustland_core
 
       - name: cargo check
         run: cargo check --all
@@ -176,6 +185,10 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
           key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-release-
+
+      - name: Update scx_rustland_core to latest compatible version
+        run: cargo update -p scx_rustland_core
 
       - name: Patch and commit Cargo.toml version
         run: |

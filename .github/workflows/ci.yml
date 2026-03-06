@@ -54,6 +54,10 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
           key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-test-
+
+      - name: Update scx_rustland_core to latest compatible version
+        run: cargo update -p scx_rustland_core
 
       - name: cargo test
         run: cargo test --all -- --nocapture
@@ -86,6 +90,10 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
           key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-release-
+
+      - name: Update scx_rustland_core to latest compatible version
+        run: cargo update -p scx_rustland_core
 
       - name: cargo build --release
         run: cargo build --release

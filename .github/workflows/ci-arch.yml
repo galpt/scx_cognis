@@ -39,5 +39,8 @@ jobs:
           key: arch-cargo-check-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: arch-cargo-check-
 
+      - name: Update scx_rustland_core to latest compatible version
+        run: cargo update -p scx_rustland_core
+
       - name: cargo check
         run: cargo check --all
