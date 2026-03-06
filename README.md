@@ -46,7 +46,6 @@ That framing matters, because this repository is still exactly what its code say
 
 ## Status
 
-- Current crate version: `1.3.7`
 - Language/runtime model: Rust 2021 userspace scheduler on top of `sched_ext`
 - Core dependencies include `scx_rustland_core = 2.4.10`, `libbpf-rs = 0.26.0-beta.1`, `ratatui = 0.26`, and `crossterm = 0.27`
 - CI workflows in this repository currently cover Ubuntu, Arch Linux, and CachyOS compile/test paths
@@ -192,7 +191,7 @@ The repository currently exposes metrics through `scx_stats` and formats them in
 The line format starts like this:
 
 ```text
-[cognis v1.3.7] tldr: ... | r:... | q:... | pf:... | d→u:... k:... c:... b:... f:... | cong:... | 🧠 Interactive:... Compute:... IOwait:... RT:... Unknown:... | quarantine:... flagged:... | slice:...µs reward:...
+[cognis vx.y.z] tldr: ... | r:... | q:... | pf:... | d→u:... k:... c:... b:... f:... | cong:... | 🧠 Interactive:... Compute:... IOwait:... RT:... Unknown:... | quarantine:... flagged:... | slice:...µs reward:...
 ```
 
 The `tldr` message is not free-form prose; it comes from a fixed set of status messages selected from current metrics such as page faults, failures, congestion, load, label mix, and reward EMA.
@@ -387,7 +386,7 @@ The script is opinionated about what to watch: not just `bogo ops/s`, but also f
 
 ### Reference results
 
-The checked-in benchmark notes in `benchmarks_results.md` currently record the following comparison on a Lenovo IdeaPad Gaming 3 15ARH7 running CachyOS with a `6.19.5-3-cachyos` kernel. Those notes were gathered from a `v1.3.6` benchmark run; the current crate version is now `1.3.7`, so treat the table as a repository reference snapshot rather than a promise that every `1.3.7` machine will reproduce the same numbers.
+The checked-in benchmark notes in `benchmarks_results.md` currently record the following comparison on a Lenovo IdeaPad Gaming 3 15ARH7 running CachyOS with a `6.19.5-3-cachyos` kernel. Those notes were gathered from a `v1.3.6` benchmark run, so treat the table as a repository reference snapshot rather than a promise that every later release will reproduce the same numbers.
 
 | Phase | Metric | Baseline | Cognis | Delta |
 |:--|:--|--:|--:|--:|
