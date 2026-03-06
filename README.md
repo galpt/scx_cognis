@@ -2,8 +2,6 @@
 
 "Cognis" (from Latin *cognōscere* — to learn, to know) is a `sched_ext` userspace CPU scheduler written in Rust. It combines deterministic task classification, an O(1) CPU selector, a fixed-weight Elman RNN burst predictor, a trust engine, and a tabular Q-learning slice controller while keeping the hot path bounded and allocation-free after initialisation.
 
-Build/test clean — all 29 unit tests pass, and the current tree passes `cargo check`, `cargo test`, `cargo clippy --all-targets -- -D warnings`, and `cargo fmt --check`. Runtime behaviour on `sched_ext`-enabled kernels is still being hardened, so throughput and cold-start behaviour should still be validated on your own hardware before relying on it for production workloads.
-
 ---
 
 ## Table of Contents
