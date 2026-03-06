@@ -40,8 +40,7 @@ jobs:
           key: cachyos-cargo-check-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: cachyos-cargo-check-
 
-      - name: Update scx_rustland_core to latest compatible version
-        run: cargo update -p scx_rustland_core
+
 
       - name: cargo check
         run: cargo check --all
