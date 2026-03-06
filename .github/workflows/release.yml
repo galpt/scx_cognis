@@ -88,9 +88,6 @@ jobs:
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
 
-      - name: Update scx_rustland_core to latest compatible version
-        run: cargo update -p scx_rustland_core
-
       - name: cargo test
         run: cargo test --all -- --nocapture
 
@@ -114,13 +111,10 @@ jobs:
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Update scx_rustland_core to latest compatible version
-        run: cargo update -p scx_rustland_core
-
       - name: cargo check
         run: cargo check --all
 
-  # ──────────────────────────────────────────────────────────────────────────
+  # ────────────────────────────────────────────────────────────────────────
   # CI: compile-check on CachyOS
   # ──────────────────────────────────────────────────────────────────────────
   ci-cachyos:
@@ -140,13 +134,10 @@ jobs:
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Update scx_rustland_core to latest compatible version
-        run: cargo update -p scx_rustland_core
-
       - name: cargo check
         run: cargo check --all
 
-  # ──────────────────────────────────────────────────────────────────────────
+  # ────────────────────────────────────────────────────────────────────────
   # Release: build, tag, and publish (only if all CI jobs pass)
   # ──────────────────────────────────────────────────────────────────────────
   release:
@@ -186,9 +177,6 @@ jobs:
             ~/.cargo/git
           key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-release-
-
-      - name: Update scx_rustland_core to latest compatible version
-        run: cargo update -p scx_rustland_core
 
       - name: Patch and commit Cargo.toml version
         run: |
