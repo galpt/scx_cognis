@@ -847,13 +847,13 @@ impl<'a> Scheduler<'a> {
                 break;
             }
 
-            // Never keep draining if a RealTime task is already pending in the
-            // userspace queues.  This bounds enqueue-side work before the next
-            // dispatch and prevents kworkers from sitting behind a long burst of
-            // compute-task classification/bookkeeping.
-            if !self.rt_queue.is_empty() {
-                break;
-            }
+            // NOTE: the two early-break guards that existed here previously
+            // ("stop if rt_queue non-empty" and "break on first RT task")
+            // were removed because they caused a slow-drain loop of 1 task
+            // per schedule() call under SCHED_FIFO load.  Priority ordering
+            // is maintained by pop_highest_priority_task() in the dispatch
+            // phase, which always dequeues RT tasks first regardless of drain
+            // order.
 
             match self.bpf.dequeue_task() {
                 Ok(Some(mut task)) => {
@@ -896,13 +896,6 @@ impl<'a> Scheduler<'a> {
                     });
 
                     drained += 1;
-
-                    // Stop immediately once a freshly dequeued task lands in
-                    // the RT bucket so schedule() can dispatch it in this same
-                    // cycle with minimal additional userspace latency.
-                    if matches!(label, TaskLabel::RealTime) {
-                        break;
-                    }
                 }
                 Ok(None) => break,
                 Err(err) => {
@@ -1144,31 +1137,35 @@ impl<'a> Scheduler<'a> {
     fn schedule(&mut self) {
         // 1. Drain queued tasks in a bounded batch.
         //
-        // Draining until the ring buffer is empty can delay dispatch for too
-        // long under sustained wakeup storms: the scheduler keeps classifying
-        // and bookkeeping new tasks instead of getting already-queued RT work
-        // onto a CPU.  Bound the dequeue batch so each schedule() call reaches
-        // the dispatch phase quickly, and let usersched_has_pending_tasks() in
-        // BPF trigger the next round if the ring buffer still contains work.
-        //
-        // 4× nr_cpus is enough to absorb normal bursts while keeping the worst
-        // case enqueue-side latency well below the watchdog budget.
+        // Bound the batch so each schedule() call reaches the dispatch phase
+        // quickly. 4× nr_cpus is enough to absorb normal bursts; any tasks
+        // left in the BPF ring buffer trigger a re-invocation via
+        // usersched_has_pending_tasks() automatically.
         let nr_cpus = (*self.bpf.nr_online_cpus_mut()).max(1) as usize;
-        let drain_budget = nr_cpus.saturating_mul(4);
-        self.drain_queued_tasks(drain_budget.max(1));
+        let drain_budget = nr_cpus.saturating_mul(4).max(16);
+        self.drain_queued_tasks(drain_budget);
 
-        // 2. Batch-dispatch up to 2× nr_cpus tasks in a single schedule() call.
+        // 2. Dispatch ALL queued tasks — no per-cycle cap.
         //
-        // All user tasks go to SHARED_DSQ (RL_CPU_ANY) so any of the N-1 CPUs that did
-        // not pick up the scheduler from SCHED_DSQ can consume them.  Per-CPU DSQs are
-        // only used for kernel workers (affinity-pinned) and --percpu-local mode.
-        // No userspace idle bitmask is maintained; the BPF idle-kick from kick_task_cpu
-        // ensures a sleeping CPU wakes up promptly to drain SHARED_DSQ.
-        let dispatch_budget = nr_cpus.saturating_mul(2);
-        for _ in 0..dispatch_budget {
-            if self.tasks_empty() {
-                break;
-            }
+        // This is the critical fix for runnable-task stall crashes:
+        //
+        //   notify_complete(N > 0) sets nr_scheduled > 0, which makes
+        //   usersched_has_pending_tasks() return true in BPF.  ops.dispatch
+        //   then prioritises running the cognis kthread (SCHED_DSQ) over
+        //   cpu_to_dsq(X) on every CPU X.  Kworkers dispatched by BPF to
+        //   cpu_to_dsq(X) — the CPU currently hosting cognis — can only be
+        //   consumed once that CPU stops picking cognis from SCHED_DSQ; if
+        //   nr_scheduled stays > 0 for 5+ seconds the sched_ext watchdog fires.
+        //
+        //   By dispatching every internally-queued task before returning,
+        //   tasks_len() == 0 → notify_complete(0) → nr_scheduled = 0 →
+        //   usersched_has_pending_tasks() returns false → every CPU's
+        //   ops.dispatch falls through to its local per-CPU DSQ and drains
+        //   kworkers normally.
+        //
+        // All user tasks go to SHARED_DSQ (RL_CPU_ANY); dispatch order is
+        // maintained by pop_highest_priority_task() (RT first).
+        while !self.tasks_empty() {
             if !self.dispatch_task() {
                 break;
             }

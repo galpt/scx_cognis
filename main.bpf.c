@@ -497,10 +497,16 @@ static void dispatch_task(const struct dispatched_task_ctx *task)
 	/*
 	 * Dispatch task to the shared DSQ if the user-space scheduler
 	 * didn't select any specific target CPU.
+	 *
+	 * Count these as user dispatches: every cognis-dispatched user task
+	 * uses RL_CPU_ANY, so omitting the counter here caused d→u to
+	 * always read 0 in --monitor output even when the scheduler was
+	 * working correctly.
 	 */
 	if (task->cpu == RL_CPU_ANY) {
 		scx_bpf_dsq_insert_vtime(p, SHARED_DSQ,
 					 task->slice_ns, task->vtime, task->flags);
+		__sync_fetch_and_add(&nr_user_dispatches, 1);
 		kick_task_cpu(p, prev_cpu);
 		goto out_release;
 	}
