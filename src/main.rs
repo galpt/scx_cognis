@@ -173,9 +173,13 @@ struct TaskLifetime {
 
 // ── Main Scheduler Struct ──────────────────────────────────────────────────
 
-/// Maximum depth of each per-label VecDeque task bucket.
-/// Allocated with_capacity() once at init; no growth happens after that.
-const QUEUE_DEPTH: usize = 512;
+/// Initial capacity of each per-label VecDeque task bucket.
+///
+/// This is intentionally sized to the same order of magnitude as the upstream
+/// kernel→userspace ring buffer (`MAX_ENQUEUED_TASKS = 4096`). It is a capacity
+/// hint, not a hard cap: silently dropping runnable tasks from userspace state
+/// can strand them until the sched_ext watchdog fires.
+const QUEUE_DEPTH: usize = 4096;
 
 /// Lifetime table size — must be a power of 2.  Sized to hold all concurrent
 /// PIDs on even the largest NUMA servers with comfortable headroom.
@@ -190,7 +194,8 @@ struct Scheduler<'a> {
     stats_server: StatsServer<(), Metrics>,
 
     // Per-label task queues (priority order: RT > Interactive > IoWait > Unknown > Compute).
-    // Each bucket is pre-allocated to QUEUE_DEPTH and never grows after init.
+    // Each bucket is pre-allocated to QUEUE_DEPTH to avoid early reallocations,
+    // but may grow further under extreme bursts rather than dropping runnable tasks.
     rt_queue: VecDeque<Task>,
     interactive_queue: VecDeque<Task>,
     iowait_queue: VecDeque<Task>,
@@ -505,10 +510,11 @@ impl<'a> Scheduler<'a> {
 
     /// Route a task to the correct per-label bucket.
     ///
-    /// If the bucket is full (len == QUEUE_DEPTH), the oldest (front) task
-    /// is silently dropped to make room — this is a back-pressure signal
-    /// that the system is overloaded and very old tasks have missed their
-    /// deadline anyway.
+    /// Correctness is more important than keeping bucket length artificially
+    /// bounded: silently dropping a runnable task here can leave it undispatched
+    /// until the sched_ext watchdog aborts the scheduler.  The BPF side already
+    /// has explicit back-pressure handling when the ring buffer is full, so the
+    /// userspace side must preserve every task it accepted.
     #[inline(always)]
     fn push_task(&mut self, task: Task) {
         let q = match task.label {
@@ -518,9 +524,6 @@ impl<'a> Scheduler<'a> {
             TaskLabel::Unknown => &mut self.unknown_queue,
             TaskLabel::Compute => &mut self.compute_queue,
         };
-        if q.len() >= QUEUE_DEPTH {
-            q.pop_front(); // drop oldest under back-pressure
-        }
         q.push_back(task);
     }
 
@@ -852,8 +855,18 @@ impl<'a> Scheduler<'a> {
 
     // ── Drain queued tasks (runs scheduling pipeline per task) ──────────────
 
-    fn drain_queued_tasks(&mut self) {
-        loop {
+    fn drain_queued_tasks(&mut self, max_batch: usize) {
+        let mut drained = 0usize;
+
+        while drained < max_batch {
+            // Never keep draining if a RealTime task is already pending in the
+            // userspace queues.  This bounds enqueue-side work before the next
+            // dispatch and prevents kworkers from sitting behind a long burst of
+            // compute-task classification/bookkeeping.
+            if !self.rt_queue.is_empty() {
+                break;
+            }
+
             match self.bpf.dequeue_task() {
                 Ok(Some(mut task)) => {
                     let (deadline, slice_ns, label, perf_cri, features) =
@@ -898,6 +911,15 @@ impl<'a> Scheduler<'a> {
                         perf_cri_fp: (perf_cri * 1000.0).clamp(0.0, 1000.0) as u16,
                         qtask: task,
                     });
+
+                    drained += 1;
+
+                    // Stop immediately once a freshly dequeued task lands in
+                    // the RT bucket so schedule() can dispatch it in this same
+                    // cycle with minimal additional userspace latency.
+                    if matches!(label, TaskLabel::RealTime) {
+                        break;
+                    }
                 }
                 Ok(None) => break,
                 Err(err) => {
@@ -1142,8 +1164,20 @@ impl<'a> Scheduler<'a> {
     // ── Main scheduling loop ───────────────────────────────────────────────
 
     fn schedule(&mut self) {
-        // 1. Drain queued tasks (heuristic classify + enqueue).
-        self.drain_queued_tasks();
+        // 1. Drain queued tasks in a bounded batch.
+        //
+        // Draining until the ring buffer is empty can delay dispatch for too
+        // long under sustained wakeup storms: the scheduler keeps classifying
+        // and bookkeeping new tasks instead of getting already-queued RT work
+        // onto a CPU.  Bound the dequeue batch so each schedule() call reaches
+        // the dispatch phase quickly, and let usersched_has_pending_tasks() in
+        // BPF trigger the next round if the ring buffer still contains work.
+        //
+        // 4× nr_cpus is enough to absorb normal bursts while keeping the worst
+        // case enqueue-side latency well below the watchdog budget.
+        let nr_cpus = (*self.bpf.nr_online_cpus_mut()).max(1) as usize;
+        let drain_budget = nr_cpus.saturating_mul(4);
+        self.drain_queued_tasks(drain_budget.max(1));
 
         // 2. Batch-dispatch up to nr_cpus tasks in a single schedule() call.
         //
@@ -1155,7 +1189,6 @@ impl<'a> Scheduler<'a> {
         //
         // By filling the BPF dispatch list with up to nr_cpus tasks at once,
         // every runnable CPU gets a task in a single round-trip.
-        let nr_cpus = (*self.bpf.nr_online_cpus_mut()).max(1) as usize;
         // Reset the idle-CPU bitmask so that each dispatch window starts with
         // all CPUs considered available.  As tasks are dispatched to specific
         // CPUs, those CPUs are marked busy one-by-one, producing round-robin
