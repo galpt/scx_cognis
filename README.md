@@ -1,42 +1,32 @@
 # scx_cognis
 
-Build/test clean — all 29 unit tests pass on every commit. The scheduler builds cleanly from crates.io with no external SCM dependencies. Runtime behaviour on `sched_ext`-enabled kernels is still being hardened, so synthetic benchmark throughput and cold-start behaviour should be validated on your own hardware before relying on it for production workloads.
+"Cognis" (from Latin *cognōscere* — to learn, to know) is a `sched_ext` userspace CPU scheduler written in Rust. It combines deterministic task classification, an O(1) CPU selector, a fixed-weight Elman RNN burst predictor, a trust engine, and a tabular Q-learning slice controller while keeping the hot path bounded and allocation-free after initialisation.
+
+Build/test clean — all 29 unit tests pass, and the current tree passes `cargo check`, `cargo test`, `cargo clippy --all-targets -- -D warnings`, and `cargo fmt --check`. Runtime behaviour on `sched_ext`-enabled kernels is still being hardened, so throughput and cold-start behaviour should still be validated on your own hardware before relying on it for production workloads.
 
 ---
 
-Predicts each PID's next CPU burst duration using a compact Elman RNN: $`H = 4`$ hidden units, $`X = 3`$ inputs (`burst_norm`, `exec_ratio`, `cpu_intensity`). The architecture is a standard single-layer Elman RNN ($`h_t = \tanh(W_h \cdot h_{t-1} + W_x \cdot x_t + b)`$); weights are compile-time constants derived from offline analysis of synthetic scheduler traces and have not yet been validated across broad real-world workloads. The forward pass runs in $`O(H \cdot X) = O(12)`$ multiplications with per-PID hidden state stored in a zero-alloc fixed open-addressing table (`[RnnState; 4096]`).
 ## Table of Contents
-clamped to $`[-1.0,\ +1.0]`$, where `interactive_frac` and `compute_frac` are derived from the scheduler's observed classification counters and `load_norm` is CPU utilisation (0–1). This produces a meaningful gradient: the policy learns to **shrink** when Compute activity dominates (low `interactive_frac`) and **keep/grow** only when Interactive work is being served well.
+
 - [Status](#status)
-| `v1.1.8` (header) | version | static | Scheduler version embedded in every monitor line, matching the binary you are running. Identical to the output of `scx_cognis --version`. |
   - [Test Results](#test-results)
-| `Unknown:1` | reserved bucket | per-interval | Reserved metrics bucket. The current heuristic does not emit `Unknown`, so this should normally stay at 0. |
   - [Tested Platforms](#tested-platforms)
-| `reward:0.42` | reward EMA | instant | Exponential moving average of the scheduler's **reward function**: $`R = (\text{interactive\_frac} \times \text{load\_norm}) \times 0.7 - \text{congestion} \times 0.2 - \text{latency} \times 0.1`$. Values near $`1.0`$ are ideal (Interactive tasks served under load); values near $`0`$ mean the workload is mostly compute-heavy or lightly loaded; negative values indicate sustained congestion and/or latency pressure. |
 - [Features](#features)
-The easiest way to evaluate scx_cognis is to run a stress workload while the browser renders a heavy WebGL scene. `cognis_benchmark.sh` automates this for you. The raw `stress-ng` numbers below are taken from [benchmarks_results.md](../benchmarks_results.md) and should be read together with the subjective browser-responsiveness check.
- **Potentially much lower raw `bogo ops/s (real time)` for CPU-bound phases** — the current implementation can trade a large amount of synthetic benchmark throughput for responsiveness.
+  - [Pipeline Overview](#pipeline-overview)
+  - [Component Details](#component-details)
+    - [Heuristic Task Classifier](#heuristic-task-classifier)
     - [O(1) CPU Selector](#o1-cpu-selector)
     - [Elman RNN Burst Predictor](#elman-rnn-burst-predictor)
     - [Trust Engine](#trust-engine)
     - [Q-learning Policy Controller](#q-learning-policy-controller)
-| bogo ops/s (real time) | 22,024.86 | 11,019.19 | −50.0% |
-| bogo ops/s (usr time) | 1,403.81 | 1,826.00 | +30.1% |
-This recorded run shows a substantial real-time throughput penalty under a pure CPU workload, while `usr time` improved moderately.
+    - [ratatui TUI Dashboard](#ratatui-tui-dashboard)
 - [Design Notes](#design-notes)
   - [Architecture](#architecture)
-| bogo ops/s (real time) | 184,206.49 | 92,322.96 | −49.9% |
-| bogo ops/s (usr time) | 42,681.43 | 43,098.01 | +1.0% |
-In this recorded run the `iomix` real-time throughput dropped sharply, while `usr time` stayed near baseline. That combination indicates materially longer wall-clock completion under the current scheduler despite similar CPU time spent in userspace.
   - [Latency Budget](#latency-budget)
   - [Scheduler Fail-Safe](#scheduler-fail-safe)
   - [Reward Function](#reward-function)
   - [Time-Slice Calculation](#time-slice-calculation)
-| CPU ×16 | bogo ops/s (real) | 19,662.59 | 11,780.62 | −40.1% |
-| CPU ×16 | bogo ops/s (usr) | 1,421.03 | 1,739.32 | +22.4% |
-| VM ×2 | bogo ops/s (real) | 24,569.98 | 24,469.50 | −0.4% |
-| VM ×2 | bogo ops/s (usr) | 14,019.12 | 22,904.19 | +63.4% |
-The mixed phase still shows a meaningful CPU-throughput penalty, but the VM stressor stayed near baseline in real-time throughput while improving in `usr time` on this run.
+- [Requirements](#requirements)
   - [Kernel Requirements](#kernel-requirements)
   - [Rust Toolchain](#rust-toolchain)
   - [System Libraries](#system-libraries)
@@ -1070,7 +1060,7 @@ If the `reward` value stays low (near 0) during CPU-heavy phases, this is normal
 > 500 fish (default Aquarium), 60 s per phase, `stress-ng` workload. CPU governor left at system default (`powersave`) for both runs.
 >
 > **Context:**
-> These numbers reflect the current implementation recorded in [benchmarks_results.md](benchmarks_results.md). The real-time throughput gap for CPU-bound phases is expected and by design — scx_cognis pre-empts compute workers more frequently to keep interactive tasks (browser compositor, input handling) responsive. The `usr time` metric, which measures only the CPU time workers were actually executing, stays close to or above baseline. The tradeoff is intentional: lower raw compute throughput in exchange for better responsiveness under full CPU load.
+> These numbers reflect one recorded run of the current implementation on the test platform listed below. The real-time throughput gap for CPU-bound phases is expected and by design — scx_cognis pre-empts compute workers more frequently to keep interactive tasks (browser compositor, input handling) responsive. The `usr time` metric, which measures only the CPU time workers were actually executing, stays close to or above baseline. The tradeoff is intentional: lower raw compute throughput in exchange for better responsiveness under full CPU load.
 
 **Phase 1 — CPU stress (16 × workers, 60 s):**
 
