@@ -15,10 +15,8 @@ use std::ffi::c_ulong;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::sync::Once;
 
 use anyhow::bail;
-use anyhow::Context;
 use anyhow::Result;
 
 use plain::Plain;
@@ -192,21 +190,17 @@ struct AlignedBuffer([u8; BUFSIZE]);
 
 static mut BUF: AlignedBuffer = AlignedBuffer([0; BUFSIZE]);
 
-static SET_HANDLER: Once = Once::new();
-
-fn set_ctrlc_handler(shutdown: Arc<AtomicBool>) -> Result<(), anyhow::Error> {
-    SET_HANDLER.call_once(|| {
-        let shutdown_clone = shutdown.clone();
-        ctrlc::set_handler(move || {
-            shutdown_clone.store(true, Ordering::Relaxed);
-        })
-        .expect("Error setting Ctrl-C handler");
-    });
-    Ok(())
-}
-
 impl<'cb> BpfScheduler<'cb> {
+    /// Initialise the BPF scheduler.
+    ///
+    /// `shutdown` must be the **process-level** `Arc<AtomicBool>` whose ctrlc
+    /// handler was registered once in `main()`.  Sharing the same Arc across
+    /// every restart iteration ensures that a SIGTERM received at any point —
+    /// including the restart backoff window between two `run()` calls — is
+    /// always observed by `bpf.exited()`, preventing the scheduler from
+    /// ignoring a `systemctl stop` / `sudo kill` request.
     pub fn init(
+        shutdown: Arc<AtomicBool>,
         open_object: &'cb mut MaybeUninit<OpenObject>,
         open_opts: Option<bpf_object_open_opts>,
         exit_dump_len: u32,
@@ -216,8 +210,6 @@ impl<'cb> BpfScheduler<'cb> {
         slice_ns: u64,
         name: &str,
     ) -> Result<Self> {
-        let shutdown = Arc::new(AtomicBool::new(false));
-        set_ctrlc_handler(shutdown.clone()).context("Error setting Ctrl-C handler")?;
 
         // Open the BPF prog first for verification.
         let mut skel_builder = BpfSkelBuilder::default();

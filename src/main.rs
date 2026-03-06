@@ -35,9 +35,12 @@ mod tui;
 use std::io;
 use std::mem::MaybeUninit;
 use std::panic::{self, AssertUnwindSafe};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use std::time::{Duration, Instant, SystemTime};
 
+use anyhow::Context;
 use anyhow::Result;
 use clap::Parser;
 use libbpf_rs::OpenObject;
@@ -245,7 +248,11 @@ struct Scheduler<'a> {
 }
 
 impl<'a> Scheduler<'a> {
-    fn init(opts: &'a Opts, open_object: &'a mut MaybeUninit<OpenObject>) -> Result<Self> {
+    fn init(
+        opts: &'a Opts,
+        open_object: &'a mut MaybeUninit<OpenObject>,
+        shutdown: Arc<AtomicBool>,
+    ) -> Result<Self> {
         let stats_server = StatsServer::new(stats::server_data()).launch()?;
 
         // When --slice-us is 0 (the default), the auto-slice mode is active:
@@ -262,6 +269,7 @@ impl<'a> Scheduler<'a> {
         let policy = PolicyController::new(base_slice_ns);
 
         let bpf = BpfScheduler::init(
+            shutdown,
             open_object,
             opts.libbpf.clone().into_bpf_open_opts(),
             opts.exit_dump_len,
@@ -1355,16 +1363,37 @@ fn main() -> Result<()> {
         }
     }
 
+    // Shared shutdown flag and ctrlc/SIGTERM handler — registered ONCE for the
+    // entire process lifetime.  The same Arc is passed into every
+    // Scheduler::init() call (including after restarts), so a SIGTERM received
+    // at any point — including the restart backoff window between two run()
+    // iterations — is always observed and stops the outer restart loop.
+    let shutdown = Arc::new(AtomicBool::new(false));
+    {
+        let sd = shutdown.clone();
+        ctrlc::set_handler(move || {
+            sd.store(true, Ordering::Relaxed);
+        })
+        .context("Error setting Ctrl-C / SIGTERM handler")?;
+    }
+
     // Main scheduler loop with restart support.
     let mut open_object = MaybeUninit::uninit();
     let mut rapid_failures = 0u32;
     let mut last_failure_at: Option<Instant> = None;
 
     loop {
+        // A SIGTERM received during the restart backoff (or while init is
+        // still in progress) must not be silently dropped — check the flag
+        // before starting a new instance.
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
+
         elevate_scheduler_thread();
 
         let loop_result = panic::catch_unwind(AssertUnwindSafe(|| -> Result<bool> {
-            let mut sched = Scheduler::init(&opts, &mut open_object)?;
+            let mut sched = Scheduler::init(&opts, &mut open_object, shutdown.clone())?;
             Ok(sched.run()?.should_restart())
         }));
 
