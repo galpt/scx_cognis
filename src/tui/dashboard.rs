@@ -537,16 +537,14 @@ pub fn run_tui(state: SharedState, shutdown: Arc<std::sync::atomic::AtomicBool>)
     let _ = restore_terminal(&mut terminal);
 }
 
-/// Render one TUI frame and check for quit key.  Call this from the
-/// scheduler's main loop to drive the TUI without spawning a thread.
+/// Drain pending terminal events and return `true` if the user requested quit.
 ///
-/// * `last_hist` — caller-owned `Instant` that governs history push (500 ms).
-/// * Returns `true` if the user pressed 'q' or Esc (scheduler should stop).
-pub fn tick_tui(state: &SharedState, terminal: &mut Term, last_hist: &mut Instant) -> bool {
+/// Uses `poll(Duration::ZERO)` semantics so the call never blocks the
+/// scheduler loop; crossterm guarantees that `read()` won't block after a
+/// successful zero-timeout `poll()`.
+pub fn poll_tui_quit() -> bool {
     use crossterm::event::{self, Event, KeyCode};
 
-    // Drain all pending events so a queued 'q' is never skipped because
-    // an earlier mouse-move, resize, or key-repeat event consumed the slot.
     while event::poll(Duration::from_millis(0)).unwrap_or(false) {
         if let Ok(Event::Key(key)) = event::read() {
             if key.code == KeyCode::Char('q') || key.code == KeyCode::Esc {
@@ -555,6 +553,14 @@ pub fn tick_tui(state: &SharedState, terminal: &mut Term, last_hist: &mut Instan
         }
     }
 
+    false
+}
+
+/// Render one TUI frame and check for quit key.  Call this from the
+/// scheduler's main loop to drive the TUI without spawning a thread.
+///
+/// * `last_hist` — caller-owned `Instant` that governs history push (500 ms).
+pub fn tick_tui(state: &SharedState, terminal: &mut Term, last_hist: &mut Instant) {
     // Push history every 500 ms.
     if last_hist.elapsed() >= Duration::from_millis(500) {
         *last_hist = Instant::now();
@@ -568,8 +574,6 @@ pub fn tick_tui(state: &SharedState, terminal: &mut Term, last_hist: &mut Instan
         let snap = snap.clone();
         let _ = terminal.draw(|f| draw(f, &snap));
     }
-
-    false
 }
 
 // DashboardState needs to be Clone for the above to work.

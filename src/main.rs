@@ -1252,16 +1252,17 @@ impl<'a> Scheduler<'a> {
                 self.housekeeping();
             }
 
-            // Inline TUI rendering (no separate thread — avoids EPERM under sudo).
-            // Render only during slack periods so terminal I/O never competes
-            // with the hot scheduling path. This intentionally trades UI frame
-            // rate for scheduler safety under bursty wakeup/load conditions.
+            // Inline TUI handling (no separate thread — avoids EPERM under sudo).
+            // Input is polled every loop with a zero-timeout non-blocking poll
+            // so 'q' / Esc remain responsive even under load. Rendering is
+            // rate-limited to 10 FPS to keep terminal I/O bounded without
+            // waiting for the scheduler to become completely idle.
             if self.tui_term.is_some() {
-                let should_render = self.last_tui_render.elapsed() >= Duration::from_millis(250)
-                    && self.tasks_empty()
-                    && *self.bpf.nr_queued_mut() == 0
-                    && *self.bpf.nr_scheduled_mut() == 0;
+                if tui::poll_tui_quit() {
+                    self.tui_quit = true;
+                }
 
+                let should_render = self.last_tui_render.elapsed() >= Duration::from_millis(100);
                 if should_render {
                     self.last_tui_render = Instant::now();
                     // Feed fresh metrics to TUI state regardless of whether a
@@ -1272,9 +1273,7 @@ impl<'a> Scheduler<'a> {
                     if let (Some(ref state), Some(ref mut term)) =
                         (&self.tui_state, &mut self.tui_term)
                     {
-                        if tui::tick_tui(state, term, &mut self.last_tui_hist) {
-                            self.tui_quit = true;
-                        }
+                        tui::tick_tui(state, term, &mut self.last_tui_hist);
                     }
                 }
             }
