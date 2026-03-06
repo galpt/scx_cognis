@@ -1297,15 +1297,26 @@ impl Drop for Scheduler<'_> {
 }
 
 fn elevate_scheduler_thread() {
-    // Raise the userspace scheduler thread before BPF attach so there is no
-    // startup window where sched_ext has already handed work to Cognis but the
-    // controlling thread is still competing as SCHED_NORMAL.
+    // Keep the userspace scheduler responsive without turning it into a
+    // permanent real-time thread.
+    //
+    // The previous implementation promoted the main loop to SCHED_FIFO(1).
+    // That diverged from Andrea Righi's stable reference scheduler and was
+    // unsafe here because Cognis runs a mostly non-blocking control loop
+    // (schedule → housekeeping → optional TUI draw). Under SCHED_FIFO, Linux
+    // runs the thread until it blocks, is preempted by a higher-priority RT
+    // thread, or yields to an equal-priority peer; normal-priority kworkers on
+    // the same CPU can therefore be starved long enough to trip the sched_ext
+    // watchdog. See sched(7): https://man7.org/linux/man-pages/man7/sched.7.html
+    //
+    // A best-effort nice(-20) boost keeps the scheduler favored under CFS
+    // while still preserving fair progress for kernel workers and the rest of
+    // the system.
     unsafe {
-        let param = libc::sched_param { sched_priority: 1 };
-        if libc::sched_setscheduler(0, libc::SCHED_FIFO, &param) != 0 {
+        if libc::setpriority(libc::PRIO_PROCESS, 0, -20) != 0 {
             warn!(
-                "Could not set SCHED_FIFO (errno {}); continuing with \
-                 SCHED_NORMAL — performance may degrade under CPU saturation",
+                "Could not raise nice priority to -20 (errno {}); continuing \
+                 with default CFS priority",
                 *libc::__errno_location()
             );
         }
