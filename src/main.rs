@@ -1296,27 +1296,6 @@ impl<'a> Scheduler<'a> {
     }
 
     fn run(&mut self) -> Result<UserExitInfo> {
-        // Elevate this thread to SCHED_FIFO so the userspace scheduler can
-        // always preempt ordinary tasks when dispatch decisions are needed.
-        //
-        // Without this, 100%-CPU workloads starve the scheduler thread: the BPF
-        // kernel fallback takes over (k >> d→u), cores go idle waiting for
-        // userspace to catch up, and desktop interactivity collapses under load.
-        //
-        // Priority 1 is the minimum FIFO level — it beats SCHED_NORMAL but
-        // yields to any higher-priority RT thread (e.g. audio daemons at
-        // SCHED_FIFO 80+), so we don't interfere with real latency-critical work.
-        unsafe {
-            let param = libc::sched_param { sched_priority: 1 };
-            if libc::sched_setscheduler(0, libc::SCHED_FIFO, &param) != 0 {
-                warn!(
-                    "Could not set SCHED_FIFO (errno {}); continuing with \
-                     SCHED_NORMAL — performance may degrade under CPU saturation",
-                    *libc::__errno_location()
-                );
-            }
-        }
-
         let (res_ch, req_ch) = self.stats_server.channels();
         let mut last_housekeeping = Instant::now();
 
@@ -1382,6 +1361,22 @@ impl Drop for Scheduler<'_> {
             let _ = tui::restore_terminal(term);
         }
         info!("Unregistered {SCHEDULER_NAME} scheduler");
+    }
+}
+
+fn elevate_scheduler_thread() {
+    // Raise the userspace scheduler thread before BPF attach so there is no
+    // startup window where sched_ext has already handed work to Cognis but the
+    // controlling thread is still competing as SCHED_NORMAL.
+    unsafe {
+        let param = libc::sched_param { sched_priority: 1 };
+        if libc::sched_setscheduler(0, libc::SCHED_FIFO, &param) != 0 {
+            warn!(
+                "Could not set SCHED_FIFO (errno {}); continuing with \
+                 SCHED_NORMAL — performance may degrade under CPU saturation",
+                *libc::__errno_location()
+            );
+        }
     }
 }
 
@@ -1527,6 +1522,7 @@ fn main() -> Result<()> {
     // Main scheduler loop with restart support.
     let mut open_object = MaybeUninit::uninit();
     loop {
+        elevate_scheduler_thread();
         let mut sched = Scheduler::init(&opts, &mut open_object)?;
         if !sched.run()?.should_restart() {
             break;
