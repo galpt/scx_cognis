@@ -64,7 +64,6 @@ UEI_DEFINE(uei);
  * Scheduler attributes and statistics.
  */
 const volatile u32 usersched_pid; /* User-space scheduler PID */
-const volatile u32 khugepaged_pid; /* khugepaged PID */
 u64 usersched_last_run_at; /* Timestamp of the last user-space scheduler execution */
 static u64 nr_cpu_ids; /* Maximum possible CPU number */
 
@@ -257,22 +256,6 @@ static inline bool is_usersched_task(const struct task_struct *p)
 static inline bool is_kthread(const struct task_struct *p)
 {
 	return p->flags & PF_KTHREAD;
-}
-
-/*
- * Return true if the target task @p is kswapd.
- */
-static inline bool is_kswapd(const struct task_struct *p)
-{
-        return p->flags & (PF_KSWAPD | PF_KCOMPACTD);
-}
-
-/*
- * Return true if the target task @p is khugepaged, false otherwise.
- */
-static inline bool is_khugepaged(const struct task_struct *p)
-{
-	return khugepaged_pid && p->pid == khugepaged_pid;
 }
 
 /*
@@ -757,13 +740,22 @@ void BPF_STRUCT_OPS(rustland_enqueue, struct task_struct *p, u64 enq_flags)
 	}
 
 	/*
-	 * Always dispatch per-CPU kthreads directly on their target CPU.
+	 * Dispatch ALL kthreads directly, bypassing the user-space scheduling
+	 * round-trip entirely.
 	 *
-	 * This allows to prioritize critical kernel threads that may
-	 * potentially stall the entire system if they are blocked for too long
-	 * (i.e., ksoftirqd/N, rcuop/N, etc.).
+	 * Linux >= 6.13 reworked workqueue CPU affinity so that nominally
+	 * per-CPU workers (kworker/N:M) now carry nr_cpus_allowed > 1.
+	 * The old check `is_kthread(p) && nr_cpus_allowed == 1` let those
+	 * workers fall through to user-space, where round-trip latency could
+	 * exceed the 5-second sched_ext watchdog and crash the scheduler with
+	 * a "runnable task stall" event.
+	 *
+	 * Dispatching ALL kthreads in BPF eliminates this stall class without
+	 * correctness loss: kthreads must never be trust-throttled or
+	 * burst-predicted by user-space. kswapd/khugepaged are kthreads;
+	 * redundant checks removed.
 	 */
-	if ((is_kthread(p) && p->nr_cpus_allowed == 1) || is_kswapd(p) || is_khugepaged(p)) {
+	if (is_kthread(p)) {
 		scx_bpf_dsq_insert_vtime(p, cpu_to_dsq(prev_cpu),
 					 slice_ns, p->scx.dsq_vtime, enq_flags);
 		__sync_fetch_and_add(&nr_kernel_dispatches, 1);

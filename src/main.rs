@@ -38,6 +38,7 @@ use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use std::os::unix::process::CommandExt;
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Context;
@@ -1305,6 +1306,26 @@ fn is_runtime_exit_error(err: &anyhow::Error) -> bool {
     err.to_string().starts_with("EXIT:")
 }
 
+fn log_cognis_failure(reason: &str) {
+    tui::emergency_restore_terminal();
+    eprintln!();
+    eprintln!("\x1b[31;1m╬══════════════════════════════════════════════════════════════╬\x1b[0m");
+    eprintln!("\x1b[31;1m║  COGNIS SCHEDULER — PERMANENT FAILURE                        ║\x1b[0m");
+    eprintln!("\x1b[31;1m╟──────────────────────────────────────────────────────────────╢\x1b[0m");
+    eprintln!("\x1b[31;1m║  Cognis could not recover.  Your system has automatically     ║\x1b[0m");
+    eprintln!("\x1b[31;1m║  fallen back to the kernel EEVDF scheduler.                  ║\x1b[0m");
+    eprintln!("\x1b[31;1m╬══════════════════════════════════════════════════════════════╬\x1b[0m");
+    eprintln!("  Reason  : {}", reason);
+    eprintln!("  Recovery: sudo systemctl restart scx");
+    eprintln!("            or: sudo scx_cognis --tui");
+    eprintln!("  Report  : https://github.com/galpt/scx_cognis/issues");
+    eprintln!();
+    log::error!(
+        "COGNIS PERMANENT FAILURE — system fell back to kernel EEVDF: {}",
+        reason
+    );
+}
+
 fn install_terminal_panic_hook() {
     let default_hook = panic::take_hook();
     panic::set_hook(Box::new(move |panic_info| {
@@ -1413,19 +1434,34 @@ fn main() -> Result<()> {
                 last_failure_at = Some(now);
 
                 if rapid_failures > RAPID_FAILURE_LIMIT {
-                    anyhow::bail!(
-                        "refusing to auto-restart after {} rapid runtime failures in {:?}: {}",
-                        rapid_failures,
-                        RAPID_FAILURE_WINDOW,
-                        err
-                    );
+                    log_cognis_failure(&format!(
+                        "exceeded {} restart attempts in {:?}: {}",
+                        RAPID_FAILURE_LIMIT, RAPID_FAILURE_WINDOW, err
+                    ));
+                    std::process::exit(1);
                 }
 
                 warn!(
-                    "runtime failure detected (attempt {}/{} in {:?}): {}; restarting after {:?}",
+                    "runtime failure detected (attempt {}/{} in {:?}): {}; re-executing for \
+                     clean restart in {:?}",
                     rapid_failures, RAPID_FAILURE_LIMIT, RAPID_FAILURE_WINDOW, err, RESTART_BACKOFF
                 );
                 std::thread::sleep(RESTART_BACKOFF);
+
+                // Re-exec this binary for a completely clean OS state.
+                //
+                // In-process restart fails after a sched_ext watchdog event because
+                // the post-crash kernel state leaves sigaltstack(2) broken (EPERM),
+                // which then aborts the process when StatsServer::launch() tries to
+                // spawn its stats thread.  exec() replaces the process image in-place
+                // (same PID so systemd keeps tracking it) and resets all OS state.
+                let exe = std::env::current_exe()
+                    .unwrap_or_else(|_| std::path::PathBuf::from("/proc/self/exe"));
+                let exec_err = std::process::Command::new(&exe)
+                    .args(std::env::args_os().skip(1))
+                    .exec();
+                // exec() only returns on error — fall back to in-process restart.
+                warn!("re-exec failed ({}); falling back to in-process restart", exec_err);
             }
             Ok(Err(err)) => {
                 tui::emergency_restore_terminal();
@@ -1444,16 +1480,18 @@ fn main() -> Result<()> {
                 last_failure_at = Some(now);
 
                 if rapid_failures > RAPID_FAILURE_LIMIT {
-                    anyhow::bail!(
-                        "refusing to auto-restart after {} rapid scheduler panics in {:?}: {}",
-                        rapid_failures,
+                    log_cognis_failure(&format!(
+                        "exceeded {} restart attempts in {:?}: {}",
+                        RAPID_FAILURE_LIMIT,
                         RAPID_FAILURE_WINDOW,
                         panic_payload_to_string(payload.as_ref())
-                    );
+                    ));
+                    std::process::exit(1);
                 }
 
                 warn!(
-                    "scheduler panic detected (attempt {}/{} in {:?}): {}; restarting after {:?}",
+                    "scheduler panic detected (attempt {}/{} in {:?}): {}; re-executing for \
+                     clean restart in {:?}",
                     rapid_failures,
                     RAPID_FAILURE_LIMIT,
                     RAPID_FAILURE_WINDOW,
@@ -1461,6 +1499,14 @@ fn main() -> Result<()> {
                     RESTART_BACKOFF
                 );
                 std::thread::sleep(RESTART_BACKOFF);
+
+                // Re-exec for clean OS state (see runtime failure branch above).
+                let exe = std::env::current_exe()
+                    .unwrap_or_else(|_| std::path::PathBuf::from("/proc/self/exe"));
+                let exec_err = std::process::Command::new(&exe)
+                    .args(std::env::args_os().skip(1))
+                    .exec();
+                warn!("re-exec failed ({}); falling back to in-process restart", exec_err);
             }
         }
     }

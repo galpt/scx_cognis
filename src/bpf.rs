@@ -20,7 +20,6 @@ use anyhow::bail;
 use anyhow::Result;
 
 use plain::Plain;
-use procfs::process::all_processes;
 
 use libbpf_rs::libbpf_sys::bpf_object_open_opts;
 use libbpf_rs::OpenObject;
@@ -254,7 +253,6 @@ impl<'cb> BpfScheduler<'cb> {
         }
         skel.struct_ops.rustland_mut().exit_dump_len = exit_dump_len;
         skel.maps.rodata_data.as_mut().unwrap().usersched_pid = std::process::id();
-        skel.maps.rodata_data.as_mut().unwrap().khugepaged_pid = Self::khugepaged_pid();
         skel.maps.rodata_data.as_mut().unwrap().builtin_idle = builtin_idle;
         skel.maps.rodata_data.as_mut().unwrap().slice_ns = slice_ns;
         skel.maps.rodata_data.as_mut().unwrap().debug = debug;
@@ -339,29 +337,6 @@ impl<'cb> BpfScheduler<'cb> {
         name_field[i] = 0;
 
         Ok(())
-    }
-
-    // Return the PID of khugepaged, if present, otherwise return 0.
-    fn khugepaged_pid() -> u32 {
-        let procs = match all_processes() {
-            Ok(p) => p,
-            Err(_) => return 0,
-        };
-
-        for proc in procs {
-            let proc = match proc {
-                Ok(p) => p,
-                Err(_) => continue,
-            };
-
-            if let Ok(stat) = proc.stat() {
-                if proc.exe().is_err() && stat.comm == "khugepaged" {
-                    return proc.pid() as u32;
-                }
-            }
-        }
-
-        0
     }
 
     // Notify the BPF component that the user-space scheduler has completed its scheduling cycle,
