@@ -14,11 +14,13 @@
 // All history buffers use HistoryRing — a fixed-size circular array that
 // never reallocates after init (zero-alloc after DashboardState creation).
 
-use std::io;
+use std::io::{self, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crossterm::{
+    cursor::Show,
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -169,23 +171,46 @@ impl DashboardState {
 
 pub type Term = Terminal<CrosstermBackend<io::Stdout>>;
 
+static TUI_TERMINAL_ACTIVE: AtomicBool = AtomicBool::new(false);
+
 pub fn setup_terminal() -> Result<Term, io::Error> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    if let Err(err) = execute!(stdout, EnterAlternateScreen, EnableMouseCapture) {
+        let _ = disable_raw_mode();
+        return Err(err);
+    }
     let backend = CrosstermBackend::new(stdout);
-    Terminal::new(backend)
+    let terminal = match Terminal::new(backend) {
+        Ok(terminal) => terminal,
+        Err(err) => {
+            let _ = restore_stdout_terminal();
+            return Err(err);
+        }
+    };
+    TUI_TERMINAL_ACTIVE.store(true, Ordering::Release);
+    Ok(terminal)
 }
 
 pub fn restore_terminal(term: &mut Term) -> Result<(), io::Error> {
-    disable_raw_mode()?;
-    execute!(
-        term.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
+    restore_stdout_terminal()?;
     term.show_cursor()?;
     Ok(())
+}
+
+fn restore_stdout_terminal() -> Result<(), io::Error> {
+    let _ = disable_raw_mode();
+    let mut stdout = io::stdout();
+    execute!(stdout, LeaveAlternateScreen, DisableMouseCapture, Show)?;
+    stdout.flush()?;
+    TUI_TERMINAL_ACTIVE.store(false, Ordering::Release);
+    Ok(())
+}
+
+pub fn emergency_restore_terminal() {
+    if TUI_TERMINAL_ACTIVE.load(Ordering::Acquire) {
+        let _ = restore_stdout_terminal();
+    }
 }
 
 // ── Rendering ─────────────────────────────────────────────────────────────

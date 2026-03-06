@@ -1405,6 +1405,14 @@ fn is_runtime_exit_error(err: &anyhow::Error) -> bool {
     err.to_string().starts_with("EXIT:")
 }
 
+fn install_terminal_panic_hook() {
+    let default_hook = panic::take_hook();
+    panic::set_hook(Box::new(move |panic_info| {
+        tui::emergency_restore_terminal();
+        default_hook(panic_info);
+    }));
+}
+
 // ── CPU topology helpers ──────────────────────────────────────────────────
 
 // ONLINE_CPUS removed – nr_online_cpus is queried live from the BPF scheduler.
@@ -1530,6 +1538,7 @@ fn main() -> Result<()> {
         simplelog::TerminalMode::Stderr,
         simplelog::ColorChoice::Auto,
     )?;
+    install_terminal_panic_hook();
 
     // Stats monitor mode.
     if let Some(intv) = opts.monitor.or(opts.stats) {
@@ -1561,6 +1570,7 @@ fn main() -> Result<()> {
             Ok(Ok(true)) => continue,
             Ok(Ok(false)) => break,
             Ok(Err(err)) if is_runtime_exit_error(&err) => {
+                tui::emergency_restore_terminal();
                 let now = Instant::now();
                 rapid_failures = if last_failure_at
                     .is_some_and(|prev| now.duration_since(prev) <= RAPID_FAILURE_WINDOW)
@@ -1586,8 +1596,12 @@ fn main() -> Result<()> {
                 );
                 std::thread::sleep(RESTART_BACKOFF);
             }
-            Ok(Err(err)) => return Err(err),
+            Ok(Err(err)) => {
+                tui::emergency_restore_terminal();
+                return Err(err);
+            }
             Err(payload) => {
+                tui::emergency_restore_terminal();
                 let now = Instant::now();
                 rapid_failures = if last_failure_at
                     .is_some_and(|prev| now.duration_since(prev) <= RAPID_FAILURE_WINDOW)
