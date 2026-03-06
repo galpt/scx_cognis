@@ -4,6 +4,6 @@
 pub mod dashboard;
 
 pub use dashboard::{
-    emergency_restore_terminal, new_shared_state, poll_tui_quit, restore_terminal,
-    setup_terminal, tick_tui, SharedState, Term, WallEntry,
+    emergency_restore_terminal, new_shared_state, poll_tui_quit, restore_terminal, setup_terminal,
+    tick_tui, SharedState, Term, WallEntry,
 };
