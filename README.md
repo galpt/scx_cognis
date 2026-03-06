@@ -144,12 +144,25 @@ test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fin
 Every scheduling decision passes through a multi-stage pipeline. The entire pipeline completes in **< 5 µs** on a modern CPU, staying well within the time-slice budget.
 
 ```
-ops.enqueue   →  Heuristic Classifier  →  Trust Check  →  Burst Predictor
+ops.enqueue   →  [BPF] kthread fast-dispatch (PF_KTHREAD → cpu_to_dsq, bypasses userspace)
+              →  [Rust] Heuristic Classifier  →  Trust Check  →  Burst Predictor
 ops.dispatch  →  Q-learning Policy (adaptive time slice)
 ops.select_cpu → O(1) CPU Selector  (P/E-core bitmask, quarantine-aware)
 ops.tick      →  Trust Engine tick  (no-op; prepared for future anomaly detection)
 schedule loop →  Trust Engine flush          (staleness-based, every 1 s)
 ```
+
+> [!NOTE]
+> **Kernel threads never reach user-space.** All tasks with the `PF_KTHREAD` flag
+> (kworkers, ksoftirqd, rcuop, etc.) are short-circuited in the BPF `ops.enqueue`
+> hook and dispatched directly to `cpu_to_dsq(prev_cpu)`, bypassing the ring
+> buffer entirely.  This is essential on Linux ≥ 6.13 where the workqueue
+> subsystem reworked per-CPU worker affinity: nominally per-CPU kworkers such as
+> `kworker/N:M` may now have `nr_cpus_allowed > 1`, which under the old guard
+> (`nr_cpus_allowed == 1`) caused them to enter Rust priority queues and stall
+> long enough to trip the sched_ext watchdog.  The redesigned condition uses
+> `is_kthread(p)` alone — no affinity check.  `cpu_to_dsq()` falls back to
+> `SHARED_DSQ` for out-of-range `prev_cpu`, so no crash path exists.
 
 ### Component Details
 
@@ -327,9 +340,10 @@ The pipeline runs **synchronously on the hot scheduling path** for the per-task 
 
 | Step | Hot Path? | Frequency |
 |:---|:---|:---|
-| Heuristic classify | ✅ Yes | every `ops.enqueue` |
-| Trust check | ✅ Yes | every `ops.enqueue` |
-| Burst predictor read | ✅ Yes | every `ops.enqueue` |
+| kthread BPF fast-dispatch (PF_KTHREAD) | ✅ Yes (BPF only) | every `ops.enqueue` for kthreads — exits before ring buffer |
+| Heuristic classify | ✅ Yes | every `ops.enqueue` (user tasks only) |
+| Trust check | ✅ Yes | every `ops.enqueue` (user tasks only) |
+| Burst predictor read | ✅ Yes | every `ops.enqueue` (user tasks only) |
 | O(1) CPU select | ✅ Yes | every `ops.select_cpu` |
 | Q-learning slice read | ✅ Yes | every `ops.dispatch` (atomic read) |
 | Trust engine tick | ❌ No | every 100 ms |
@@ -344,7 +358,8 @@ The pipeline runs **synchronously on the hot scheduling path** for the per-task 
 | Trust check | $`O(1)`$ fixed-table lookup | < 0.1 µs |
 | Burst predictor | $`O(1)`$ EMA table read (enqueue); $`O(H \cdot X) = O(12)`$ RNN update (dispatch) | < 0.1 µs |
 | O(1) CPU select | $`O(1)`$ bitmask TZCNT | < 0.01 µs |
-| Anti-starvation check | $`O(1)`$ — one `now_ns()` vDSO call + four comparisons per dispatch | < 0.05 µs |
+| kthread BPF fast-dispatch | $`O(1)`$ — BPF only, never touches ring buffer | < 0.01 µs |
+| Anti-starvation check | $`O(1)`$ — 100 ms threshold; one `now_ns()` vDSO call + four comparisons per dispatch | < 0.05 µs |
 | Q-learning slice read | $`O(1)`$ atomic read | < 0.05 µs |
 | **Total (typical)** | | **< 1 µs** |
 
@@ -581,20 +596,20 @@ Each line from `--monitor` is a snapshot of one polling interval. All counters l
 #### Full Output Format
 
 ```
-[cognis v1.1.3] tldr: Rest assured! I'm keeping your system responsive.   | r:  5/16  q:1 /0   | pf:0 | d→u:312   k:140 c:0  b:0  f:0  | cong:0 | 🧠 Interactive:18  Compute:3  IOwait:2  RT:0  Unknown:0 | quarantine:0 flagged:0 | slice:4000µs reward:0.42
+[cognis v1.1.4] tldr: Rest assured! I'm keeping your system responsive.   | r:  5/16  q:1 /0   | pf:0 | d→u:312   k:140 c:0  b:0  f:0  | cong:0 | 🧠 Interactive:18  Compute:3  IOwait:2  RT:0  Unknown:0 | quarantine:0 flagged:0 | slice:4000µs reward:0.42
 ```
 
 #### Column Reference
 
 | Column | Full Name | Type | Meaning |
 |:---|:---|:---|:---|
-| `v1.1.3` (header) | version | static | Scheduler version embedded in every monitor line, matching the GitHub release tag. Identical to the output of `scx_cognis --version`. |
+| `v1.1.4` (header) | version | static | Scheduler version embedded in every monitor line, matching the GitHub release tag. Identical to the output of `scx_cognis --version`. |
 | `tldr: ...` | human summary | computed | One-line plain-English summary of current system health. Changes every interval based on load, reward, congestion, and threat level. See the [TLDR message reference](#tldr-message-reference) below. |
 | `r: 5/16` | running / online CPUs | instant | Tasks actively executing right now out of total online CPUs. High ratios (≥ 0.8) mean the system is busy. |
 | `q:1 /0` | queued / scheduled | instant | `queued` = tasks handed by the kernel to userspace and waiting for a dispatch decision; `scheduled` = tasks that have been ordered but not yet sent back to BPF. Under normal load both stay near 0. |
 | `pf:0` | major page faults | per-interval | **Major** page faults (hard faults requiring disk I/O) inside the scheduler process per interval. Non-zero means the scheduler binary itself was partially swapped to disk — this causes real latency spikes and indicates memory pressure. Minor faults (normal anonymous-memory mapping) are intentionally excluded. Should always be **0** on a healthy system. |
 | `d→u:312` | user dispatches | per-interval | Tasks dispatched **by the Cognis userspace scheduler** in this interval. The primary work-done counter. |
-| `k:140` | kernel dispatches | per-interval | Tasks dispatched **by the kernel fallback path** (e.g. idle tasks, kthreads). A high ratio of `k` to `d→u` is normal. |
+| `k:140` | kernel dispatches | per-interval | Tasks dispatched **directly by the BPF backend** without going through the Cognis user-space ring buffer. All kernel threads (`PF_KTHREAD`: kworkers, ksoftirqd, rcuop, kswapd, …) are intentionally fast-dispatched here to prevent priority-queue stalls (especially relevant on Linux ≥ 6.13 where kworkers may have `nr_cpus_allowed > 1`). A high ratio of `k` to `d→u` is completely normal. |
 | `c:0` | cancel dispatches | per-interval | Dispatches cancelled before execution (task exited or migrated away). Usually 0. |
 | `b:0` | bounce dispatches | per-interval | Dispatches that had to be redirected to a different DSQ (CPU affinity conflict). Occasional bounces are fine; sustained high values suggest affinity misconfiguration. |
 | `f:0` | failed dispatches | per-interval | Dispatches that errored out entirely. Should always be **0**. |

@@ -765,13 +765,32 @@ void BPF_STRUCT_OPS(rustland_enqueue, struct task_struct *p, u64 enq_flags)
 	}
 
 	/*
-	 * Always dispatch per-CPU kthreads directly on their target CPU.
+	 * Always dispatch kthreads directly on their target CPU, bypassing the
+	 * user-space ring buffer entirely.
 	 *
-	 * This allows to prioritize critical kernel threads that may
-	 * potentially stall the entire system if they are blocked for too long
-	 * (i.e., ksoftirqd/N, rcuop/N, etc.).
+	 * Kernel threads (kworkers, ksoftirqd, RCU callbacks, kswapd, etc.)
+	 * must never be routed through the Rust scheduler's priority queues.
+	 * When they are, two failure modes arise:
+	 *
+	 *   1. Classification: CPU-intensive kworkers get labelled 'Compute'
+	 *      (the lowest-priority bucket) and starve behind Interactive /
+	 *      IoWait traffic until the sched_ext watchdog fires at ~5 s.
+	 *
+	 *   2. Affinity: the nr_cpus_allowed == 1 guard in the original
+	 *      condition no longer holds on Linux >= 6.13, where the workqueue
+	 *      subsystem reworked per-CPU worker affinity so that nominally
+	 *      'per-CPU' kworker threads (kworker/N:M) may have
+	 *      nr_cpus_allowed > 1.  Those threads then fell through to the
+	 *      ring buffer and were subject to failure mode 1.
+	 *
+	 * Fix: remove the nr_cpus_allowed == 1 restriction.  ALL kthreads
+	 * are fast-dispatched to cpu_to_dsq(prev_cpu).  cpu_to_dsq()
+	 * safely falls back to SHARED_DSQ when prev_cpu is out of range.
+	 * Because p->scx.dsq_vtime is 0 (set in ops.enable and never
+	 * updated for kthreads), kthreads sort before any user task in the
+	 * vtime-ordered DSQ and are served without delay.
 	 */
-	if ((is_kthread(p) && p->nr_cpus_allowed == 1) || is_kswapd(p) || is_khugepaged(p)) {
+	if (is_kthread(p) || is_kswapd(p) || is_khugepaged(p)) {
 		scx_bpf_dsq_insert_vtime(p, cpu_to_dsq(prev_cpu),
 					 slice_ns, p->scx.dsq_vtime, enq_flags);
 		__sync_fetch_and_add(&nr_kernel_dispatches, 1);

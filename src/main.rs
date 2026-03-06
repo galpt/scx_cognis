@@ -499,8 +499,11 @@ impl<'a> Scheduler<'a> {
     /// per dispatch — O(1), < 50 ns total.
     #[inline(always)]
     fn pop_highest_priority_task(&mut self) -> Option<Task> {
-        // 500 ms = 10× safety margin below the 5 s sched_ext watchdog.
-        const STARVATION_NS: u64 = 500_000_000;
+        // 100 ms = 50× safety margin below the 5 s sched_ext watchdog.
+        // Reduced from 500 ms after the BPF kthread fix so that any task
+        // that unexpectedly reaches a low-priority bucket is rescued well
+        // before the watchdog, even under worst-case queue depths.
+        const STARVATION_NS: u64 = 100_000_000;
         let now = Self::now_ns();
 
         // Check buckets from lowest → highest priority so the most-starved
