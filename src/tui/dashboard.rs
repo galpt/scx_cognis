@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 
 use crossterm::{
     cursor::Show,
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
+    event::{DisableMouseCapture, EnableMouseCapture},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -114,7 +114,7 @@ impl WallEntry {
 }
 
 /// All mutable state the dashboard needs to render.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DashboardState {
     pub metrics: Metrics,
     pub inference_us: f64, // Most recent inference latency (µs)
@@ -484,59 +484,6 @@ pub fn new_shared_state() -> SharedState {
     Arc::new(Mutex::new(DashboardState::default()))
 }
 
-/// Run the TUI in a blocking loop until the user presses 'q' or the
-/// `shutdown` flag is set.
-///
-/// Kept for reference — the scheduler now uses [`tick_tui`] to drive the
-/// TUI inline from its main loop instead of spawning a separate thread.
-#[allow(dead_code)]
-pub fn run_tui(state: SharedState, shutdown: Arc<std::sync::atomic::AtomicBool>) {
-    let mut terminal = match setup_terminal() {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("TUI init failed: {e}");
-            return;
-        }
-    };
-
-    let tick = Duration::from_millis(500);
-    let mut last_tick = Instant::now();
-
-    loop {
-        // Poll for key events without blocking the redraw loop.
-        if event::poll(Duration::from_millis(50)).unwrap_or(false) {
-            if let Ok(Event::Key(key)) = event::read() {
-                if key.code == KeyCode::Char('q') || key.code == KeyCode::Esc {
-                    shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
-                    break;
-                }
-            }
-        }
-
-        if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
-            break;
-        }
-
-        if last_tick.elapsed() >= tick {
-            last_tick = Instant::now();
-            // Update history inside the lock, then release before drawing.
-            if let Ok(mut s) = state.lock() {
-                s.push_history();
-            }
-        }
-
-        // Draw frame.
-        let snap = match state.lock() {
-            Ok(s) => s.clone(),
-            Err(_) => continue,
-        };
-        // Clone DashboardState so we don't hold the lock during rendering.
-        let _ = terminal.draw(|f| draw(f, &snap));
-    }
-
-    let _ = restore_terminal(&mut terminal);
-}
-
 /// Drain pending terminal events and return `true` if the user requested quit.
 ///
 /// Uses `poll(Duration::ZERO)` semantics so the call never blocks the
@@ -573,23 +520,5 @@ pub fn tick_tui(state: &SharedState, terminal: &mut Term, last_hist: &mut Instan
     if let Ok(snap) = state.lock() {
         let snap = snap.clone();
         let _ = terminal.draw(|f| draw(f, &snap));
-    }
-}
-
-// DashboardState needs to be Clone for the above to work.
-impl Clone for DashboardState {
-    fn clone(&self) -> Self {
-        Self {
-            metrics: self.metrics.clone(),
-            inference_us: self.inference_us,
-            inference_hist: self.inference_hist.clone(),
-            reward_hist: self.reward_hist.clone(),
-            throughput_hist: self.throughput_hist.clone(),
-            wall_of_shame: self.wall_of_shame,
-            wall_len: self.wall_len,
-            ai_slice_hist: self.ai_slice_hist,
-            ai_slice_head: self.ai_slice_head,
-            ai_slice_len: self.ai_slice_len,
-        }
     }
 }

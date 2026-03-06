@@ -77,7 +77,7 @@
 
 ## Status
 
-Build/test clean — all 29 unit tests pass, and the current tree passes `cargo check`, `cargo test`, `cargo clippy --all-targets -- -D warnings`, and `cargo fmt --check`. The scheduler has been exercised successfully on `sched_ext`-enabled kernels (≥ 6.12), but several heuristics and benchmark interpretations are still best treated as implementation-specific rather than production-validated guarantees.
+Build/test clean — all 29 unit tests pass, and the current tree passes `cargo check`, `cargo test`, `cargo clippy --all-targets -- -D warnings`, and `cargo fmt --all -- --check`. The scheduler has been exercised successfully on `sched_ext`-enabled kernels (≥ 6.12), but several heuristics and benchmark interpretations are still best treated as implementation-specific rather than production-validated guarantees.
 
 ### Test Results
 
@@ -140,7 +140,7 @@ test result: ok. 29 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fin
 >
 > Cognis is designed to keep interactive threads — games, audio, desktop UI — responsive even when the rest of the system is under heavy CPU or I/O load. On every scheduling event it classifies each thread as RealTime, Interactive, IoWait, or Compute (`Unknown` remains a reserved metrics bucket and is not emitted by the current heuristic) and dispatches it to a matching priority queue: game threads and audio daemons are dequeued and run before background compilers or encoders, and they receive shorter, more frequent CPU slices (Interactive: 0.5× base, RealTime: 0.25× base) so they are never held up waiting for a CPU-bound worker to exhaust its slice. CPU placement dispatches all user tasks to the shared DSQ (`SHARED_DSQ`), which any available CPU can pick up — this guarantees forward progress even when one CPU is busy hosting the userspace scheduler process. Kernel workers are still pinned to their affinity CPU. A trust-based engine monitors every thread's behaviour: tasks that repeatedly burn their full slice without yielding (background miners, misbehaving workers) lose trust and receive a reduced time-slice, freeing CPU bandwidth for responsive work.
 >
-> Batch-workload throughput is intentionally traded off for responsiveness. If your goal is raw CPU throughput (compilers, encoders, benchmarks), the default EEVDF scheduler usually wins; Cognis's advantage is lower scheduling latency for threads that wake up, do a little work, and sleep again.
+> Cognis is tuned for responsiveness first, but the current `v1.3.6` benchmark run on the test platform stayed near baseline throughput in all three phases. Exact throughput tradeoffs remain workload- and hardware-specific; Cognis's main advantage is lower scheduling latency for threads that wake up, do a little work, and sleep again.
 
 ### Pipeline Overview
 
@@ -565,7 +565,7 @@ scx_cognis --monitor 0.5
 
 > [!NOTE]
 > 1. If the scheduler was started **without** the provided service file (e.g. a manually launched instance), the socket may be root-only. In that case prefix with `sudo`.
-> 2. The version is displayed inline at the start of every output line (`[cognis v1.3.3] ...` in the current tree), so you can confirm which build is running without stopping the service. Use `scx_cognis --version` for a one-shot version check when the scheduler is not running.
+> 2. The version is displayed inline at the start of every output line (`[cognis v1.3.6] ...` in the current tree), so you can confirm which build is running without stopping the service. Use `scx_cognis --version` for a one-shot version check when the scheduler is not running.
 
 [↑ Back to Table of Contents](#table-of-contents)
 
@@ -578,14 +578,14 @@ Each line from `--monitor` is a snapshot of one polling interval. All counters l
 #### Full Output Format
 
 ```
-[cognis v1.3.3] tldr: Rest assured! I'm keeping your system responsive.   | r:  5/16  q:1 /0   | pf:0 | d→u:312   k:140 c:0  b:0  f:0  | cong:0 | 🧠 Interactive:18  Compute:3  IOwait:2  RT:0  Unknown:0 | quarantine:0 flagged:0 | slice:4000µs reward:0.42
+[cognis v1.3.6] tldr: Rest assured! I'm keeping your system responsive.   | r:  5/16  q:1 /0   | pf:0 | d→u:312   k:140 c:0  b:0  f:0  | cong:0 | 🧠 Interactive:18  Compute:3  IOwait:2  RT:0  Unknown:0 | quarantine:0 flagged:0 | slice:4000µs reward:0.42
 ```
 
 #### Column Reference
 
 | Column | Full Name | Type | Meaning |
 |:---|:---|:---|:---|
-| `v1.3.3` (header) | version | static | Scheduler version embedded in every monitor line. In released builds it should match the release tag; in local builds it matches the crate version returned by `scx_cognis --version`. |
+| `v1.3.6` (header) | version | static | Scheduler version embedded in every monitor line. In released builds it should match the release tag; in local builds it matches the crate version returned by `scx_cognis --version`. |
 | `tldr: ...` | human summary | computed | One-line plain-English summary of current system health. Changes every interval based on load, reward, congestion, and threat level. See the [TLDR message reference](#tldr-message-reference) below. |
 | `r: 5/16` | running / online CPUs | instant | Tasks actively executing right now out of total online CPUs. High ratios (≥ 0.8) mean the system is busy. |
 | `q:1 /0` | queued / scheduled | instant | `queued` = tasks handed by the kernel to userspace and waiting for a dispatch decision; `scheduled` = tasks that have been ordered but not yet sent back to BPF. Under normal load both stay near 0. |
@@ -1010,13 +1010,13 @@ Each mode runs three 60-second stress-ng phases (CPU → I/O → Mixed) while th
 
 ### Interpreting Results
 
-scx_cognis prioritises **Interactive** tasks with a 0.5× shorter time-slice so the browser's compositing thread pre-empts compute-bound stress workers more frequently. You should observe:
+scx_cognis prioritises **Interactive** tasks with a 0.5× shorter time-slice so the browser's compositing thread pre-empts compute-bound stress workers more frequently. On the current `v1.3.6` run you should observe:
 
 - **Smoother Aquarium animation** under load compared to the baseline.
-- **Lower raw bogo-ops/s for CPU-bound phases** — this is expected and by design. scx_cognis pre-empts compute workers more frequently to keep the browser compositor responsive. The `usr time` metric stays close to or above baseline, confirming no CPU cycles are wasted.
+- **Near-baseline raw throughput on this test platform** — the latest run stayed within normal single-run noise for most lines while preserving responsiveness.
 - **Lower perceived input latency** — the Fish Count slider and tab switching should feel snappy even while CPUs are saturated.
 
-If the `reward` value stays low (near 0) during CPU-heavy phases, this is normal — `interactive_frac` falls when recent classification events are dominated by stress-ng workers, which pulls the reward signal down. It does not indicate a problem.
+If the `reward` value stays low (near 0) during CPU-heavy phases, this is normal — `interactive_frac` falls when recent classification events are dominated by stress-ng workers, which pulls the reward signal down. It does not indicate a problem. Likewise, small one-run throughput deltas should be treated cautiously unless you repeat each mode several times and compare medians.
 
 ### Test Platform
 
@@ -1036,36 +1036,36 @@ If the `reward` value stays low (near 0) during CPU-heavy phases, this is normal
 > 500 fish (default Aquarium), 60 s per phase, `stress-ng` workload. CPU governor left at system default (`powersave`) for both runs.
 >
 > **Context:**
-> These numbers reflect one recorded run of the current implementation on the test platform listed below. The real-time throughput gap for CPU-bound phases is expected and by design — scx_cognis pre-empts compute workers more frequently to keep interactive tasks (browser compositor, input handling) responsive. The `usr time` metric, which measures only the CPU time workers were actually executing, stays close to or above baseline. The tradeoff is intentional: lower raw compute throughput in exchange for better responsiveness under full CPU load.
+> These numbers reflect one recorded run of `v1.3.6` on the test platform listed below. Unlike older Cognis revisions on this same machine, the current implementation no longer shows a large wall-clock throughput penalty in this benchmark: most lines stayed within normal single-run noise while the desktop responsiveness objective was preserved. Treat any small percentage delta as anecdotal unless you repeat the test several times and compare medians.
 
 **Phase 1 — CPU stress (16 × workers, 60 s):**
 
 | Metric | Baseline (linux-cachyos) | scx_cognis | Δ |
 |:-------|:--------------:|:----------:|:---:|
-| bogo ops/s (real time) | 22,024.86 | 11,019.19 | −50.0% |
-| bogo ops/s (usr time) | 1,403.81 | 1,826.00 | +30.1% |
+| bogo ops/s (real time) | 22,055.82 | 22,210.24 | +0.7% |
+| bogo ops/s (usr time) | 1,411.10 | 1,411.04 | 0.0% |
 
-The real-time drop reflects frequent pre-emption of compute workers by higher-priority interactive tasks. The usr-time gain shows that when workers do run, they continue to accumulate competitive on-CPU work despite more frequent scheduling interruptions.
+CPU throughput remained effectively unchanged in this run: wall-clock `bogo ops/s` rose by 0.7% and `usr time` stayed flat. On this platform, Cognis preserved compute throughput while still prioritising interactive wakeups.
 
 **Phase 2 — I/O stress (4 × `iomix` workers, 60 s):**
 
 | Metric | Baseline (linux-cachyos) | scx_cognis | Δ |
 |:-------|:--------------:|:----------:|:---:|
-| bogo ops/s (real time) | 184,206.49 | 92,322.96 | −49.9% |
-| bogo ops/s (usr time) | 42,681.43 | 43,098.01 | +1.0% |
+| bogo ops/s (real time) | 178,202.08 | 180,383.24 | +1.2% |
+| bogo ops/s (usr time) | 40,448.66 | 40,180.41 | −0.7% |
 
-I/O-bound workers still accumulate almost identical usr-time throughput, but the wall-clock score drops sharply because the benchmark mixes wakeups, sleeps, and scheduler-visible latency in a way that amplifies Cognis's responsiveness bias.
+I/O throughput was also essentially flat: wall-clock throughput rose by 1.2% while `usr time` dipped by 0.7%, which is well within the kind of noise you would expect from a single run under the `powersave` governor.
 
 **Phase 3 — Mixed stress (16 × `cpu` + 2 × `vm` workers, 60 s):**
 
 | Stressor | Metric | Baseline (linux-cachyos) | scx_cognis | Δ |
 |:---------|:-------|:--------------:|:----------:|:---:|
-| CPU ×16 | bogo ops/s (real) | 19,662.59 | 11,780.62 | −40.1% |
-| CPU ×16 | bogo ops/s (usr) | 1,421.03 | 1,739.32 | +22.4% |
-| VM ×2 | bogo ops/s (real) | 24,569.98 | 24,469.50 | −0.4% |
-| VM ×2 | bogo ops/s (usr) | 14,019.12 | 22,904.19 | +63.4% |
+| CPU ×16 | bogo ops/s (real) | 19,760.80 | 19,781.18 | +0.1% |
+| CPU ×16 | bogo ops/s (usr) | 1,417.85 | 1,419.61 | +0.1% |
+| VM ×2 | bogo ops/s (real) | 24,555.34 | 24,566.91 | +0.0% |
+| VM ×2 | bogo ops/s (usr) | 14,789.09 | 14,021.45 | −5.2% |
 
-The CPU stressor shows the same general pattern as Phase 1, but with a smaller real-time penalty. The VM stressor stays near baseline in wall-clock throughput while showing a strong usr-time gain, which is consistent with Cognis favouring short, wakeup-heavy work.
+The mixed phase stayed close to baseline too. The CPU stressor was effectively identical, and the VM stressor's wall-clock throughput was unchanged. The only noticeable deviation was a 5.2% lower VM `usr time`, which is still small enough that it should be interpreted with repeated medians rather than a single sample.
 
 > [!TIP]
 > If you run your own benchmark, keep the CPU governor fixed (`performance`) for both schedulers, run each mode at least 3 times, and compare median values. Single runs can swing significantly.
