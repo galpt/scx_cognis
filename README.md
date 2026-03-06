@@ -149,7 +149,7 @@ Every scheduling decision passes through a multi-stage pipeline. The hot path is
 ```
 ops.enqueue   →  Rust kthread check  →  Heuristic Classifier  →  Trust Check  →  Burst Predictor
 ops.dispatch  →  Q-learning Policy (adaptive time slice)  →  SHARED_DSQ dispatch (RL_CPU_ANY)
-ops.select_cpu → kernel idle-CPU query  (pick_idle_cpu, atomic)
+ops.select_cpu → idle-CPU wakeup hint   (pick_idle_cpu, atomic; placement overridden by SHARED_DSQ)
 ops.tick      →  Trust Engine tick  (no-op; prepared for future anomaly detection)
 schedule loop →  Trust Engine flush          (staleness-based, every 1 s)
 ```
@@ -304,7 +304,7 @@ flowchart TD
 
     subgraph Pipeline["Scheduling Pipeline"]
         P1["`**enqueue** → heuristic classify → trust check → Elman RNN headroom hint`"]
-        P2["`**select_cpu** → kernel idle-CPU query (pick_idle_cpu, atomic)`"]
+        P2["`**select_cpu** → idle-CPU wakeup hint (pick_idle_cpu, atomic); placement → SHARED_DSQ`"]
         P3["`**dispatch** → Q-learning policy slice read → SHARED_DSQ (RL_CPU_ANY)`"]
         P4["`**tick** → trust engine tick`"]
     end
@@ -320,7 +320,7 @@ flowchart TD
 
 ### Pipeline Details
 
-The pipeline runs **synchronously on the hot scheduling path** for the per-task steps (heuristic classify, trust check, burst predictor read, kernel idle-CPU query, Q-learning slice read). Heavier operations (trust engine ticks, Q-table updates) run on **periodic timers** off the hot path.
+The pipeline runs **synchronously on the hot scheduling path** for the per-task steps (heuristic classify, trust check, burst predictor read, SHARED_DSQ dispatch, Q-learning slice read). Heavier operations (trust engine ticks, Q-table updates) run on **periodic timers** off the hot path.
 
 | Step | Hot Path? | Frequency |
 |:---|:---|:---|
@@ -578,7 +578,7 @@ Each line from `--monitor` is a snapshot of one polling interval. All counters l
 #### Full Output Format
 
 ```
-[cognis v1.2.1] tldr: Rest assured! I'm keeping your system responsive.   | r:  5/16  q:1 /0   | pf:0 | d→u:312   k:140 c:0  b:0  f:0  | cong:0 | 🧠 Interactive:18  Compute:3  IOwait:2  RT:0  Unknown:0 | quarantine:0 flagged:0 | slice:4000µs reward:0.42
+[cognis v1.3.3] tldr: Rest assured! I'm keeping your system responsive.   | r:  5/16  q:1 /0   | pf:0 | d→u:312   k:140 c:0  b:0  f:0  | cong:0 | 🧠 Interactive:18  Compute:3  IOwait:2  RT:0  Unknown:0 | quarantine:0 flagged:0 | slice:4000µs reward:0.42
 ```
 
 #### Column Reference
