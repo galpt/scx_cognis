@@ -1461,7 +1461,10 @@ fn main() -> Result<()> {
                     .args(std::env::args_os().skip(1))
                     .exec();
                 // exec() only returns on error — fall back to in-process restart.
-                warn!("re-exec failed ({}); falling back to in-process restart", exec_err);
+                warn!(
+                    "re-exec failed ({}); falling back to in-process restart",
+                    exec_err
+                );
             }
             Ok(Err(err)) => {
                 tui::emergency_restore_terminal();
@@ -1506,7 +1509,10 @@ fn main() -> Result<()> {
                 let exec_err = std::process::Command::new(&exe)
                     .args(std::env::args_os().skip(1))
                     .exec();
-                warn!("re-exec failed ({}); falling back to in-process restart", exec_err);
+                warn!(
+                    "re-exec failed ({}); falling back to in-process restart",
+                    exec_err
+                );
             }
         }
     }
