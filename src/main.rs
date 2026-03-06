@@ -143,6 +143,9 @@ struct Task {
     deadline: u64,
     timestamp: u64,
     label: TaskLabel,
+    /// Kernel worker threads should stay on their previously used CPU even
+    /// when they reach Rust with a widened affinity mask on newer kernels.
+    is_kernel_worker: bool,
     slice_ns: u64,
     /// Performance criticality score stored as fixed-point u16 (perf_cri × 1000).
     /// Range 0..=1000, representing 0.0..=1.0 with 0.1% resolution.
@@ -740,7 +743,7 @@ impl<'a> Scheduler<'a> {
     fn ai_classify_and_enqueue(
         &mut self,
         task: &mut QueuedTask,
-    ) -> (u64, u64, TaskLabel, f32, TaskFeatures) {
+    ) -> (u64, u64, TaskLabel, f32, TaskFeatures, bool) {
         let t0 = Self::now_ns();
 
         let nr_cpus = (*self.bpf.nr_online_cpus_mut()).max(1) as i32;
@@ -872,7 +875,7 @@ impl<'a> Scheduler<'a> {
         } else {
             features.perf_cri
         };
-        (deadline, slice, label, ret_perf_cri, features)
+        (deadline, slice, label, ret_perf_cri, features, is_kworker)
     }
 
     // ── Drain queued tasks (runs scheduling pipeline per task) ──────────────
@@ -899,7 +902,7 @@ impl<'a> Scheduler<'a> {
 
             match self.bpf.dequeue_task() {
                 Ok(Some(mut task)) => {
-                    let (deadline, slice_ns, label, perf_cri, features) =
+                    let (deadline, slice_ns, label, perf_cri, features, is_kernel_worker) =
                         self.ai_classify_and_enqueue(&mut task);
                     let timestamp = Self::now_ns();
 
@@ -937,6 +940,7 @@ impl<'a> Scheduler<'a> {
                         deadline,
                         timestamp,
                         label,
+                        is_kernel_worker,
                         slice_ns,
                         perf_cri_fp: (perf_cri * 1000.0).clamp(0.0, 1000.0) as u16,
                         qtask: task,
@@ -998,7 +1002,7 @@ impl<'a> Scheduler<'a> {
         // which avoids any user-kernel round-trips when every core is occupied.
         // The threshold floats via the perf_cri EWMA, so the selector re-engages
         // automatically when interactive tasks return.
-        dispatched.cpu = if self.opts.percpu_local {
+        dispatched.cpu = if self.opts.percpu_local || task.is_kernel_worker {
             task.qtask.cpu
         } else if self.perf_cri_ema > 0.85 {
             RL_CPU_ANY
