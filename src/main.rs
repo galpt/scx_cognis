@@ -9,7 +9,8 @@
 //   ┌─────────────────────────────────────────────────────────────────────┐
 //   │  ops.enqueue  → Heuristic classifier + Trust check                  │
 //   │  ops.dispatch → Q-learning policy (adaptive time slice)              │
-//   │  ops.select_cpu → kernel idle-CPU query (bpf.select_cpu → pick_idle_cpu) │
+//   │             → SHARED_DSQ (RL_CPU_ANY) for all user tasks             │
+//   │  ops.select_cpu → kernel idle-CPU query (pick_idle_cpu, atomic)      │
 //   │  ops.tick     → Trust-based anomaly detection (behavioural, zero-alloc) │
 //   └─────────────────────────────────────────────────────────────────────┘
 //
@@ -75,8 +76,9 @@ const RAPID_FAILURE_LIMIT: u32 = 20;
 /// Scheduling pipeline: a deterministic heuristic task classifier, Elman RNN burst prediction
 /// (fixed offline-trained weights), a combined trust/anomaly table for reputation tracking, and
 /// a tabular Q-learning policy controller — all targeting sub-10µs per-event latency with zero
-/// hot-path heap allocations. CPU placement delegates to the kernel's own idle-CPU query
-/// (bpf.select_cpu → pick_idle_cpu) for guaranteed accuracy on every dispatch.
+/// hot-path heap allocations. User tasks are dispatched to SHARED_DSQ (RL_CPU_ANY) so any
+/// available CPU can pick them up, preventing the per-CPU DSQ stall that the previous
+/// bpf.select_cpu() dispatch caused. Kernel workers are still pinned to their affinity CPU.
 #[derive(Debug, Parser)]
 struct Opts {
     /// Base scheduling slice duration in microseconds.
@@ -693,15 +695,31 @@ impl<'a> Scheduler<'a> {
         let nr_cpus = (*self.bpf.nr_online_cpus_mut()).max(1) as i32;
 
         // Use the slice assigned to this PID in the previous cycle as the
-        // denominator for cpu_intensity.  This gives the unambiguous
-        // "slice-usage fraction" without any global-constant normalisation
-        // artefacts.  On the very first event for a new PID, fall back to
-        // base_slice_ns so the value is at least reasonable.
+        // denominator for cpu_intensity (= burst_ns / prev_slice_ns).
+        //
+        // On the very first event for a new PID there is no lifetime entry yet.
+        // Fallback selection:
+        //   • manual mode (base_slice_ns > 0): use the user-configured ceiling.
+        //   • auto mode   (base_slice_ns == 0): use the policy's current auto
+        //     slice (at least 1 ms).  Using 0 as denominator makes
+        //     cpu_intensity = clamp(burst_ns / 1, 0, 1) ≈ 1.0 for every
+        //     long-running process on its first event, causing the classifier
+        //     to label them all as Compute (cpu_intensity > 0.85, exec_ratio
+        //     driven low by accumulated exec_runtime).  kwin_wayland, browsers,
+        //     and other high-value interactive tasks then start life in the
+        //     lowest-priority bucket, compounding any existing per-CPU DSQ lag.
         let prev_slice_ns = self
             .lifetime_get(task.pid)
             .filter(|lt| lt.last_slice_ns > 0)
             .map(|lt| lt.last_slice_ns)
-            .unwrap_or(self.base_slice_ns);
+            .unwrap_or_else(|| {
+                if self.base_slice_ns > 0 {
+                    self.base_slice_ns
+                } else {
+                    // auto mode: clamp to at least 1 ms so cpu_intensity is meaningful.
+                    self.policy.auto_base_ns.max(NSEC_PER_USEC * 1_000)
+                }
+            });
 
         // Build features.
         let features = Self::compute_features(task, self.base_slice_ns, prev_slice_ns, nr_cpus);
@@ -910,7 +928,8 @@ impl<'a> Scheduler<'a> {
         self.sched_latency_ema_ns = self.sched_latency_ema_ns * 0.95 + wait_ns as f64 * 0.05;
 
         // Quarantine status reduces task slice (enforced in ai_classify_and_enqueue);
-        // CPU-level isolation is now delegated to the kernel via bpf.select_cpu().
+        // CPU-level isolation is applied via SHARED_DSQ: quarantined tasks still receive
+        // reduced slices; the BPF idle-kick mechanism ensures them fair access to any CPU.
         let _quarantined =
             self.trust.is_quarantined(task.qtask.pid) || self.trust.is_flagged(task.qtask.pid);
 
@@ -927,27 +946,32 @@ impl<'a> Scheduler<'a> {
             task.deadline
         };
 
-        // CPU selection — use the kernel-aware idle CPU query (same pattern as
-        // scx_rustland).  bpf.select_cpu() calls rs_select_cpu → pick_idle_cpu()
-        // which atomically test-and-clears the CPU's kernel idle bit.  This
-        // guarantees the returned CPU is genuinely idle right now, preventing
-        // the stale-bitmask problem where tasks are dispatched to specific CPUs
-        // that are actually still running the previous cycle's work; those tasks
-        // would sit in cpu_to_dsq(X) waiting for CPU X to call ops.dispatch,
-        // the root cause of the 5-second watchdog / runnable-task stall crashes.
+        // CPU selection: always dispatch user tasks to the shared DSQ (RL_CPU_ANY).
         //
-        // Per-CPU tasks (percpu_local mode) and true single-CPU kworkers bypass
-        // this and go directly to their target CPU — identical to rustland.
+        // Why not per-CPU DSQs?  The BPF ops.dispatch callback picks tasks in this order:
+        //   1. SCHED_DSQ  (userspace scheduler process, if pending work exists)
+        //   2. cpu_to_dsq(current_cpu)  (per-CPU tasks)
+        //   3. SHARED_DSQ
+        //
+        // As long as notify_complete(N > 0) keeps usersched_has_pending_tasks() true, step 1
+        // wins on every ops.dispatch invocation for the CPU that hosts the scheduler.  Any user
+        // task pinned to cpu_to_dsq(X) when CPU X is that hosting CPU sits unserved until
+        // the userspace scheduler's slice expires and step 1 fails for CPU X — which can easily
+        // take > 5 s under sustained load, tripping the sched_ext BPF watchdog with the
+        // "runnable task stall" error seen in production (kwin_wayla:cs0, sudo, etc.).
+        //
+        // SHARED_DSQ is consumed at step 3 by any of the N-1 CPUs that did NOT win the
+        // SCHED_DSQ race, guaranteeing forward progress for user tasks regardless of which
+        // CPU is currently hosting the scheduler.  An idle-CPU kick is still issued by the
+        // BPF dispatch_task() helper (kick_task_cpu → scx_bpf_kick_cpu) so a sleeping CPU
+        // wakes up and drains SHARED_DSQ promptly.
+        //
+        // Kernel workers and --percpu-local tasks are still dispatched to their affined CPU:
+        // kthreads must stay on interrupt-affined CPUs; percpu_local is an explicit user request.
         dispatched.cpu = if self.opts.percpu_local || task.is_kernel_worker {
             task.qtask.cpu
         } else {
-            match self
-                .bpf
-                .select_cpu(task.qtask.pid, task.qtask.cpu, task.qtask.flags)
-            {
-                cpu if cpu >= 0 => cpu,
-                _ => RL_CPU_ANY,
-            }
+            RL_CPU_ANY
         };
 
         if self.bpf.dispatch_task(&dispatched).is_err() {
@@ -1135,12 +1159,11 @@ impl<'a> Scheduler<'a> {
 
         // 2. Batch-dispatch up to 2× nr_cpus tasks in a single schedule() call.
         //
-        // CPU selection now goes through bpf.select_cpu() which atomically
-        // test-and-clears the kernel idle bit, so we no longer need to maintain
-        // a userspace "idle_mask" bitmask (the old approach was the root cause
-        // of the watchdog stalls: it picked CPUs that appeared idle to Cognis
-        // but were still busy in the kernel).  The reset_idle / mark_busy calls
-        // are therefore removed; correctness is fully delegated to the kernel.
+        // All user tasks go to SHARED_DSQ (RL_CPU_ANY) so any of the N-1 CPUs that did
+        // not pick up the scheduler from SCHED_DSQ can consume them.  Per-CPU DSQs are
+        // only used for kernel workers (affinity-pinned) and --percpu-local mode.
+        // No userspace idle bitmask is maintained; the BPF idle-kick from kick_task_cpu
+        // ensures a sleeping CPU wakes up promptly to drain SHARED_DSQ.
         let dispatch_budget = nr_cpus.saturating_mul(2);
         for _ in 0..dispatch_budget {
             if self.tasks_empty() {

@@ -137,7 +137,7 @@ test result: ok. 29 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fin
 > [!TIP]
 > **What to expect from scx_cognis?**
 >
-> Cognis is designed to keep interactive threads — games, audio, desktop UI — responsive even when the rest of the system is under heavy CPU or I/O load. On every scheduling event it classifies each thread as RealTime, Interactive, IoWait, or Compute (`Unknown` remains a reserved metrics bucket and is not emitted by the current heuristic) and dispatches it to a matching priority queue: game threads and audio daemons are dequeued and run before background compilers or encoders, and they receive shorter, more frequent CPU slices (Interactive: 0.5× base, RealTime: 0.25× base) so they are never held up waiting for a CPU-bound worker to exhaust its slice. CPU placement delegates to the kernel's own `pick_idle_cpu()` via `bpf.select_cpu()`, which atomically claims a genuinely idle CPU at dispatch time. A trust-based engine monitors every thread's behaviour: tasks that repeatedly burn their full slice without yielding (background miners, misbehaving workers) lose trust and receive a reduced time-slice, freeing CPU bandwidth for responsive work.
+> Cognis is designed to keep interactive threads — games, audio, desktop UI — responsive even when the rest of the system is under heavy CPU or I/O load. On every scheduling event it classifies each thread as RealTime, Interactive, IoWait, or Compute (`Unknown` remains a reserved metrics bucket and is not emitted by the current heuristic) and dispatches it to a matching priority queue: game threads and audio daemons are dequeued and run before background compilers or encoders, and they receive shorter, more frequent CPU slices (Interactive: 0.5× base, RealTime: 0.25× base) so they are never held up waiting for a CPU-bound worker to exhaust its slice. CPU placement dispatches all user tasks to the shared DSQ (`SHARED_DSQ`), which any available CPU can pick up — this guarantees forward progress even when one CPU is busy hosting the userspace scheduler process. Kernel workers are still pinned to their affinity CPU. A trust-based engine monitors every thread's behaviour: tasks that repeatedly burn their full slice without yielding (background miners, misbehaving workers) lose trust and receive a reduced time-slice, freeing CPU bandwidth for responsive work.
 >
 > Batch-workload throughput is intentionally traded off for responsiveness. If your goal is raw CPU throughput (compilers, encoders, benchmarks), the default EEVDF scheduler usually wins; Cognis's advantage is lower scheduling latency for threads that wake up, do a little work, and sleep again.
 
@@ -147,8 +147,8 @@ Every scheduling decision passes through a multi-stage pipeline. The hot path is
 
 ```
 ops.enqueue   →  Rust kthread check  →  Heuristic Classifier  →  Trust Check  →  Burst Predictor
-ops.dispatch  →  Q-learning Policy (adaptive time slice)
-ops.select_cpu → kernel idle-CPU query  (bpf.select_cpu → pick_idle_cpu, atomic)
+ops.dispatch  →  Q-learning Policy (adaptive time slice)  →  SHARED_DSQ dispatch (RL_CPU_ANY)
+ops.select_cpu → kernel idle-CPU query  (pick_idle_cpu, atomic)
 ops.tick      →  Trust Engine tick  (no-op; prepared for future anomaly detection)
 schedule loop →  Trust Engine flush          (staleness-based, every 1 s)
 ```
@@ -203,16 +203,18 @@ Labels influence the base time-slice multiplier and feed into the Trust Engine a
 
 [↑ Back to Table of Contents](#table-of-contents)
 
-#### CPU Placement — Kernel Idle-CPU Query
+#### CPU Placement — Shared DSQ Dispatch
 
-For every task that reaches `dispatch_task()`, Cognis calls `bpf.select_cpu(pid, prev_cpu, flags)`, which invokes the sched_ext kernel helper `rs_select_cpu` → `pick_idle_cpu()`. This atomically test-and-clears the kernel's own idle bit for the chosen CPU, guaranteeing the returned CPU is genuinely idle at the moment of dispatch — not merely idle in a stale per-cycle bitmask.
+All user tasks dispatched by `dispatch_task()` go to `SHARED_DSQ` (`RL_CPU_ANY`). This means any available CPU can pick up the task, guaranteeing forward progress regardless of which CPU is currently hosting the userspace scheduler process.
 
-If no idle CPU is found (all CPUs busy), `RL_CPU_ANY` is returned and BPF places the task using its own internal load balancer.
+The root cause of the previous `bpf.select_cpu()` per-CPU DSQ approach was a systematic stall: `ops.dispatch` checks `SCHED_DSQ` first (to run the userspace scheduler when `nr_scheduled > 0`). The CPU that "won" that race never reached `cpu_to_dsq(X)` to consume the task pinned there. Under sustained scheduling pressure the targeted CPU could be locked on `SCHED_DSQ` duty for seconds, tripping the 5-second sched_ext watchdog with a "runnable task stall" error.
 
-Per-CPU tasks (`ops.select_cpu`; kernel workers with `nr_cpus_allowed == 1`) bypass this path and are pinned directly to their affinity CPU — identical to the scx_rustland reference pattern.
+`SHARED_DSQ` is consumed by any of the N-1 CPUs that did not get the scheduler from `SCHED_DSQ`. The BPF `kick_task_cpu()` helper in `dispatch_task()` issues an idle-CPU kick so a sleeping CPU wakes up and drains `SHARED_DSQ` promptly.
+
+Kernel workers and tasks in `--percpu-local` mode are still dispatched to their affinity CPU, as before — kthreads must stay interrupt-affined.
 
 > [!NOTE]
-> **Why not a userspace bitmask?** A per-cycle bitmask that resets to "all CPUs idle" each `schedule()` call is stale by construction: dispatching to a CPU that is still running the previous cycle's task leaves the new task waiting in `cpu_to_dsq(X)` until that CPU calls `ops.dispatch`. Under sustained load this accumulates into runnable-task stalls that exceed the 5-second sched_ext watchdog, causing a hard crash. The kernel idle bit is the authoritative source of truth; using it directly eliminates the class of watchdog stall crashes that motivated the bitmask approach.
+> **Why not `bpf.select_cpu()`?** The previous design called `rs_select_cpu → pick_idle_cpu()` to atomically claim a genuinely idle CPU and dispatch directly to `cpu_to_dsq(X)`. This was correct in isolated micro-benchmarks but produced a live-lock under real desktop load: the selected CPU X was frequently the same CPU running the userspace scheduler loop (because `SCHED_DSQ` has higher priority in `ops.dispatch`). The task in `cpu_to_dsq(X)` then sat unserved for up to 5 s until the watchdog fired. `SHARED_DSQ` eliminates this class of stall entirely.
 
 [↑ Back to Table of Contents](#table-of-contents)
 
@@ -301,8 +303,8 @@ flowchart TD
 
     subgraph Pipeline["Scheduling Pipeline"]
         P1["`**enqueue** → heuristic classify → trust check → Elman RNN headroom hint`"]
-        P2["`**select_cpu** → kernel idle-CPU query (bpf.select_cpu → pick_idle_cpu)`"]
-        P3["`**dispatch** → Q-learning policy slice read`"]
+        P2["`**select_cpu** → kernel idle-CPU query (pick_idle_cpu, atomic)`"]
+        P3["`**dispatch** → Q-learning policy slice read → SHARED_DSQ (RL_CPU_ANY)`"]
         P4["`**tick** → trust engine tick`"]
     end
 
@@ -325,7 +327,7 @@ The pipeline runs **synchronously on the hot scheduling path** for the per-task 
 | Heuristic classify | ✅ Yes | every `ops.enqueue` (user tasks only) |
 | Trust check | ✅ Yes | every `ops.enqueue` (user tasks only) |
 | Burst predictor read | ✅ Yes | every `ops.enqueue` (user tasks only) |
-| Kernel idle-CPU query | ✅ Yes | every `ops.select_cpu` |
+| SHARED_DSQ dispatch | ✅ Yes | every `ops.dispatch` (user tasks only; kernel workers go to affinity CPU) |
 | Q-learning slice read | ✅ Yes | every `ops.dispatch` (atomic read) |
 | Trust engine tick | ❌ No | every 100 ms |
 | Q-table update | ❌ No | every 250 ms |
@@ -339,7 +341,7 @@ The pipeline runs **synchronously on the hot scheduling path** for the per-task 
 | Heuristic classify | $`O(1)`$ — 4 comparisons | < 0.05 µs |
 | Trust check | $`O(1)`$ fixed-table lookup | < 0.1 µs |
 | Burst predictor | $`O(1)`$ EMA table read (enqueue); $`O(H \cdot X) = O(12)`$ RNN update (dispatch) | < 0.1 µs |
-| Kernel idle-CPU query | $`O(1)`$ kernel `pick_idle_cpu()` | < 0.01 µs |
+| SHARED_DSQ dispatch | $`O(1)`$ — `RL_CPU_ANY` constant; BPF kick issued by `kick_task_cpu()` | < 0.01 µs |
 | Anti-starvation check | $`O(1)`$ — 100 ms threshold; one `now_ns()` vDSO call + four comparisons per dispatch | < 0.05 µs |
 | Q-learning slice read | $`O(1)`$ atomic read | < 0.05 µs |
 | **Total (typical)** | | **< 1 µs** |
@@ -562,7 +564,7 @@ scx_cognis --monitor 0.5
 
 > [!NOTE]
 > 1. If the scheduler was started **without** the provided service file (e.g. a manually launched instance), the socket may be root-only. In that case prefix with `sudo`.
-> 2. The version is displayed inline at the start of every output line (`[cognis v1.2.1] ...` in the current tree), so you can confirm which build is running without stopping the service. Use `scx_cognis --version` for a one-shot version check when the scheduler is not running.
+> 2. The version is displayed inline at the start of every output line (`[cognis v1.3.3] ...` in the current tree), so you can confirm which build is running without stopping the service. Use `scx_cognis --version` for a one-shot version check when the scheduler is not running.
 
 [↑ Back to Table of Contents](#table-of-contents)
 
@@ -582,7 +584,7 @@ Each line from `--monitor` is a snapshot of one polling interval. All counters l
 
 | Column | Full Name | Type | Meaning |
 |:---|:---|:---|:---|
-| `v1.2.1` (header) | version | static | Scheduler version embedded in every monitor line. In released builds it should match the release tag; in local builds it matches the crate version returned by `scx_cognis --version`. |
+| `v1.3.3` (header) | version | static | Scheduler version embedded in every monitor line. In released builds it should match the release tag; in local builds it matches the crate version returned by `scx_cognis --version`. |
 | `tldr: ...` | human summary | computed | One-line plain-English summary of current system health. Changes every interval based on load, reward, congestion, and threat level. See the [TLDR message reference](#tldr-message-reference) below. |
 | `r: 5/16` | running / online CPUs | instant | Tasks actively executing right now out of total online CPUs. High ratios (≥ 0.8) mean the system is busy. |
 | `q:1 /0` | queued / scheduled | instant | `queued` = tasks handed by the kernel to userspace and waiting for a dispatch decision; `scheduled` = tasks that have been ordered but not yet sent back to BPF. Under normal load both stay near 0. |

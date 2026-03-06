@@ -277,8 +277,20 @@ impl<'cb> BpfScheduler<'cb> {
 
         // Lock all the memory to prevent page faults that could trigger potential deadlocks during
         // scheduling.
+        //
+        // NOTE: `disable_mmap()` is intentionally NOT called here.  That method installs a seccomp
+        // BPF filter that blocks every mmap(2) syscall with EPERM, and seccomp filters are
+        // inherited across exec(2) — they cannot be removed once loaded.  After a sched_ext
+        // watchdog crash, the scheduler re-execs itself for a clean in-process restart.  With the
+        // seccomp filter active, the new process image's dynamic linker cannot mmap shared
+        // libraries (libseccomp.so.2 and others), making every restart attempt permanently fatal
+        // with "cannot create shared object descriptor: Operation not permitted".
+        //
+        // The 64 MB preallocated arena (`HEAP_SIZE = 64 MiB`) combined with
+        // mlockall(MCL_CURRENT | MCL_FUTURE) already guarantees page-fault-free allocation on the
+        // hot scheduling path.  The seccomp guard is a redundant, restart-breaking safety net that
+        // provides no additional correctness benefit for a correctly sized arena.
         ALLOCATOR.lock_memory();
-        ALLOCATOR.disable_mmap().expect("Failed to disable mmap");
 
         // Make sure to use the SCHED_EXT class at least for the scheduler itself.
         if partial {
