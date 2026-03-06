@@ -268,16 +268,16 @@ impl<'a> Scheduler<'a> {
 
         let policy = PolicyController::new(base_slice_ns);
 
-        let mut bpf = BpfScheduler::init(BpfInitArgs {
+        let mut bpf = BpfScheduler::init(
             open_object,
-            open_opts: opts.libbpf.clone().into_bpf_open_opts(),
-            exit_dump_len: opts.exit_dump_len,
-            partial: opts.partial,
-            debug: opts.verbose,
-            builtin_idle: true,
-            slice_ns: slice_ns_min,
-            name: "cognis",
-        })?;
+            opts.libbpf.clone().into_bpf_open_opts(),
+            opts.exit_dump_len,
+            opts.partial,
+            opts.verbose,
+            true,
+            slice_ns_min,
+            "cognis",
+        )?;
 
         // Build initial CPU topology from real sysfs data.
         let mut cpu_sel = CpuSelector::new();

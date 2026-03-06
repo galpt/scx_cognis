@@ -194,17 +194,6 @@ static mut BUF: AlignedBuffer = AlignedBuffer([0; BUFSIZE]);
 
 static SET_HANDLER: Once = Once::new();
 
-pub struct BpfInitArgs<'cb> {
-    pub open_object: &'cb mut MaybeUninit<OpenObject>,
-    pub open_opts: Option<bpf_object_open_opts>,
-    pub exit_dump_len: u32,
-    pub partial: bool,
-    pub debug: bool,
-    pub builtin_idle: bool,
-    pub slice_ns: u64,
-    pub name: &'cb str,
-}
-
 fn set_ctrlc_handler(shutdown: Arc<AtomicBool>) -> Result<(), anyhow::Error> {
     SET_HANDLER.call_once(|| {
         let shutdown_clone = shutdown.clone();
@@ -217,18 +206,17 @@ fn set_ctrlc_handler(shutdown: Arc<AtomicBool>) -> Result<(), anyhow::Error> {
 }
 
 impl<'cb> BpfScheduler<'cb> {
-    pub fn init(args: BpfInitArgs<'cb>) -> Result<Self> {
-        let BpfInitArgs {
-            open_object,
-            open_opts,
-            exit_dump_len,
-            partial,
-            debug,
-            builtin_idle,
-            slice_ns,
-            name,
-        } = args;
-
+    #[allow(clippy::too_many_arguments)]
+    pub fn init(
+        open_object: &'cb mut MaybeUninit<OpenObject>,
+        open_opts: Option<bpf_object_open_opts>,
+        exit_dump_len: u32,
+        partial: bool,
+        debug: bool,
+        builtin_idle: bool,
+        slice_ns: u64,
+        name: &str,
+    ) -> Result<Self> {
         let shutdown = Arc::new(AtomicBool::new(false));
         set_ctrlc_handler(shutdown.clone()).context("Error setting Ctrl-C handler")?;
 
