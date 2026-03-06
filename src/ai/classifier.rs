@@ -95,9 +95,9 @@ pub struct TaskFeatures {
     ///   - High value: tasks that use lots of CPU and/or seldom sleep.
     ///   - Low value: tasks that spend most of their time sleeping (I/O-bound).
     ///
-    /// Used by the A* load balancer to dynamically route tasks to P vs E cores
+    /// Used by the O(1) CPU selector to dynamically route tasks to P vs E cores
     /// based on a system-wide average threshold (rather than a static label→core
-    /// rule).  Range [0, 1].  Computed in `main.rs::compute_features()`.
+    /// rule). Range [0, 1]. Computed in `main.rs::compute_features()`.
     pub perf_cri: f32,
 }
 

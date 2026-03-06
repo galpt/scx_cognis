@@ -3,7 +3,7 @@
 //
 // Scheduling AI modules — aggregates all sub-modules:
 //   - Heuristic task classifier (deterministic rules)
-//   - O(1) bitmask CPU selector (replaces A* load balancer)
+//   - O(1) bitmask CPU selector (current P/E-core routing logic)
 //   - Elman RNN burst predictor (fixed-weight recurrent model, zero-alloc table)
 //   - Trust table (combined reputation + anomaly detection, zero-alloc)
 //   - Q-learning policy controller (tabular reinforcement learning)

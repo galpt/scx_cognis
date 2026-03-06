@@ -143,9 +143,9 @@ impl QTable {
 pub struct SchedulerSignal {
     /// System load average (0..n_cpus) normalised to 0..1.
     pub load_norm: f64,
-    /// Fraction of running tasks classified as Interactive.
+    /// Fraction of cumulative classification events labelled Interactive.
     pub interactive_frac: f64,
-    /// Fraction of running tasks classified as Compute.
+    /// Fraction of cumulative classification events labelled Compute.
     pub compute_frac: f64,
     /// P99 scheduling latency EMA (ns), normalised to [0, 1] by dividing by 10 ms.
     pub latency_p99_norm: f64,

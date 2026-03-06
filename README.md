@@ -1,32 +1,42 @@
 # scx_cognis
 
-"Cognis" (from Latin *cognōscere*) — to learn, to know — is a Linux CPU scheduler built on the [`sched_ext`](https://www.kernel.org/doc/html/latest/scheduler/sched-ext.html) framework and [`scx_rustland_core`](https://crates.io/crates/scx_rustland_core), running entirely in user-space Rust. It combines deterministic heuristics with O(1) bitmask CPU selection, an Elman RNN burst predictor, a zero-alloc trust engine, and a tabular Q-learning policy controller — targeting a sub-10 µs per-event inference overhead. Per-PID state lives in fixed-size arrays; task queues use fixed-capacity `TaskQueue` FIFOs with one inline deferred slot per label, allocated once at init; no heap allocation occurs on the scheduling hot path after `Scheduler::init()` returns.
+Build/test clean — all 29 unit tests pass on every commit. The scheduler builds cleanly from crates.io with no external SCM dependencies. Runtime behaviour on `sched_ext`-enabled kernels is still being hardened, so synthetic benchmark throughput and cold-start behaviour should be validated on your own hardware before relying on it for production workloads.
 
 ---
 
-<a name="table-of-contents"></a>
+Predicts each PID's next CPU burst duration using a compact Elman RNN: $`H = 4`$ hidden units, $`X = 3`$ inputs (`burst_norm`, `exec_ratio`, `cpu_intensity`). The architecture is a standard single-layer Elman RNN ($`h_t = \tanh(W_h \cdot h_{t-1} + W_x \cdot x_t + b)`$); weights are compile-time constants derived from offline analysis of synthetic scheduler traces and have not yet been validated across broad real-world workloads. The forward pass runs in $`O(H \cdot X) = O(12)`$ multiplications with per-PID hidden state stored in a zero-alloc fixed open-addressing table (`[RnnState; 4096]`).
 ## Table of Contents
-
+clamped to $`[-1.0,\ +1.0]`$, where `interactive_frac` and `compute_frac` are derived from the scheduler's observed classification counters and `load_norm` is CPU utilisation (0–1). This produces a meaningful gradient: the policy learns to **shrink** when Compute activity dominates (low `interactive_frac`) and **keep/grow** only when Interactive work is being served well.
 - [Status](#status)
+| `v1.1.8` (header) | version | static | Scheduler version embedded in every monitor line, matching the binary you are running. Identical to the output of `scx_cognis --version`. |
   - [Test Results](#test-results)
+| `Unknown:1` | reserved bucket | per-interval | Reserved metrics bucket. The current heuristic does not emit `Unknown`, so this should normally stay at 0. |
   - [Tested Platforms](#tested-platforms)
+| `reward:0.42` | reward EMA | instant | Exponential moving average of the scheduler's **reward function**: $`R = (\text{interactive\_frac} \times \text{load\_norm}) \times 0.7 - \text{congestion} \times 0.2 - \text{latency} \times 0.1`$. Values near $`1.0`$ are ideal (Interactive tasks served under load); values near $`0`$ mean the workload is mostly compute-heavy or lightly loaded; negative values indicate sustained congestion and/or latency pressure. |
 - [Features](#features)
-  - [Pipeline Overview](#pipeline-overview)
-  - [Component Details](#component-details)
-    - [Heuristic Task Classifier](#heuristic-task-classifier)
+The easiest way to evaluate scx_cognis is to run a stress workload while the browser renders a heavy WebGL scene. `cognis_benchmark.sh` automates this for you. The raw `stress-ng` numbers below are taken from [benchmarks_results.md](../benchmarks_results.md) and should be read together with the subjective browser-responsiveness check.
+ **Potentially much lower raw `bogo ops/s (real time)` for CPU-bound phases** — the current implementation can trade a large amount of synthetic benchmark throughput for responsiveness.
     - [O(1) CPU Selector](#o1-cpu-selector)
     - [Elman RNN Burst Predictor](#elman-rnn-burst-predictor)
     - [Trust Engine](#trust-engine)
     - [Q-learning Policy Controller](#q-learning-policy-controller)
-    - [ratatui TUI Dashboard](#ratatui-tui-dashboard)
+| bogo ops/s (real time) | 22,024.86 | 11,019.19 | −50.0% |
+| bogo ops/s (usr time) | 1,403.81 | 1,826.00 | +30.1% |
+This recorded run shows a substantial real-time throughput penalty under a pure CPU workload, while `usr time` improved moderately.
 - [Design Notes](#design-notes)
   - [Architecture](#architecture)
-  - [Pipeline Details](#pipeline-details)
+| bogo ops/s (real time) | 184,206.49 | 92,322.96 | −49.9% |
+| bogo ops/s (usr time) | 42,681.43 | 43,098.01 | +1.0% |
+In this recorded run the `iomix` real-time throughput dropped sharply, while `usr time` stayed near baseline. That combination indicates materially longer wall-clock completion under the current scheduler despite similar CPU time spent in userspace.
   - [Latency Budget](#latency-budget)
   - [Scheduler Fail-Safe](#scheduler-fail-safe)
   - [Reward Function](#reward-function)
   - [Time-Slice Calculation](#time-slice-calculation)
-- [Requirements](#requirements)
+| CPU ×16 | bogo ops/s (real) | 19,662.59 | 11,780.62 | −40.1% |
+| CPU ×16 | bogo ops/s (usr) | 1,421.03 | 1,739.32 | +22.4% |
+| VM ×2 | bogo ops/s (real) | 24,569.98 | 24,469.50 | −0.4% |
+| VM ×2 | bogo ops/s (usr) | 14,019.12 | 22,904.19 | +63.4% |
+The mixed phase still shows a meaningful CPU-throughput penalty, but the VM stressor stayed near baseline in real-time throughput while improving in `usr time` on this run.
   - [Kernel Requirements](#kernel-requirements)
   - [Rust Toolchain](#rust-toolchain)
   - [System Libraries](#system-libraries)
@@ -78,7 +88,7 @@
 
 ## Status
 
-Stable — all 29 unit tests pass on every commit. The scheduler builds cleanly from crates.io with no external SCM dependencies, and has been run successfully on production workloads on `sched_ext`-enabled kernels (≥ 6.12).
+Build/test clean — all 29 unit tests pass, and the current tree passes `cargo check`, `cargo test`, `cargo clippy --all-targets -- -D warnings`, and `cargo fmt --check`. The scheduler has been exercised successfully on `sched_ext`-enabled kernels (≥ 6.12), but several heuristics and benchmark interpretations are still best treated as implementation-specific rather than production-validated guarantees.
 
 ### Test Results
 
@@ -139,13 +149,13 @@ test result: ok. 29 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fin
 > [!TIP]
 > **What to expect from scx_cognis?**
 >
-> Cognis is designed to keep interactive threads — games, audio, desktop UI — responsive even when the rest of the system is under heavy CPU or I/O load. On every scheduling event it classifies each thread as RealTime, Interactive, IoWait, or Compute (`Unknown` remains a reserved metrics bucket and is not emitted by the current heuristic) and dispatches it to a matching priority queue: game threads and audio daemons are dequeued and run before background compilers or encoders, and they receive shorter, more frequent CPU slices (Interactive: 0.5× base, RealTime: 0.25× base) so they are never held up waiting for a CPU-bound worker to exhaust its slice. On hybrid CPUs (Intel Core Ultra, Raptor Lake), Interactive and RealTime threads are automatically routed to performance cores; Compute threads are sent to efficiency cores — no manual CPU pinning needed. A trust-based engine monitors every thread's behaviour: tasks that repeatedly burn their full slice without yielding (background miners, misbehaving workers) lose trust and are quarantined to a restricted CPU, freeing the rest of the system for responsive work.
+> Cognis is designed to keep interactive threads — games, audio, desktop UI — responsive even when the rest of the system is under heavy CPU or I/O load. On every scheduling event it classifies each thread as RealTime, Interactive, IoWait, or Compute (`Unknown` remains a reserved metrics bucket and is not emitted by the current heuristic) and dispatches it to a matching priority queue: game threads and audio daemons are dequeued and run before background compilers or encoders, and they receive shorter, more frequent CPU slices (Interactive: 0.5× base, RealTime: 0.25× base) so they are never held up waiting for a CPU-bound worker to exhaust its slice. On hybrid CPUs (Intel Core Ultra, Raptor Lake), RealTime tasks always target performance cores, while other tasks are steered by `perf_cri` relative to the system-wide average rather than by a fixed label→core rule. On non-hybrid CPUs, all online CPUs are treated as performance-class. A trust-based engine monitors every thread's behaviour: tasks that repeatedly burn their full slice without yielding (background miners, misbehaving workers) lose trust and are quarantined to a restricted CPU, freeing the rest of the system for responsive work.
 >
-> Fair-share throughput for batch workloads is preserved — just not maximised. If your goal is raw CPU throughput (compilers, encoders, benchmarks), the default EEVDF scheduler wins; cognis's advantage is consistent low scheduling latency for threads that wake up, do a little work, and sleep again.
+> Batch-workload throughput is intentionally traded off for responsiveness. If your goal is raw CPU throughput (compilers, encoders, benchmarks), the default EEVDF scheduler usually wins; Cognis's advantage is lower scheduling latency for threads that wake up, do a little work, and sleep again.
 
 ### Pipeline Overview
 
-Every scheduling decision passes through a multi-stage pipeline. The entire pipeline completes in **< 5 µs** on a modern CPU, staying well within the time-slice budget.
+Every scheduling decision passes through a multi-stage pipeline. The hot path is intentionally bounded and allocation-free after initialisation; live enqueue→dispatch latency is exported through the stats interface instead of being claimed as a fixed universal microbenchmark number.
 
 ```
 ops.enqueue   →  Rust kthread check  →  Heuristic Classifier  →  Trust Check  →  Burst Predictor
@@ -281,7 +291,7 @@ The reward signal is:
 R = (\text{interactive\_frac} \times \text{load\_norm}) \times 0.7 - \text{congestion} \times 0.2 - \text{latency} \times 0.1
 ```
 
-clamped to $`[-1.0,\ +1.0]`$, where `interactive_frac` is the fraction of currently-queued Interactive tasks and `load_norm` is CPU utilisation (0–1). This produces a meaningful gradient: the policy learns to **shrink** when Compute tasks dominate (low `interactive_frac`) and **keep/grow** only when Interactive tasks are well-served.
+clamped to $`[-1.0,\ +1.0]`$, where `interactive_frac` and `compute_frac` are derived from cumulative classification-event counters gathered since scheduler start, while `load_norm` is the current running-tasks-per-CPU ratio clamped to 0–1. This produces a meaningful gradient: the policy learns to **shrink** when recent classification history is compute-heavy (low `interactive_frac`) and **keep/grow** only when interactive work is being served under load.
 
 $`\varepsilon`$-greedy exploration decays from $`0.15 \to 0.02`$ with each update. The current slice is published to an `AtomicU64` so the dispatch hot-path reads it without locking.
 
@@ -589,7 +599,7 @@ scx_cognis --monitor 0.5
 
 > [!NOTE]
 > 1. If the scheduler was started **without** the provided service file (e.g. a manually launched instance), the socket may be root-only. In that case prefix with `sudo`.
-> 2. The version is displayed inline at the start of every output line (`[cognis v1.1.4] ...`), so you can confirm which release is running without stopping the service. Use `scx_cognis --version` for a one-shot version check when the scheduler is not running.
+> 2. The version is displayed inline at the start of every output line (`[cognis v1.2.1] ...` in the current tree), so you can confirm which build is running without stopping the service. Use `scx_cognis --version` for a one-shot version check when the scheduler is not running.
 
 [↑ Back to Table of Contents](#table-of-contents)
 
@@ -602,14 +612,14 @@ Each line from `--monitor` is a snapshot of one polling interval. All counters l
 #### Full Output Format
 
 ```
-[cognis v1.1.4] tldr: Rest assured! I'm keeping your system responsive.   | r:  5/16  q:1 /0   | pf:0 | d→u:312   k:140 c:0  b:0  f:0  | cong:0 | 🧠 Interactive:18  Compute:3  IOwait:2  RT:0  Unknown:0 | quarantine:0 flagged:0 | slice:4000µs reward:0.42
+[cognis v1.2.1] tldr: Rest assured! I'm keeping your system responsive.   | r:  5/16  q:1 /0   | pf:0 | d→u:312   k:140 c:0  b:0  f:0  | cong:0 | 🧠 Interactive:18  Compute:3  IOwait:2  RT:0  Unknown:0 | quarantine:0 flagged:0 | slice:4000µs reward:0.42
 ```
 
 #### Column Reference
 
 | Column | Full Name | Type | Meaning |
 |:---|:---|:---|:---|
-| `v1.1.4` (header) | version | static | Scheduler version embedded in every monitor line, matching the GitHub release tag. Identical to the output of `scx_cognis --version`. |
+| `v1.2.1` (header) | version | static | Scheduler version embedded in every monitor line. In released builds it should match the release tag; in local builds it matches the crate version returned by `scx_cognis --version`. |
 | `tldr: ...` | human summary | computed | One-line plain-English summary of current system health. Changes every interval based on load, reward, congestion, and threat level. See the [TLDR message reference](#tldr-message-reference) below. |
 | `r: 5/16` | running / online CPUs | instant | Tasks actively executing right now out of total online CPUs. High ratios (≥ 0.8) mean the system is busy. |
 | `q:1 /0` | queued / scheduled | instant | `queued` = tasks handed by the kernel to userspace and waiting for a dispatch decision; `scheduled` = tasks that have been ordered but not yet sent back to BPF. Under normal load both stay near 0. |
@@ -624,30 +634,30 @@ Each line from `--monitor` is a snapshot of one polling interval. All counters l
 | `Compute:3` | compute events | per-interval | Events classified as **Compute** (CPU-bound: compilers, encoders). Gets a 1× baseline time-slice (CPU-bound; pre-empted less often by design). |
 | `IOwait:2` | I/O-wait events | per-interval | Events classified as **I/O Wait** (blocked on disk/network most of the time). Gets a 0.75× time-slice. |
 | `RT:0` | realtime events | per-interval | Events classified as **RealTime** (JACK, audio daemons, SCHED_FIFO tasks). Gets a 0.25× time-slice for minimum latency. |
-| `Unknown:1` | unclassified events | per-interval | Events that did not match any heuristic rule. In practice this should never appear with the current 3-band heuristic (every task is classified as Compute, Interactive, or IoWait). Gets a 1× baseline time-slice. |
+| `Unknown:1` | unknown-label events | per-interval | Reserved bucket for events tagged `Unknown`. With the current heuristic, normal userspace tasks should classify into Interactive, Compute, IoWait, or RealTime, so this counter is expected to stay at 0 unless a future classifier revision starts emitting `Unknown`. Gets a 1× baseline time-slice. |
 | `quarantine:0` | quarantined PIDs | instant | PIDs currently throttled by the **Trust Engine** for consistently burning 100% of their assigned slice (monopolising behaviour). They receive a reduced time-slice until their trust score recovers. |
 | `flagged:0` | flagged PIDs | instant | PIDs detected as scheduling anomalies by the **Trust Engine** (adversarial scheduling behaviour: slice-burning, high fork rate, involuntary context switches). Flagged tasks are routed to restricted CPUs to prevent them from starving others. |
-| `slice:4000µs` | policy time-slice | instant | The **Q-learning Policy Controller**'s current effective base time-slice in microseconds. In auto mode (`--slice-us 0`, the default) this is derived from `TARGETED_LATENCY_NS / tasks_per_cpu` (clamped 500 µs – 20 ms, EWMA-smoothed) and then fine-tuned by the Q-learning policy factor. The controller shrinks the slice when Interactive tasks are well-served and grows it when the system is mostly idle. |
-| `reward:0.42` | reward EMA | instant | Exponential moving average of the scheduler's **reward function**: $`R = (\text{interactive\_frac} \times \text{load\_norm}) \times 0.7 - \text{congestion} \times 0.2 - \text{latency} \times 0.1`$. Values near $`1.0`$ are ideal (Interactive tasks served under load); near $`0`$ means mostly Compute tasks dominating; negative values indicate sustained high congestion. |
+| `slice:4000µs` | policy time-slice | instant | The **Q-learning Policy Controller**'s current effective base time-slice in microseconds. In auto mode (`--slice-us 0`, the default) this starts from `TARGETED_LATENCY_NS / max(tasks_per_cpu, 1)` and is clamped to 500 µs – 20 ms before Q-learning applies its bounded action ratio. The controller mainly shrinks slices under interactive-heavy pressure and restores them toward the auto-computed ceiling otherwise. |
+| `reward:0.42` | reward EMA | instant | Exponential moving average of the scheduler's **reward function**: $`R = (\text{interactive\_frac} \times \text{load\_norm}) \times 0.7 - \text{congestion} \times 0.2 - \text{latency} \times 0.1`$. Here `interactive_frac` comes from cumulative classification-event counts, `congestion` is derived from scheduler congestion events, and `latency` is the enqueue→dispatch latency EMA normalised by 10 ms. Values near $`1.0`$ mean interactive work is being served well under load; negative values indicate sustained congestion or latency pressure. |
 
 #### Classification Label Deep-Dive
 
-The classifier uses a **deterministic 3-band heuristic** evaluated stateless on every scheduling event. There is no sliding window or voting — this prevents feedback-loop misclassification while maintaining O(1) latency.
+The classifier uses a **deterministic stateless heuristic** evaluated on every scheduling event. There is no sliding window or voting — this prevents feedback-loop misclassification while maintaining O(1) latency.
 
 The key feature is $`\text{cpu\_intensity} = \text{burst\_ns} / \text{prev\_assigned\_slice\_ns}`$ (slice-usage fraction):
 
 | Label | Slice Multiplier | Heuristic Rule |
 |:---|:---|:---|
 | **RealTime** | 0.25× | priority weight $`> 95\%`$ of max (SCHED_FIFO / SCHED_RR tasks) |
-| **Compute** | 1.0× | $`\text{cpu\_intensity} > 0.85`$ — task consumed > 85% of its assigned slice (CPU-bound) |
-| **Interactive** | 0.5× | $`0.10 \leq \text{cpu\_intensity} \leq 0.85`$ — task yields regularly (latency-sensitive) |
+| **Compute** | 1.0× | $`\text{cpu\_intensity} > 0.85`$ **and** $`\text{exec\_ratio} < 0.30`$ — task consumed most of its assigned slice and did not just wake up (CPU-bound) |
+| **Interactive** | 0.5× | $`0.10 \leq \text{cpu\_intensity} \leq 0.85`$ or high-slice-use wakeups that are not Compute — task yields regularly (latency-sensitive) |
 | **IoWait** | 0.75× | $`\text{cpu\_intensity} < 0.10`$ — task released CPU far before slice expired (I/O-blocked) |
 | **Unknown** | 1.0× | reserved; not emitted by the current heuristic |
 
 > [!TIP]
 > **Why does Interactive dominate?**
 >
-> Most desktop, service, and shell tasks yield before consuming their full slice, giving `cpu_intensity` values in the 0.1–0.85 range. Pure CPU workloads (compilers, encoders, stress-ng) consume their entire slice and jump to `cpu_intensity > 0.85` within one or two scheduling events.
+> Most desktop, service, and shell tasks yield before consuming their full slice, giving `cpu_intensity` values in the 0.1–0.85 range. Pure CPU workloads (compilers, encoders, stress-ng) usually consume their entire slice and, once `exec_ratio` also drops below 0.30, settle into the Compute bucket within one or two scheduling events.
 
 #### TLDR Message Reference
 
@@ -671,7 +681,7 @@ Messages are evaluated each interval in **highest-severity-first** order. The fi
 | `A solid workload — distributing tasks evenly and keeping things smooth.` | `load 65–85%` | Normal moderately-loaded system |
 | `Smooth sailing! Everything is running beautifully right now.` | `reward ≥ 0.7`, `load < 50%` | Ideal operating conditions |
 | `Rest assured! I'm keeping your system responsive.` | `reward ≥ 0.4`, interactive-heavy | System healthy, desktop/UI is snappy |
-| `Compute tasks are in full swing — throughput maximised, interactivity preserved.` | `reward ≥ 0.4`, compute-heavy | Background compute running efficiently without hurting interactivity |
+| `Compute tasks are in full swing — prioritising steady progress while preserving responsiveness where possible.` | `reward ≥ 0.4`, compute-heavy | Compute-heavy workload where Cognis is still trying to keep interactive work responsive |
 | `Balancing work steadily — nothing to worry about.` | `reward ≥ 0.4`, balanced | Healthy mixed workload |
 | `System is mostly idle. Just here waiting to help!` | `load < 10%` | Light load; cognis is in standby |
 | `Keeping an eye on things — all nominal.` | fallback | Default: nothing notable to report |
@@ -1040,7 +1050,7 @@ scx_cognis prioritises **Interactive** tasks with a 0.5× shorter time-slice so 
 - **Lower raw bogo-ops/s for CPU-bound phases** — this is expected and by design. scx_cognis pre-empts compute workers more frequently to keep the browser compositor responsive. The `usr time` metric stays close to or above baseline, confirming no CPU cycles are wasted.
 - **Lower perceived input latency** — the Fish Count slider and tab switching should feel snappy even while CPUs are saturated.
 
-If the `reward` value stays low (near 0) during CPU-heavy phases, this is normal — `interactive_frac` is low when stress-ng workers dominate, which pulls the reward signal down. It does not indicate a problem.
+If the `reward` value stays low (near 0) during CPU-heavy phases, this is normal — `interactive_frac` falls when recent classification events are dominated by stress-ng workers, which pulls the reward signal down. It does not indicate a problem.
 
 ### Test Platform
 
@@ -1060,36 +1070,36 @@ If the `reward` value stays low (near 0) during CPU-heavy phases, this is normal
 > 500 fish (default Aquarium), 60 s per phase, `stress-ng` workload. CPU governor left at system default (`powersave`) for both runs.
 >
 > **Context:**
-> These numbers reflect the current implementation. The real-time throughput gap for CPU-bound phases is expected and by design — scx_cognis pre-empts compute workers more frequently to keep interactive tasks (browser compositor, input handling) responsive. The `usr time` metric, which measures only the CPU time workers were actually executing, stays close to or above baseline, confirming that no CPU cycles are wasted. The tradeoff is intentional: lower raw compute throughput in exchange for sustained frame-rate smoothness under full CPU load.
+> These numbers reflect the current implementation recorded in [benchmarks_results.md](benchmarks_results.md). The real-time throughput gap for CPU-bound phases is expected and by design — scx_cognis pre-empts compute workers more frequently to keep interactive tasks (browser compositor, input handling) responsive. The `usr time` metric, which measures only the CPU time workers were actually executing, stays close to or above baseline. The tradeoff is intentional: lower raw compute throughput in exchange for better responsiveness under full CPU load.
 
 **Phase 1 — CPU stress (16 × workers, 60 s):**
 
 | Metric | Baseline (linux-cachyos) | scx_cognis | Δ |
 |:-------|:--------------:|:----------:|:---:|
-| bogo ops/s (real time) | 20,824 | 2,081 | −90.0% |
-| bogo ops/s (usr time) | 1,384 | 2,077 | +50.1% |
+| bogo ops/s (real time) | 22,024.86 | 11,019.19 | −50.0% |
+| bogo ops/s (usr time) | 1,403.81 | 1,826.00 | +30.1% |
 
-The real-time drop reflects frequent pre-emption of compute workers by higher-priority interactive tasks. The usr-time gain shows that when workers do run, they execute more efficiently — no CPU cycles are wasted between scheduling events.
+The real-time drop reflects frequent pre-emption of compute workers by higher-priority interactive tasks. The usr-time gain shows that when workers do run, they continue to accumulate competitive on-CPU work despite more frequent scheduling interruptions.
 
 **Phase 2 — I/O stress (4 × `iomix` workers, 60 s):**
 
 | Metric | Baseline (linux-cachyos) | scx_cognis | Δ |
 |:-------|:--------------:|:----------:|:---:|
-| bogo ops/s (real time) | 182,051 | 171,387 | −5.9% |
-| bogo ops/s (usr time) | 41,935 | 42,999 | +2.5% |
+| bogo ops/s (real time) | 184,206.49 | 92,322.96 | −49.9% |
+| bogo ops/s (usr time) | 42,681.43 | 43,098.01 | +1.0% |
 
-I/O-bound workers sleep frequently on disk I/O, so they are rarely pre-empted by the Interactive path. Throughput stays within 6% of baseline in both metrics.
+I/O-bound workers still accumulate almost identical usr-time throughput, but the wall-clock score drops sharply because the benchmark mixes wakeups, sleeps, and scheduler-visible latency in a way that amplifies Cognis's responsiveness bias.
 
 **Phase 3 — Mixed stress (16 × `cpu` + 2 × `vm` workers, 60 s):**
 
 | Stressor | Metric | Baseline (linux-cachyos) | scx_cognis | Δ |
 |:---------|:-------|:--------------:|:----------:|:---:|
-| CPU ×16 | bogo ops/s (real) | 18,618 | 1,827 | −90.2% |
-| CPU ×16 | bogo ops/s (usr) | 1,389 | 2,053 | +47.9% |
-| VM ×2 | bogo ops/s (real) | 24,523 | 19,146 | −21.9% |
-| VM ×2 | bogo ops/s (usr) | 14,949 | 160,034 | +970.7% |
+| CPU ×16 | bogo ops/s (real) | 19,662.59 | 11,780.62 | −40.1% |
+| CPU ×16 | bogo ops/s (usr) | 1,421.03 | 1,739.32 | +22.4% |
+| VM ×2 | bogo ops/s (real) | 24,569.98 | 24,469.50 | −0.4% |
+| VM ×2 | bogo ops/s (usr) | 14,019.12 | 22,904.19 | +63.4% |
 
-The CPU stressor shows the same pattern as Phase 1. The VM stressor's exceptional usr-time gain reflects cognis giving short, frequent slices to tasks that yield quickly on memory allocation — the exact wakeup pattern the Interactive heuristic is designed to reward.
+The CPU stressor shows the same general pattern as Phase 1, but with a smaller real-time penalty. The VM stressor stays near baseline in wall-clock throughput while showing a strong usr-time gain, which is consistent with Cognis favouring short, wakeup-heavy work.
 
 > [!TIP]
 > If you run your own benchmark, keep the CPU governor fixed (`performance`) for both schedulers, run each mode at least 3 times, and compare median values. Single runs can swing significantly.
@@ -1116,7 +1126,7 @@ Both screenshots show CPU usage during the transition from Phase 2 to Phase 3 of
 
 ## Limitations and Next Steps
 
-- **Elman RNN weights are hardcoded** — the burst predictor uses a fixed H=4 Elman RNN with weights derived from offline synthetic-trace analysis. The EMA smoothing layer adapts predictions toward observed burst distributions at runtime, but weight updates require gradient computation incompatible with the <5 µs hot-path budget. Online or offline retraining remains a future step.
+- **Elman RNN weights are hardcoded** — the burst predictor uses a fixed H=4 Elman RNN with weights derived from offline synthetic-trace analysis. The EMA smoothing layer adapts predictions toward observed burst distributions at runtime, but weight updates require extra gradient computation that the current bounded hot-path design intentionally avoids. Online or offline retraining remains a future step.
 
 [↑ Back to Table of Contents](#table-of-contents)
 

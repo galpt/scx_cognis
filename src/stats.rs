@@ -52,7 +52,9 @@ pub struct Metrics {
     pub nr_iowait: u64,
     #[stat(desc = "Tasks classified as RealTime")]
     pub nr_realtime: u64,
-    #[stat(desc = "Tasks not yet classified (classifier still warming up)")]
+    #[stat(
+        desc = "Tasks classified as Unknown (reserved bucket; normally zero with the current heuristic)"
+    )]
     pub nr_unknown: u64,
     #[stat(desc = "PIDs currently quarantined by the trust engine")]
     pub nr_quarantined: u64,
@@ -149,7 +151,7 @@ impl Metrics {
         }
         // Good reward, compute in progress.
         if reward >= 0.4 && compute_heavy {
-            return "Compute tasks are in full swing — throughput maximised, interactivity preserved.";
+            return "Compute tasks are in full swing — prioritising steady progress while preserving responsiveness where possible.";
         }
         // Good reward, balanced mix.
         if reward >= 0.4 {
