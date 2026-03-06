@@ -430,9 +430,8 @@ impl<'a> Scheduler<'a> {
     #[inline(always)]
     fn is_kernel_worker(task: &QueuedTask) -> bool {
         // Reinterpret c_char (i8 on Linux) as bytes for ASCII comparison.
-        let bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(task.comm.as_ptr() as *const u8, task.comm.len())
-        };
+        let bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(task.comm.as_ptr() as *const u8, task.comm.len()) };
         let len = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
         let s = &bytes[..len];
 
@@ -837,7 +836,11 @@ impl<'a> Scheduler<'a> {
 
         // Kernel workers need the fastest available CPU (P-core) to complete
         // their bounded kernel operations with minimal latency.
-        let ret_perf_cri = if is_kworker { 1.0f32 } else { features.perf_cri };
+        let ret_perf_cri = if is_kworker {
+            1.0f32
+        } else {
+            features.perf_cri
+        };
         (deadline, slice, label, ret_perf_cri, features)
     }
 
