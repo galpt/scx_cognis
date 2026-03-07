@@ -135,7 +135,7 @@ Cognis is probably **not** what you are looking for when your workload looks lik
 
 If you want the short version, here it is.
 
-When the kernel hands a task to Cognis, the userspace scheduler computes a small feature set, classifies the task, looks up trust state, reads the current burst prediction, computes a slice, and queues the task in a fixed-capacity per-label FIFO. When it is time to dispatch, Cognis first gives truly latency-critical interactive work its own urgent lane, then drains the remaining queues in priority order, keeps tighter latency bounds for interactive and I/O-heavy work, and only performs bounded rescue dispatches for aged compute tasks before sending work back to BPF for execution.
+When the kernel hands a task to Cognis, the userspace scheduler computes a small feature set, classifies the task, looks up trust state, reads the current burst prediction, computes a slice, and queues the task in a fixed-capacity per-label FIFO. When it is time to dispatch, Cognis drains those queues in priority order, keeps tighter latency bounds for interactive and I/O-heavy work, and only performs bounded rescue dispatches for aged compute tasks before sending work back to BPF for execution.
 
 The implementation is intentionally biased toward bounded work:
 
@@ -148,7 +148,7 @@ At a high level, the pipeline in `src/main.rs` is:
 
 ```text
 ops.enqueue    -> feature extraction -> heuristic classification -> trust lookup -> burst predictor read
-ops.dispatch   -> slice computation -> latency-critical lane -> queue pop in priority order -> BPF dispatch
+ops.dispatch   -> slice computation -> queue pop in priority order -> BPF dispatch
 ops.select_cpu -> idle-CPU hinting in BPF, while user-task placement still goes through SHARED_DSQ
 ```
 
@@ -180,8 +180,6 @@ The primary signal is `cpu_intensity`, which is the fraction of the previously a
 - everything else -> `Interactive`
 
 That extra `exec_ratio` guard matters. The code comments call out the reason directly: a task that wakes frequently, does meaningful work, and sleeps again can use a large fraction of its slice without behaving like a classic CPU hog. Without that guard, high-value interactive work can be mislabeled as compute-heavy background work.
-
-After labeling, Cognis also checks whether the task looks latency-critical in a stricter sense. Some interactive tasks are not merely “not compute”; they are the work that determines whether the next frame lands on time. Cognis currently promotes those tasks into a dedicated urgent queue using a bounded heuristic based on wakeup-heavy burst behavior plus well-known desktop/render process names such as compositors, browser renderers, and audio pipeline components.
 
 There is another special case before the classifier even runs: `src/main.rs` checks `comm` names to detect kernel worker threads and force them into the `RealTime` bucket. That logic exists to avoid starving kernel workers that would otherwise look deceptively compute-like.
 
