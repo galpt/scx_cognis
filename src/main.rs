@@ -242,12 +242,24 @@ struct Scheduler<'a> {
 
     // Running counters for scheduling policy metrics.
     label_counts: [u64; 5],
+    /// Recent classification counts for the policy controller.
+    ///
+    /// Unlike `label_counts`, this window is decayed every policy tick so the
+    /// slice controller reacts to the current workload instead of the full
+    /// lifetime history of the scheduler process.
+    recent_label_counts: [u64; 5],
     total_inference_ns: u64,
     inference_samples: u64,
     /// Exponential moving average of user-space scheduling latency
     /// (enqueue → dispatch), in nanoseconds. Updated on every successful
     /// dispatch. Used as `latency_p99_norm` in the Q-learning reward signal.
     sched_latency_ema_ns: f64,
+    /// Number of higher-priority dispatches since the last compute rescue.
+    ///
+    /// This prevents aged compute tasks from taking over the queue as soon as
+    /// they cross the starvation threshold, while still guaranteeing periodic
+    /// progress under a sustained interactive load.
+    compute_rescue_credit: u8,
 }
 
 impl<'a> Scheduler<'a> {
@@ -357,9 +369,11 @@ impl<'a> Scheduler<'a> {
             last_trust_flush: Instant::now(),
             stats_channel_failed: false,
             label_counts: [0; 5],
+            recent_label_counts: [0; 5],
             total_inference_ns: 0,
             inference_samples: 0,
             sched_latency_ema_ns: 0.0,
+            compute_rescue_credit: 0,
         })
     }
 
@@ -482,9 +496,8 @@ impl<'a> Scheduler<'a> {
     // ── Per-label fixed-capacity task queue helpers ────────────────────
 
     #[inline(always)]
-    fn queue_is_starved(front: Option<&Task>, now: u64) -> bool {
-        const STARVATION_NS: u64 = 100_000_000;
-        front.is_some_and(|t| now.saturating_sub(t.timestamp) >= STARVATION_NS)
+    fn queue_is_starved(front: Option<&Task>, now: u64, threshold_ns: u64) -> bool {
+        front.is_some_and(|t| now.saturating_sub(t.timestamp) >= threshold_ns)
     }
 
     #[inline(always)]
@@ -566,6 +579,12 @@ impl<'a> Scheduler<'a> {
     /// per dispatch — O(1), < 50 ns total.
     #[inline(always)]
     fn pop_highest_priority_task(&mut self) -> Option<Task> {
+        const INTERACTIVE_STARVATION_NS: u64 = 20_000_000;
+        const IOWAIT_STARVATION_NS: u64 = 40_000_000;
+        const UNKNOWN_STARVATION_NS: u64 = 100_000_000;
+        const COMPUTE_STARVATION_NS: u64 = 250_000_000;
+        const COMPUTE_RESCUE_INTERVAL: u8 = 8;
+
         // RealTime tasks (kernel workers, SCHED_FIFO/RR) are UNCONDITIONALLY
         // highest priority.  They must be checked BEFORE any anti-starvation
         // logic so that no starvation promotion for lower-priority buckets can
@@ -574,38 +593,57 @@ impl<'a> Scheduler<'a> {
         // had crossed the 100 ms threshold, leaving kworkers in rt_queue
         // unserved for 5+ seconds until the kernel watchdog fired.
         if let Some(t) = self.rt_queue.pop_front() {
+            self.compute_rescue_credit = self.compute_rescue_credit.saturating_add(1);
             return Some(t);
         }
 
         // Anti-starvation promotion — only reached when rt_queue is empty.
-        // Buckets are scanned from lowest → highest priority so the most-starved
-        // task wins when multiple buckets breach the threshold simultaneously.
+        // Interactive and I/O-heavy tasks get tighter latency bounds. Compute
+        // tasks are rescued in a bounded way so they make progress without
+        // taking over every dispatch once the queue ages past its threshold.
         let now = Self::now_ns();
 
-        if Self::queue_is_starved(self.compute_queue.front(), now) {
-            return self.compute_queue.pop_front();
+        if Self::queue_is_starved(
+            self.interactive_queue.front(),
+            now,
+            INTERACTIVE_STARVATION_NS,
+        ) {
+            self.compute_rescue_credit = self.compute_rescue_credit.saturating_add(1);
+            return self.interactive_queue.pop_front();
         }
-        if Self::queue_is_starved(self.unknown_queue.front(), now) {
-            return self.unknown_queue.pop_front();
-        }
-        if Self::queue_is_starved(self.iowait_queue.front(), now) {
+        if Self::queue_is_starved(self.iowait_queue.front(), now, IOWAIT_STARVATION_NS) {
+            self.compute_rescue_credit = self.compute_rescue_credit.saturating_add(1);
             return self.iowait_queue.pop_front();
         }
-        if Self::queue_is_starved(self.interactive_queue.front(), now) {
-            return self.interactive_queue.pop_front();
+        if Self::queue_is_starved(self.unknown_queue.front(), now, UNKNOWN_STARVATION_NS) {
+            self.compute_rescue_credit = self.compute_rescue_credit.saturating_add(1);
+            return self.unknown_queue.pop_front();
+        }
+        if self.compute_rescue_credit >= COMPUTE_RESCUE_INTERVAL
+            && Self::queue_is_starved(self.compute_queue.front(), now, COMPUTE_STARVATION_NS)
+        {
+            self.compute_rescue_credit = 0;
+            return self.compute_queue.pop_front();
         }
 
         // Normal priority order for non-starved tasks.
         if let Some(t) = self.interactive_queue.pop_front() {
+            self.compute_rescue_credit = self.compute_rescue_credit.saturating_add(1);
             return Some(t);
         }
         if let Some(t) = self.iowait_queue.pop_front() {
+            self.compute_rescue_credit = self.compute_rescue_credit.saturating_add(1);
             return Some(t);
         }
         if let Some(t) = self.unknown_queue.pop_front() {
+            self.compute_rescue_credit = self.compute_rescue_credit.saturating_add(1);
             return Some(t);
         }
-        self.compute_queue.pop_front()
+        let task = self.compute_queue.pop_front();
+        if task.is_some() {
+            self.compute_rescue_credit = 0;
+        }
+        task
     }
 
     /// True when all five task buckets are empty.
@@ -741,6 +779,7 @@ impl<'a> Scheduler<'a> {
             self.classifier.classify(&features)
         };
         self.label_counts[label as usize] += 1;
+        self.recent_label_counts[label as usize] += 1;
 
         // Trust-based slice factor.
         let rep_factor = self.trust.slice_factor(task.pid);
@@ -759,6 +798,18 @@ impl<'a> Scheduler<'a> {
             * label.slice_multiplier()
             * rep_factor
             * (task.weight as f64 / 100.0)) as u64;
+
+        // Render-like interactive tasks wake frequently, burn most of the
+        // slice they are given, and need enough uninterrupted CPU time to
+        // complete a frame stage before the next vblank. Give them modest
+        // extra headroom instead of treating them like generic short-slice UI
+        // work.
+        if matches!(label, TaskLabel::Interactive)
+            && features.cpu_intensity > 0.80
+            && features.exec_ratio > 0.60
+        {
+            slice = ((slice as f64) * 1.25) as u64;
+        }
 
         // Headroom hint: if burst predictor says next burst will be short,
         // give a shorter slice to reduce wasted CPU.
@@ -1002,10 +1053,11 @@ impl<'a> Scheduler<'a> {
 
         let nr_cpus = (*self.bpf.nr_online_cpus_mut()).max(1);
         let nr_running = *self.bpf.nr_running_mut();
-        let total_labeled = self.label_counts.iter().sum::<u64>().max(1) as f64;
+        let total_labeled = self.recent_label_counts.iter().sum::<u64>().max(1) as f64;
         let interactive_frac =
-            self.label_counts[TaskLabel::Interactive as usize] as f64 / total_labeled;
-        let compute_frac = self.label_counts[TaskLabel::Compute as usize] as f64 / total_labeled;
+            self.recent_label_counts[TaskLabel::Interactive as usize] as f64 / total_labeled;
+        let compute_frac =
+            self.recent_label_counts[TaskLabel::Compute as usize] as f64 / total_labeled;
 
         // Update the auto-computed slice ceiling based on current load.
         // This mirrors LAVD's slice = targeted_latency / nr_tasks approach and
@@ -1022,6 +1074,10 @@ impl<'a> Scheduler<'a> {
             congestion_rate: *self.bpf.nr_sched_congested_mut() as f64,
         };
         self.policy.update(&sig);
+
+        for count in &mut self.recent_label_counts {
+            *count = (*count * 3) / 4;
+        }
     }
 
     /// Emit trust updates for finished tasks.

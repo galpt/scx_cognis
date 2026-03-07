@@ -44,13 +44,19 @@ impl TaskLabel {
     /// label_priority=0 position at the back of the BTreeSet; doubling their
     /// slice on top of that compounds the starvation.
     ///
+    /// Interactive tasks keep most of the base slice instead of being cut to
+    /// 50%. WebGL render threads, compositors, and similar wakeup-heavy tasks
+    /// often need a little over 1 ms of uninterrupted CPU time to finish a
+    /// frame stage under load. A 0.75× multiplier preserves responsiveness
+    /// without giving them the same long runway as background compute.
+    ///
     /// Production schedulers (scx_rustland, scx_flash) do not apply per-label
     /// slice multipliers for CPU-bound tasks.  They rely on vruntime fairness
     /// and deadline ordering, which we already have.
     pub fn slice_multiplier(self) -> f64 {
         match self {
-            TaskLabel::Interactive => 0.5,
-            TaskLabel::RealTime => 0.25,
+            TaskLabel::Interactive => 0.75,
+            TaskLabel::RealTime => 0.50,
             TaskLabel::IoWait => 0.75,
             TaskLabel::Compute => 1.0, // was 2.0 — see comment above
             TaskLabel::Unknown => 1.0,

@@ -52,7 +52,7 @@ That framing matters, because Cognis is still exactly what it says it is: **an a
 - CI workflows currently cover Ubuntu, Arch Linux, and CachyOS compile/test paths
 - Unit tests: 29
 
-This README describes the scheduler behavior, scripts, and workflows currently shipped with the project.
+This README describes the scheduler behavior, scripts, and workflows that come with Cognis today.
 
 ### CI coverage at a glance
 
@@ -135,7 +135,7 @@ Cognis is probably **not** what you are looking for when your workload looks lik
 
 If you want the short version, here it is.
 
-When the kernel hands a task to Cognis, the userspace scheduler computes a small feature set, classifies the task, looks up trust state, reads the current burst prediction, computes a slice, and queues the task in a fixed-capacity per-label FIFO. When it is time to dispatch, Cognis drains those queues in priority order and sends tasks back to BPF for execution.
+When the kernel hands a task to Cognis, the userspace scheduler computes a small feature set, classifies the task, looks up trust state, reads the current burst prediction, computes a slice, and queues the task in a fixed-capacity per-label FIFO. When it is time to dispatch, Cognis drains those queues in priority order, keeps tighter latency bounds for interactive and I/O-heavy work, and only performs bounded rescue dispatches for aged compute tasks before sending work back to BPF for execution.
 
 The implementation is intentionally biased toward bounded work:
 
@@ -197,15 +197,17 @@ The result is clamped between 500 µs and 20 ms, then smoothed. If the user pass
 
 Then Cognis applies policy and label-specific adjustments:
 
-- `Interactive` -> 0.5x
+- `Interactive` -> 0.75x
 - `IoWait` -> 0.75x
 - `Compute` -> 1.0x
-- `RealTime` -> 0.25x
+- `RealTime` -> 0.5x
 - `Unknown` -> 1.0x
 
-Finally, trust state and burst prediction can reduce the final slice further.
+There is one more interactive-specific guardrail on top of that. If a task keeps waking, burns most of the slice it was given, and then sleeps again, Cognis treats that as a latency-critical burst pattern and gives it a modest extra slice bump instead of forcing it down into the smallest possible desktop slice. That is aimed squarely at render-thread and compositor-style behavior.
 
-The Q-learning controller itself is deliberately modest. It is a bounded tabular controller with 625 discrete states and three actions: shrink, keep, or grow. It runs periodically, not in the inner dispatch loop.
+Burst prediction can still reduce the final slice further when the scheduler already has evidence that the next burst is likely to be short.
+
+The Q-learning controller itself is deliberately modest. It is a bounded tabular controller with 625 discrete states and three actions: shrink, keep, or grow. It runs periodically, not in the inner dispatch loop, and it now reacts to a decayed recent label mix rather than the full lifetime history of the scheduler process.
 
 ### Trust tracking and burst prediction
 
@@ -218,13 +220,13 @@ The first is the burst predictor in [src/ai/burst_predictor.rs](src/ai/burst_pre
 - fixed compile-time weights
 - per-PID state stored in a fixed-size table of 4096 slots
 
-The second is the trust table in [src/ai/trust.rs](src/ai/trust.rs). It tracks a trust score in `[-1.0, 1.0]`, quarantines tasks below the current threshold of `-0.35`, and can flag repeated bad actors for the TUI's wall-of-shame display.
+The second is the trust table in [src/ai/trust.rs](src/ai/trust.rs). It tracks a trust score in `[-1.0, 1.0]`, quarantines tasks below the current threshold of `-0.35`, and can flag repeated bad actors for the TUI's wall-of-shame display. Neutral tasks are not pre-penalized: only negative trust pushes slices down, while neutral and positively scored tasks keep the full slice budget they would otherwise receive.
 
 Both pieces are designed around fixed-size storage and bounded lookup/update cost. That theme shows up all over the project: if the scheduler wants to help during load, it cannot casually allocate its way into becoming extra load.
 
 ### Observability: monitor output and the TUI
 
-The repository currently exposes metrics through `scx_stats` and formats them in [src/stats.rs](src/stats.rs).
+Cognis exposes metrics through `scx_stats` and formats them in [src/stats.rs](src/stats.rs).
 
 The line format starts like this:
 
@@ -265,7 +267,7 @@ To run the scheduler itself, you need:
 - in practice, Cognis currently targets kernels with `sched_ext` support at `>= 6.12`
 - a toolchain capable of building the Rust and BPF pieces
 
-For a source build, the repository scripts and workflows currently assume packages in the `clang`/`llvm`, `libbpf`, `libelf`, `zlib`, `libseccomp`, and `pkg-config` family.
+For a source build, the included scripts and workflows assume packages in the `clang`/`llvm`, `libbpf`, `libelf`, `zlib`, `libseccomp`, and `pkg-config` family.
 
 You can check whether your kernel exposes `sched_ext` like this:
 
@@ -340,7 +342,7 @@ The current CLI in `src/main.rs` includes these user-facing options:
 
 ### Using install.sh
 
-The project ships a root-level installer script in [install.sh](install.sh).
+Cognis includes a root-level installer script in [install.sh](install.sh).
 
 In its current form, that script can:
 
@@ -369,7 +371,7 @@ sudo sh install.sh --flags "--verbose"
 
 ### Using uninstall.sh
 
-The repository also ships [uninstall.sh](uninstall.sh).
+Cognis also includes [uninstall.sh](uninstall.sh).
 
 That script currently:
 

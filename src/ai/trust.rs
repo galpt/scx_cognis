@@ -302,16 +302,20 @@ impl TrustTable {
 
     /// Time-slice multiplier derived from trust score ∈ [0.25, 1.0].
     ///
-    /// Maps the trust score range [-1.0, +1.0] → [0.25, 1.0]:
-    ///   - Neutral (0.0)     → 0.625× (slightly below 1× to avoid boosting unknowns)
-    ///   - Fully trusted (+1.0) → 1.0×
-    ///   - Adversarial (-1.0)   → 0.25× (quarantine sandboxing)
+    /// Neutral and positively-scored tasks keep a full slice. Only negative
+    /// scores are penalized:
+    ///   - Neutral (0.0) or trusted (+1.0) → 1.0×
+    ///   - Adversarial (-1.0)              → 0.25×
     ///
-    /// Replaces `ReputationEngine::slice_factor()`.
+    /// This avoids pre-penalizing long-lived desktop tasks that have not yet
+    /// exited and therefore have not produced any trust observations.
     pub fn slice_factor(&self, pid: i32) -> f64 {
-        let t = self.trust_score(pid); // ∈ [-1.0, +1.0]
-                                       // Linear remap: f(t) = 0.625 + t * 0.375, clamped to [0.25, 1.0].
-        (0.625 + t as f64 * 0.375).clamp(0.25, 1.0)
+        let t = self.trust_score(pid);
+        if t >= 0.0 {
+            1.0
+        } else {
+            (1.0 + t as f64 * 0.75).clamp(0.25, 1.0)
+        }
     }
 
     /// Evict a PID's slot (called when a process fully exits the system).
@@ -504,11 +508,11 @@ mod tests {
     #[test]
     fn slice_factor_ranges() {
         let mut t = TrustTable::new();
-        // Unknown PID → neutral score → factor ≈ 0.625.
+        // Unknown PID → neutral score → no penalty.
         let f_neutral = t.slice_factor(9999);
         assert!(
-            (f_neutral - 0.625).abs() < 0.01,
-            "neutral trust → ~0.625×, got {f_neutral}"
+            (f_neutral - 1.0).abs() < 0.01,
+            "neutral trust → 1.0×, got {f_neutral}"
         );
         // Fully trusted → 1.0×
         let obs_good = ExitObservation {
