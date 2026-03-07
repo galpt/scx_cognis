@@ -6,7 +6,7 @@ Sometimes a Linux desktop feels fine right up until it doesn't. A browser starts
 
 It is a Rust userspace scheduler built on top of `sched_ext` and `scx_rustland_core`. Cognis combines a deterministic task classifier, a fixed-size trust table, a compact burst predictor, and a deterministic load-driven slice controller. The goal is not to be magical. The goal is simpler: keep interactive work responsive under pressure without turning the scheduler itself into the problem.
 
-That framing matters, because Cognis is still exactly what it says it is: **an attempt at an intelligent CPU scheduler**. It is stable enough to build, test, benchmark, and run on `sched_ext`-enabled systems, but it is still an implementation-driven project rather than a broadly validated production scheduler.
+That framing matters, because Cognis is still exactly what it says it is: **an attempt at an adaptive CPU scheduler for interactive desktops and workstations**. It currently builds, tests, benchmarks, and runs on `sched_ext`-enabled systems, but it is still an implementation-driven project rather than a broadly validated production scheduler.
 
 ---
 
@@ -96,18 +96,18 @@ They are not.
 
 That is especially true in the wider `sched_ext` ecosystem. Some schedulers are primarily there to teach or to provide a clean starting point. Some are trying to be highly tunable across architectures. Some are explicitly chasing interactive performance, but do most of their work in BPF. Cognis sits in a narrower lane than that.
 
-If you want the short answer, it is this: **Cognis is for people who want an interactive-first userspace scheduler for a desktop or workstation, and who specifically want the scheduling policy to be inspectable, hackable, and opinionated rather than generic.**
+If you want the short answer, it is this: **Cognis is for people who want an interactive-first userspace scheduler for a desktop or workstation, and who want the scheduling policy to stay inspectable and easy to modify in Rust.**
 
 That puts it in a different place from several well-known `sched_ext` schedulers:
 
-| Scheduler | What it is trying to be | When Cognis is the better fit |
+| Scheduler | What it is trying to be | When Cognis may fit better |
 |:--|:--|:--|
-| `scx_rust_scheduler` | A basic FIFO Rust scheduler template built to help developers learn and experiment | Choose Cognis if you want an actual interactive-first policy with classification, trust tracking, adaptive slices, monitoring, and a TUI rather than a minimal starting point |
-| `scx_rustland` | A readable all-Rust userspace scheduler that prioritizes interactive workloads and doubles as a template | Choose Cognis if you want to stay in the same userspace-Rust family but want a more opinionated desktop/workstation policy with per-event labels, trust-based throttling, burst prediction, and richer observability |
-| `scx_bpfland` | An interactive-first scheduler similar in spirit to Rustland, but with the scheduling policy pushed fully into BPF for production use | Choose Cognis if you care more about policy readability and rapid userspace iteration than about moving as much of the scheduler as possible into BPF |
-| `scx_lavd` | A latency-criticality-aware scheduler aimed at interactive workloads like gaming while still targeting high throughput and low tail latency | Choose Cognis if you want a smaller, easier-to-reason-about userspace policy that is explicitly experimental and easier to modify than a more production-oriented BPF-first design |
-| `scx_rusty` | A flexible multi-domain hybrid scheduler that can be tuned across architectures and workloads | Choose Cognis if your problem is not “I need a broadly tunable topology-aware scheduler,” but “my desktop should stay responsive while mixed background work is happening” |
-| `scx_layered` | A highly configurable scheduler for layer-based policies, service isolation, cgroup-driven CPU allocation, and workload-specific tuning | Choose Cognis if you do not want to design layer configs and CPU allocation policies, and instead want one built-in policy focused on interactive desktop responsiveness |
+| `scx_rust_scheduler` | A basic FIFO Rust scheduler template built to help developers learn and experiment | Consider Cognis if you want a built-in desktop-oriented policy with classification, trust tracking, slice control, monitoring, and a TUI instead of a minimal starting point |
+| `scx_rustland` | A readable all-Rust userspace scheduler that prioritizes interactive workloads and doubles as a template | Consider Cognis if you want a similar userspace-Rust approach with per-event labels, trust-based throttling, burst prediction, and more scheduler-specific monitoring |
+| `scx_bpfland` | An interactive-first scheduler similar in spirit to Rustland, but with the scheduling policy pushed fully into BPF for production use | Consider Cognis if you prefer to keep policy development in userspace Rust rather than move most of it into BPF |
+| `scx_lavd` | A latency-criticality-aware scheduler aimed at interactive workloads like gaming while still targeting high throughput and low tail latency | Consider Cognis if you want a smaller userspace policy that is easier to inspect and modify, and you are comfortable with a more experimental scheduler |
+| `scx_rusty` | A flexible multi-domain hybrid scheduler that can be tuned across architectures and workloads | Consider Cognis if your main problem is desktop responsiveness under mixed background work rather than broad topology-oriented tuning |
+| `scx_layered` | A highly configurable scheduler for layer-based policies, service isolation, cgroup-driven CPU allocation, and workload-specific tuning | Consider Cognis if you want one built-in desktop/workstation policy rather than a layer-configuration framework |
 
 That leads to a practical rule of thumb.
 
@@ -224,7 +224,7 @@ The first is the burst predictor in [src/ai/burst_predictor.rs](src/ai/burst_pre
 - fixed compile-time weights
 - per-PID state stored in a fixed-size table of 4096 slots
 
-The second is the trust table in [src/ai/trust.rs](src/ai/trust.rs). It tracks a trust score in `[-1.0, 1.0]`, quarantines tasks below the current threshold of `-0.35`, and can flag repeated bad actors for the TUI's wall-of-shame display. Neutral tasks are not pre-penalized: only negative trust pushes slices down, while neutral and positively scored tasks keep the full slice budget they would otherwise receive.
+The second is the trust table in [src/ai/trust.rs](src/ai/trust.rs). It tracks a trust score in `[-1.0, 1.0]`, quarantines tasks below the current threshold of `-0.35`, and can flag repeated bad actors for the TUI's trust watchlist. Neutral tasks are not pre-penalized: only negative trust pushes slices down, while neutral and positively scored tasks keep the full slice budget they would otherwise receive.
 
 Both pieces are designed around fixed-size storage and bounded lookup/update cost. That theme shows up all over the project: if the scheduler wants to help during load, it cannot casually allocate its way into becoming extra load.
 
@@ -247,7 +247,7 @@ If you prefer a visual view, the TUI in [src/tui/dashboard.rs](src/tui/dashboard
 3. a task-classification panel
 4. a slice-control panel
 5. an inference-latency chart
-6. a trust “wall of shame”
+6. a trust watchlist
 
 The TUI exits on `q` or `Esc`.
 
@@ -426,7 +426,7 @@ Then it opens the WebGL Aquarium and runs three 60-second `stress-ng` phases:
 2. I/O (`iomix`)
 3. mixed CPU + VM pressure
 
-The script is opinionated about what to watch: not just `bogo ops/s`, but also frame pacing, jank, and whether desktop interaction still feels immediate during load.
+The script is focused on what to watch: not just `bogo ops/s`, but also frame pacing, jank, and whether desktop interaction still feels immediate during load.
 
 ### Reference results
 
@@ -461,7 +461,7 @@ The two screenshots below show the comparison used in this benchmark section:
 
 The useful point of the benchmark is not “Cognis always produces a larger benchmark number.” The more honest reading is narrower than that.
 
-On the recorded reference machine, the numbers above stayed close to baseline while Cognis was tuned for responsiveness-first behavior. That is encouraging, but it is still only one machine, one governor configuration, and one set of runs.
+On the recorded reference machine, the numbers above stayed close to baseline while Cognis was tuned for responsiveness-first behavior. That is useful context, but it is still only one machine, one governor configuration, and one set of runs.
 
 If you want numbers you can trust on your own hardware, keep the governor fixed, run both modes multiple times, and compare medians. Then watch the Aquarium while you do it. The whole project makes a lot more sense when you look at throughput and interaction quality at the same time.
 
@@ -471,7 +471,7 @@ If you want numbers you can trust on your own hardware, keep the governor fixed,
 
 ## Limitations
 
-The scheduler is capable, but it is not shy about its limits.
+The scheduler has clear limits.
 
 - The burst predictor uses fixed compile-time weights rather than online learning.
 - The deterministic slice controller is intentionally global. That keeps the implementation simple and predictable, but it is still not the same thing as LF-BMQ's fully per-task slice expiry and preemption model.

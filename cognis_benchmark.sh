@@ -176,7 +176,7 @@ print_summary() {
     say "  2. Aquarium fps — higher is better (visual responsiveness)"
     say "  3. Aquarium jank — zero stutter is ideal"
     say ""
-    say "scx_cognis should deliver a smoother Aquarium experience under load"
+    say "scx_cognis is intended to improve Aquarium smoothness under load"
     say "by shortening greedy background bursts while preserving enough slice"
     say "budget for render, browser, compositor, and other wakeup-heavy work."
     sep
