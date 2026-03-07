@@ -152,6 +152,7 @@ struct Task {
     deadline: u64,
     timestamp: u64,
     label: TaskLabel,
+    wake_boosted: bool,
     latency_sensitive: bool,
     perf_cri: f32,
     /// Kernel worker threads should stay on their previously used CPU even
@@ -202,6 +203,9 @@ struct Scheduler<'a> {
     stats_server: StatsServer<(), Metrics>,
 
     // Per-label fixed-capacity task queues (priority order: RT > Interactive > IoWait > Unknown > Compute).
+    // A separate boosted interactive lane gives short-lived wake-sensitive
+    // tasks one temporary priority step above the normal interactive FIFO.
+    boosted_interactive_queue: TaskQueue<Task>,
     // Each queue has one inline deferred slot so a single saturation event can
     // be absorbed without losing a runnable task.
     rt_queue: TaskQueue<Task>,
@@ -335,6 +339,7 @@ impl<'a> Scheduler<'a> {
             bpf,
             opts,
             stats_server,
+            boosted_interactive_queue: TaskQueue::with_capacity(QUEUE_DEPTH),
             rt_queue: TaskQueue::with_capacity(QUEUE_DEPTH),
             interactive_queue: TaskQueue::with_capacity(QUEUE_DEPTH),
             iowait_queue: TaskQueue::with_capacity(QUEUE_DEPTH),
@@ -578,11 +583,28 @@ impl<'a> Scheduler<'a> {
 
     #[inline(always)]
     fn has_deferred_tasks(&self) -> bool {
-        self.rt_queue.has_deferred()
+        self.boosted_interactive_queue.has_deferred()
+            || self.rt_queue.has_deferred()
             || self.interactive_queue.has_deferred()
             || self.iowait_queue.has_deferred()
             || self.unknown_queue.has_deferred()
             || self.compute_queue.has_deferred()
+    }
+
+    #[inline(always)]
+    fn should_wake_boost(
+        latency_sensitive: bool,
+        exec_ratio: f32,
+        cpu_intensity: f32,
+        sleep_ns: u64,
+    ) -> bool {
+        const WAKE_BOOST_MIN_SLEEP_NS: u64 = 750_000;
+        const WAKE_BOOST_MAX_SLEEP_NS: u64 = 25_000_000;
+
+        latency_sensitive
+            && (WAKE_BOOST_MIN_SLEEP_NS..=WAKE_BOOST_MAX_SLEEP_NS).contains(&sleep_ns)
+            && exec_ratio >= 0.60
+            && cpu_intensity >= 0.45
     }
 
     /// Route a task to the correct per-label bucket.
@@ -598,6 +620,7 @@ impl<'a> Scheduler<'a> {
         let (result, capacity) = {
             let q = match label {
                 TaskLabel::RealTime => &mut self.rt_queue,
+                TaskLabel::Interactive if task.wake_boosted => &mut self.boosted_interactive_queue,
                 TaskLabel::Interactive => &mut self.interactive_queue,
                 TaskLabel::IoWait => &mut self.iowait_queue,
                 TaskLabel::Unknown => &mut self.unknown_queue,
@@ -655,6 +678,7 @@ impl<'a> Scheduler<'a> {
     /// per dispatch — O(1), < 50 ns total.
     #[inline(always)]
     fn pop_highest_priority_task(&mut self) -> Option<Task> {
+        const BOOSTED_INTERACTIVE_STARVATION_NS: u64 = 8_000_000;
         const INTERACTIVE_STARVATION_NS: u64 = 20_000_000;
         const IOWAIT_STARVATION_NS: u64 = 40_000_000;
         const UNKNOWN_STARVATION_NS: u64 = 100_000_000;
@@ -673,12 +697,21 @@ impl<'a> Scheduler<'a> {
             return Some(t);
         }
 
+        let now = Self::now_ns();
+
+        if Self::queue_is_starved(
+            self.boosted_interactive_queue.front(),
+            now,
+            BOOSTED_INTERACTIVE_STARVATION_NS,
+        ) {
+            self.compute_rescue_credit = self.compute_rescue_credit.saturating_add(1);
+            return self.boosted_interactive_queue.pop_front();
+        }
+
         // Anti-starvation promotion — only reached when rt_queue is empty.
         // Interactive and I/O-heavy tasks get tighter latency bounds. Compute
         // tasks are rescued in a bounded way so they make progress without
         // taking over every dispatch once the queue ages past its threshold.
-        let now = Self::now_ns();
-
         if Self::queue_is_starved(
             self.interactive_queue.front(),
             now,
@@ -703,6 +736,10 @@ impl<'a> Scheduler<'a> {
         }
 
         // Normal priority order for non-starved tasks.
+        if let Some(t) = self.boosted_interactive_queue.pop_front() {
+            self.compute_rescue_credit = self.compute_rescue_credit.saturating_add(1);
+            return Some(t);
+        }
         if let Some(t) = self.interactive_queue.pop_front() {
             self.compute_rescue_credit = self.compute_rescue_credit.saturating_add(1);
             return Some(t);
@@ -725,7 +762,8 @@ impl<'a> Scheduler<'a> {
     /// True when all five task buckets are empty.
     #[inline(always)]
     fn tasks_empty(&self) -> bool {
-        self.rt_queue.is_empty()
+        self.boosted_interactive_queue.is_empty()
+            && self.rt_queue.is_empty()
             && self.interactive_queue.is_empty()
             && self.iowait_queue.is_empty()
             && self.unknown_queue.is_empty()
@@ -735,7 +773,8 @@ impl<'a> Scheduler<'a> {
     /// Total number of tasks across all five buckets.
     #[inline(always)]
     fn tasks_len(&self) -> usize {
-        self.rt_queue.len()
+        self.boosted_interactive_queue.len()
+            + self.rt_queue.len()
             + self.interactive_queue.len()
             + self.iowait_queue.len()
             + self.unknown_queue.len()
@@ -1044,6 +1083,16 @@ impl<'a> Scheduler<'a> {
                         perf_cri,
                     ) = self.ai_classify_and_enqueue(&mut task);
                     let timestamp = Self::now_ns();
+                    let recent_sleep_ns = self
+                        .lifetime_get(task.pid)
+                        .map(|lt| timestamp.saturating_sub(lt.last_seen_ns))
+                        .unwrap_or(0);
+                    let wake_boosted = Self::should_wake_boost(
+                        latency_sensitive,
+                        features.exec_ratio,
+                        features.cpu_intensity,
+                        recent_sleep_ns,
+                    );
 
                     // Check trust flag before borrowing lifetime table mutably.
                     let cheat_flagged = self.trust.is_flagged(task.pid);
@@ -1074,6 +1123,7 @@ impl<'a> Scheduler<'a> {
                         deadline,
                         timestamp,
                         label,
+                        wake_boosted,
                         latency_sensitive,
                         perf_cri,
                         is_kernel_worker,
@@ -1766,4 +1816,25 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Scheduler;
+
+    #[test]
+    fn wake_boost_requires_latency_sensitive_task() {
+        assert!(!Scheduler::should_wake_boost(true, 0.80, 0.70, 200_000));
+        assert!(!Scheduler::should_wake_boost(false, 0.80, 0.70, 8_000_000));
+    }
+
+    #[test]
+    fn wake_boost_accepts_frame_sized_sleep_gap() {
+        assert!(Scheduler::should_wake_boost(true, 0.92, 0.78, 8_000_000));
+    }
+
+    #[test]
+    fn wake_boost_rejects_long_sleepers() {
+        assert!(!Scheduler::should_wake_boost(true, 0.92, 0.78, 40_000_000));
+    }
 }
