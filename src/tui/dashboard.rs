@@ -4,10 +4,10 @@
 // TUI Dashboard — built with ratatui.
 //
 // Renders six panels:
-//   1. Header (scheduler name, live CPU/queued/slice counts).
+//   1. Header (scheduler name, live CPU/queued/base-slice counts).
 //   2. System overview (running/queued tasks, CPUs, dispatch/congestion stats).
 //   3. Task classification breakdown (interactive/compute/io/rt gauges).
-//   4. Slice control state (deterministic slice, inference latency).
+//   4. Slice control state (base slice, recent assigned slice, inference latency).
 //   5. Inference latency chart (rolling 120-sample line chart).
 //   6. Trust watchlist — flagged/quarantined processes.
 //
@@ -247,8 +247,8 @@ fn draw_header(f: &mut Frame, area: Rect, m: &Metrics) {
         Span::raw("│ Adaptive CPU Scheduler for Desktop Responsiveness │ "),
         Span::styled(
             format!(
-                "CPUs: {}  Running: {}  Queued: {}  Slice: {}µs",
-                m.nr_cpus, m.nr_running, m.nr_queued, m.slice_us
+                "CPUs: {}  Running: {}  Queued: {}  Base: {}µs  Assigned≈{}µs",
+                m.nr_cpus, m.nr_running, m.nr_queued, m.base_slice_us, m.assigned_slice_us
             ),
             Style::default().fg(Color::Green),
         ),
@@ -333,8 +333,12 @@ fn gauge_line(label: &str, n: u64, total: u64, color: Color) -> Line<'static> {
 fn draw_slice_control(f: &mut Frame, area: Rect, state: &DashboardState) {
     let items = [
         Line::from(format!(
-            "  Deterministic Slice: {}µs",
-            state.metrics.slice_us
+            "  Base Slice:        {}µs",
+            state.metrics.base_slice_us
+        )),
+        Line::from(format!(
+            "  Assigned Slice≈   {}µs",
+            state.metrics.assigned_slice_us
         )),
         Line::from(format!("  Inference:        {:.2}µs", state.inference_us)),
         Line::from(vec![

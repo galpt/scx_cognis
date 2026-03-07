@@ -264,6 +264,10 @@ struct Scheduler<'a> {
     label_counts: [u64; 5],
     total_inference_ns: u64,
     inference_samples: u64,
+    /// Exponential moving average of the final slice assigned after all
+    /// per-task adjustments. Exported so monitor/TUI can show what tasks have
+    /// actually been receiving instead of only the global slice base.
+    assigned_slice_ema_ns: u64,
     /// Number of higher-priority dispatches since the last compute rescue.
     ///
     /// This prevents aged compute tasks from taking over the queue as soon as
@@ -293,6 +297,7 @@ impl<'a> Scheduler<'a> {
         let slice_ns_min = opts.slice_us_min * NSEC_PER_USEC;
 
         let slice_controller = SliceController::new(base_slice_ns);
+        let initial_assigned_slice_ns = slice_controller.read_slice_ns();
         let cpu_selector = Self::build_cpu_selector();
 
         let bpf = BpfScheduler::init(
@@ -385,6 +390,7 @@ impl<'a> Scheduler<'a> {
             label_counts: [0; 5],
             total_inference_ns: 0,
             inference_samples: 0,
+            assigned_slice_ema_ns: initial_assigned_slice_ns,
             compute_rescue_credit: 0,
             placement_perf_ema: 0.5,
         })
@@ -397,6 +403,23 @@ impl<'a> Scheduler<'a> {
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos() as u64
+    }
+
+    #[inline(always)]
+    fn sample_assigned_slice(&mut self, slice_ns: u64) {
+        if self.assigned_slice_ema_ns == 0 {
+            self.assigned_slice_ema_ns = slice_ns;
+        } else {
+            self.assigned_slice_ema_ns =
+                (self.assigned_slice_ema_ns.saturating_mul(7) + slice_ns) / 8;
+        }
+    }
+
+    #[inline(always)]
+    fn effective_slice_pressure(nr_running: u64, nr_queued: u64, nr_scheduled: u64) -> u64 {
+        nr_running
+            .saturating_add(nr_queued)
+            .saturating_add(nr_scheduled)
     }
 
     fn get_page_faults() -> Result<u64, io::Error> {
@@ -1167,6 +1190,7 @@ impl<'a> Scheduler<'a> {
         if quarantined {
             slice = self.slice_ns_min;
         }
+        self.sample_assigned_slice(slice);
 
         let burst_ns = task.stop_ts.saturating_sub(task.start_ts);
         let renewed_slice_credit_ns = self.next_interactive_slice_credit_ns(
@@ -1470,11 +1494,16 @@ impl<'a> Scheduler<'a> {
 
         let nr_cpus = (*self.bpf.nr_online_cpus_mut()).max(1);
         let nr_running = *self.bpf.nr_running_mut();
+        let nr_queued = *self.bpf.nr_queued_mut();
+        let nr_scheduled = *self.bpf.nr_scheduled_mut();
+        let effective_pressure =
+            Self::effective_slice_pressure(nr_running, nr_queued, nr_scheduled);
 
         // Mirror the targeted-latency load formula directly with no delayed
-        // learning step or exploration. Desktop-critical wakeups need the
-        // slice ceiling to reflect current load immediately.
-        self.slice_controller.update(nr_running, nr_cpus);
+        // learning step or exploration. Feed the controller with running work
+        // plus both kinds of userspace queue pressure so the base slice can
+        // tighten before backlog fully turns into on-CPU execution.
+        self.slice_controller.update(effective_pressure, nr_cpus);
         self.cpu_selector
             .update_avg_perf_cri(self.placement_perf_ema);
     }
@@ -1581,7 +1610,8 @@ impl<'a> Scheduler<'a> {
             nr_unknown: self.label_counts[TaskLabel::Unknown as usize],
             nr_quarantined: quarantined_count,
             nr_flagged: self.trust.flagged_count(),
-            slice_us: self.slice_controller.read_slice_ns() / NSEC_PER_USEC,
+            base_slice_us: self.slice_controller.read_slice_ns() / NSEC_PER_USEC,
+            assigned_slice_us: self.assigned_slice_ema_ns / NSEC_PER_USEC,
             inference_us: avg_inference_us as u64,
         }
     }
@@ -2042,5 +2072,19 @@ mod tests {
         assert!(Scheduler::should_wake_preempt(
             true, true, 2_000_000, 1_500_000
         ));
+    }
+
+    #[test]
+    fn effective_slice_pressure_counts_queued_work() {
+        assert_eq!(Scheduler::effective_slice_pressure(15, 2, 0), 17);
+        assert_eq!(Scheduler::effective_slice_pressure(15, 2, 3), 20);
+    }
+
+    #[test]
+    fn effective_slice_pressure_saturates() {
+        assert_eq!(
+            Scheduler::effective_slice_pressure(u64::MAX, 1, 1),
+            u64::MAX
+        );
     }
 }

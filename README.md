@@ -50,7 +50,7 @@ That framing matters, because Cognis is still exactly what it says it is: **an a
 - Language/runtime model: Rust 2021 userspace scheduler on top of `sched_ext`
 - Core dependencies include `scx_rustland_core = 2.4.10`, `libbpf-rs = 0.26.0-beta.1`, `ratatui = 0.26`, and `crossterm = 0.27`
 - CI workflows currently cover Ubuntu, Arch Linux, and CachyOS compile/test paths
-- Unit tests: 38
+- Unit tests: 40
 
 This README describes the scheduler behavior, scripts, and workflows that come with Cognis today.
 
@@ -195,6 +195,8 @@ First, the deterministic slice controller in [src/ai/policy.rs](src/ai/policy.rs
 TARGETED_LATENCY_NS / max(tasks_per_cpu, 1)
 ```
 
+In the current implementation, `tasks_per_cpu` is fed from the combined pressure that Cognis can see at that moment: currently running tasks plus the queued BPF-to-userspace backlog and any userspace tasks still pending dispatch. That means the base slice can tighten before all of that pressure has already turned into actively running work.
+
 The result is clamped between 250 µs and 8 ms and applied directly. That is intentionally much tighter than a throughput-first desktop policy because Cognis is explicitly trying to stay inside a 120 Hz-style interaction budget under load. If the user passes `--slice-us N`, that value acts as a ceiling, not as a promise that every task will receive exactly `N` microseconds.
 
 Then Cognis applies policy and label-specific adjustments:
@@ -211,7 +213,7 @@ Burst prediction can still reduce the final slice further when the scheduler alr
 
 There is also a separate deadline-side guardrail now: non-compute tasks do not carry an `exec_runtime` penalty past roughly one 120 Hz frame budget. That keeps a browser, renderer, or compositor from missing a wakeup and then spending the next 100 ms paying for it.
 
-The slice controller is deliberately direct. It re-runs the load formula on a short periodic tick and updates the global base slice immediately. The point is not to be clever. The point is to make slice changes predictable enough that desktop-critical wakeups are not waiting on a slower control loop to notice that the machine just got busy.
+The slice controller is deliberately direct. It re-runs the load formula on a short periodic tick and updates the global base slice immediately from the current running-plus-queued pressure signal. The point is not to be clever. The point is to make slice changes predictable enough that desktop-critical wakeups are not waiting on a slower control loop to notice that the machine just got busy.
 
 ### Trust tracking and burst prediction
 
@@ -235,10 +237,10 @@ Cognis exposes metrics through `scx_stats` and formats them in [src/stats.rs](sr
 The line format starts like this:
 
 ```text
-[cognis vx.y.z] tldr: ... | r:... | q:... | pf:... | d→u:... k:... c:... b:... f:... | cong:... | 🧠 Interactive:... Compute:... IOwait:... RT:... Unknown:... | quarantine:... flagged:... | slice:...µs
+[cognis vx.y.z] tldr: ... | r:... | q:... | pf:... | d→u:... k:... c:... b:... f:... | cong:... | 🧠 Interactive:... Compute:... IOwait:... RT:... Unknown:... | quarantine:... flagged:... | slice(base/assigned):.../...µs
 ```
 
-The `tldr` message is not free-form prose; it comes from a fixed set of status messages selected from current metrics such as page faults, failures, congestion, load, and label mix.
+The `tldr` message is not free-form prose; it comes from a fixed set of status messages selected from current metrics such as page faults, failures, congestion, load, and label mix. The exported slice pair now distinguishes the current global load-driven base slice from a recent EMA of the final per-task assigned slices after label, trust, burst, and interactive-renewal adjustments.
 
 If you prefer a visual view, the TUI in [src/tui/dashboard.rs](src/tui/dashboard.rs) currently renders:
 
