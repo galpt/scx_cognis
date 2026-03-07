@@ -27,17 +27,18 @@ use std::sync::Arc;
 // ── Auto-slice constants ──────────────────────────────────────────────────────
 
 /// Targeted scheduling latency: the time window in which all runnable tasks
-/// should be served at least once.  Mirrors LAVD's targeted_latency concept.
-/// Actual slice = TARGETED_LATENCY_NS / max(nr_runnable_per_cpu, 1).
-const TARGETED_LATENCY_NS: u64 = 15_000_000; // 15 ms
+/// should be served at least once. Mirrors LAVD's targeted_latency concept,
+/// but tuned for a 120 Hz desktop frame budget instead of throughput-first
+/// batch execution. Actual slice = TARGETED_LATENCY_NS / max(nr_runnable_per_cpu, 1).
+const TARGETED_LATENCY_NS: u64 = 6_000_000; // 6 ms
 
 /// Absolute minimum slice regardless of how many tasks are running.
 /// Below this value, context-switch overhead starts dominating.
-const AUTO_SLICE_MIN_NS: u64 = 500_000; // 500 µs
+const AUTO_SLICE_MIN_NS: u64 = 250_000; // 250 µs
 
 /// Absolute maximum slice even under very low load.
-/// Caps how long a Compute task can lock a CPU when the system is nearly idle.
-const AUTO_SLICE_MAX_NS: u64 = 20_000_000; // 20 ms
+/// Caps how long a task can monopolize a CPU even when the system is nearly idle.
+const AUTO_SLICE_MAX_NS: u64 = 8_000_000; // 8 ms
 
 // ── Action space ─────────────────────────────────────────────────────────────
 
@@ -53,7 +54,7 @@ const N_ACTIONS: usize = 3;
 // Adjustment ratios per action (applied to current slice within [auto_base/4, auto_base]).
 // Q-learning can only CONTRACT the slice for interactive-heavy phases or RESTORE
 // it when the system is I/O-bound — it cannot inflate above the auto-computed base.
-const ACTION_RATIO: [f64; N_ACTIONS] = [0.80, 1.00, 1.15];
+const ACTION_RATIO: [f64; N_ACTIONS] = [0.75, 1.00, 1.08];
 
 // ── State discretisation ─────────────────────────────────────────────────────
 

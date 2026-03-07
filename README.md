@@ -193,19 +193,21 @@ First, the policy controller in [src/ai/policy.rs](src/ai/policy.rs) computes an
 TARGETED_LATENCY_NS / max(tasks_per_cpu, 1)
 ```
 
-The result is clamped between 500 µs and 20 ms, then smoothed. If the user passes `--slice-us N`, that value acts as a ceiling, not as a promise that every task will receive exactly `N` microseconds.
+The result is clamped between 250 µs and 8 ms, then smoothed. That is intentionally much tighter than a throughput-first desktop policy because Cognis is explicitly trying to stay inside a 120 Hz-style interaction budget under load. If the user passes `--slice-us N`, that value acts as a ceiling, not as a promise that every task will receive exactly `N` microseconds.
 
 Then Cognis applies policy and label-specific adjustments:
 
-- `Interactive` -> 0.75x
-- `IoWait` -> 0.75x
-- `Compute` -> 1.0x
-- `RealTime` -> 0.5x
-- `Unknown` -> 1.0x
+- `Interactive` -> 1.0x
+- `IoWait` -> 0.9x
+- `Compute` -> 0.5x
+- `RealTime` -> 0.75x
+- `Unknown` -> 0.75x
 
 There is one more interactive-specific guardrail on top of that. If a task keeps waking, burns most of the slice it was given, and then sleeps again, Cognis treats that as a latency-critical burst pattern and gives it a modest extra slice bump instead of forcing it down into the smallest possible desktop slice. That is aimed squarely at render-thread and compositor-style behavior.
 
 Burst prediction can still reduce the final slice further when the scheduler already has evidence that the next burst is likely to be short.
+
+There is also a separate deadline-side guardrail now: non-compute tasks do not carry an `exec_runtime` penalty past roughly one 120 Hz frame budget. That keeps a browser, renderer, or compositor from missing a wakeup and then spending the next 100 ms paying for it.
 
 The Q-learning controller itself is deliberately modest. It is a bounded tabular controller with 625 discrete states and three actions: shrink, keep, or grow. It runs periodically, not in the inner dispatch loop, and it now reacts to a decayed recent label mix rather than the full lifetime history of the scheduler process.
 

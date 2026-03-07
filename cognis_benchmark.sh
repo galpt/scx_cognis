@@ -179,8 +179,8 @@ print_summary() {
     say "  3. Aquarium jank — zero stutter is ideal"
     say ""
     say "scx_cognis should deliver a smoother Aquarium experience under load"
-    say "because Interactive tasks receive a 0.5x shorter time-slice, keeping"
-    say "the browser frame-pacing responsive even while CPUs are saturated."
+    say "by shortening greedy background bursts while preserving enough slice"
+    say "budget for render, browser, compositor, and other wakeup-heavy work."
     sep
 }
 

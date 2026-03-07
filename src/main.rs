@@ -65,6 +65,7 @@ use tui::SharedState;
 const SCHEDULER_NAME: &str = "Cognis";
 const NSEC_PER_USEC: u64 = 1_000;
 const NSEC_PER_SEC: u64 = 1_000_000_000;
+const NON_COMPUTE_EXEC_CAP_NS: u64 = 8_000_000;
 const RESTART_BACKOFF: Duration = Duration::from_millis(250);
 const RAPID_FAILURE_WINDOW: Duration = Duration::from_secs(30);
 const RAPID_FAILURE_LIMIT: u32 = 20;
@@ -863,16 +864,15 @@ impl<'a> Scheduler<'a> {
         // the cap and bury them behind every Interactive task.
         // Schedule Compute tasks by vruntime fairness alone.
         //
-        // For all other labels, cap at 100 × slice_ns_min (≈ 100 ms at
-        // default --slice-us-min 1000).  The old cap of 100 × base_slice_ns
-        // (≈ 2000 ms) meant any non-Compute task that didn't sleep frequently
-        // accumulated a 2-second deadline penalty and was treated as Compute
-        // regardless of its label — breaking interactivity under 100% CPU
-        // load.  The tighter 100 ms cap matches scx_rustland's behaviour.
+        // For all other labels, keep the exec-runtime deadline penalty within
+        // roughly one 120 Hz frame budget. A render or compositor thread that
+        // misses one wakeup should not spend the next 100 ms buried behind CPU
+        // hogs. Keeping this cap tight preserves frame pacing under load while
+        // still allowing fair vtime-based ordering among interactive peers.
         let exec_cap = if matches!(label, TaskLabel::Compute) {
             0
         } else {
-            self.slice_ns_min.saturating_mul(100)
+            NON_COMPUTE_EXEC_CAP_NS.max(self.slice_ns_min.saturating_mul(2))
         };
         let deadline = task.vtime.saturating_add(task.exec_runtime.min(exec_cap));
 
