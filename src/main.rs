@@ -150,6 +150,7 @@ struct Task {
     deadline: u64,
     timestamp: u64,
     label: TaskLabel,
+    latency_critical: bool,
     /// Kernel worker threads should stay on their previously used CPU even
     /// when they reach Rust with a widened affinity mask on newer kernels.
     is_kernel_worker: bool,
@@ -201,6 +202,7 @@ struct Scheduler<'a> {
     // Each queue has one inline deferred slot so a single saturation event can
     // be absorbed without losing a runnable task.
     rt_queue: TaskQueue<Task>,
+    latency_queue: TaskQueue<Task>,
     interactive_queue: TaskQueue<Task>,
     iowait_queue: TaskQueue<Task>,
     unknown_queue: TaskQueue<Task>,
@@ -327,6 +329,7 @@ impl<'a> Scheduler<'a> {
             opts,
             stats_server,
             rt_queue: TaskQueue::with_capacity(QUEUE_DEPTH),
+            latency_queue: TaskQueue::with_capacity(QUEUE_DEPTH),
             interactive_queue: TaskQueue::with_capacity(QUEUE_DEPTH),
             iowait_queue: TaskQueue::with_capacity(QUEUE_DEPTH),
             unknown_queue: TaskQueue::with_capacity(QUEUE_DEPTH),
@@ -504,6 +507,7 @@ impl<'a> Scheduler<'a> {
     #[inline(always)]
     fn has_deferred_tasks(&self) -> bool {
         self.rt_queue.has_deferred()
+            || self.latency_queue.has_deferred()
             || self.interactive_queue.has_deferred()
             || self.iowait_queue.has_deferred()
             || self.unknown_queue.has_deferred()
@@ -521,12 +525,16 @@ impl<'a> Scheduler<'a> {
         let label = task.label;
         let pid = task.qtask.pid;
         let (result, capacity) = {
-            let q = match label {
-                TaskLabel::RealTime => &mut self.rt_queue,
-                TaskLabel::Interactive => &mut self.interactive_queue,
-                TaskLabel::IoWait => &mut self.iowait_queue,
-                TaskLabel::Unknown => &mut self.unknown_queue,
-                TaskLabel::Compute => &mut self.compute_queue,
+            let q = if task.latency_critical {
+                &mut self.latency_queue
+            } else {
+                match label {
+                    TaskLabel::RealTime => &mut self.rt_queue,
+                    TaskLabel::Interactive => &mut self.interactive_queue,
+                    TaskLabel::IoWait => &mut self.iowait_queue,
+                    TaskLabel::Unknown => &mut self.unknown_queue,
+                    TaskLabel::Compute => &mut self.compute_queue,
+                }
             };
             (q.push_back(task), q.capacity())
         };
@@ -555,10 +563,10 @@ impl<'a> Scheduler<'a> {
         }
     }
 
-    /// Pop the highest-priority task available across all five buckets,
+    /// Pop the highest-priority task available across all six buckets,
     /// with anti-starvation promotion for lower-priority buckets.
     ///
-    /// Priority order: RealTime > Interactive > IoWait > Unknown > Compute.
+    /// Priority order: RealTime > LatencyCritical > Interactive > IoWait > Unknown > Compute.
     /// Within a bucket, tasks are served FIFO (insertion order).
     ///
     /// # Guarantee for RealTime tasks
@@ -580,6 +588,7 @@ impl<'a> Scheduler<'a> {
     /// per dispatch — O(1), < 50 ns total.
     #[inline(always)]
     fn pop_highest_priority_task(&mut self) -> Option<Task> {
+        const LATENCY_CRITICAL_STARVATION_NS: u64 = 8_000_000;
         const INTERACTIVE_STARVATION_NS: u64 = 20_000_000;
         const IOWAIT_STARVATION_NS: u64 = 40_000_000;
         const UNKNOWN_STARVATION_NS: u64 = 100_000_000;
@@ -605,6 +614,15 @@ impl<'a> Scheduler<'a> {
         let now = Self::now_ns();
 
         if Self::queue_is_starved(
+            self.latency_queue.front(),
+            now,
+            LATENCY_CRITICAL_STARVATION_NS,
+        ) {
+            self.compute_rescue_credit = self.compute_rescue_credit.saturating_add(1);
+            return self.latency_queue.pop_front();
+        }
+
+        if Self::queue_is_starved(
             self.interactive_queue.front(),
             now,
             INTERACTIVE_STARVATION_NS,
@@ -628,6 +646,10 @@ impl<'a> Scheduler<'a> {
         }
 
         // Normal priority order for non-starved tasks.
+        if let Some(t) = self.latency_queue.pop_front() {
+            self.compute_rescue_credit = self.compute_rescue_credit.saturating_add(1);
+            return Some(t);
+        }
         if let Some(t) = self.interactive_queue.pop_front() {
             self.compute_rescue_credit = self.compute_rescue_credit.saturating_add(1);
             return Some(t);
@@ -651,6 +673,7 @@ impl<'a> Scheduler<'a> {
     #[inline(always)]
     fn tasks_empty(&self) -> bool {
         self.rt_queue.is_empty()
+            && self.latency_queue.is_empty()
             && self.interactive_queue.is_empty()
             && self.iowait_queue.is_empty()
             && self.unknown_queue.is_empty()
@@ -661,6 +684,7 @@ impl<'a> Scheduler<'a> {
     #[inline(always)]
     fn tasks_len(&self) -> usize {
         self.rt_queue.len()
+            + self.latency_queue.len()
             + self.interactive_queue.len()
             + self.iowait_queue.len()
             + self.unknown_queue.len()
@@ -725,10 +749,53 @@ impl<'a> Scheduler<'a> {
         }
     }
 
+    #[inline(always)]
+    fn task_comm_matches(task: &QueuedTask, names: &[&[u8]]) -> bool {
+        let bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(task.comm.as_ptr() as *const u8, task.comm.len()) };
+        let len = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+        let comm = &bytes[..len];
+
+        names.iter().any(|name| comm.starts_with(name))
+    }
+
+    #[inline(always)]
+    fn is_latency_critical(task: &QueuedTask, label: TaskLabel, features: &TaskFeatures) -> bool {
+        if matches!(label, TaskLabel::RealTime) {
+            return true;
+        }
+        if !matches!(label, TaskLabel::Interactive) {
+            return false;
+        }
+
+        if Self::task_comm_matches(
+            task,
+            &[
+                b"kwin_wayland",
+                b"kwin_x11",
+                b"Xwayland",
+                b"firefox",
+                b"chrome",
+                b"chromium",
+                b"brave",
+                b"Web Content",
+                b"GPU Process",
+                b"plasmashell",
+                b"gnome-shell",
+                b"pipewire",
+                b"wireplumber",
+            ],
+        ) {
+            return true;
+        }
+
+        features.exec_ratio >= 0.70 && features.cpu_intensity >= 0.55
+    }
+
     fn ai_classify_and_enqueue(
         &mut self,
         task: &mut QueuedTask,
-    ) -> (u64, u64, TaskLabel, TaskFeatures, bool) {
+    ) -> (u64, u64, TaskLabel, TaskFeatures, bool, bool) {
         let t0 = Self::now_ns();
 
         let nr_cpus = (*self.bpf.nr_online_cpus_mut()).max(1) as i32;
@@ -779,6 +846,7 @@ impl<'a> Scheduler<'a> {
         } else {
             self.classifier.classify(&features)
         };
+        let latency_critical = Self::is_latency_critical(task, label, &features);
         self.label_counts[label as usize] += 1;
         self.recent_label_counts[label as usize] += 1;
 
@@ -881,7 +949,14 @@ impl<'a> Scheduler<'a> {
         self.total_inference_ns += elapsed;
         self.inference_samples += 1;
 
-        (deadline, slice, label, features, is_kworker)
+        (
+            deadline,
+            slice,
+            label,
+            features,
+            is_kworker,
+            latency_critical,
+        )
     }
 
     // ── Drain queued tasks (runs scheduling pipeline per task) ──────────────
@@ -908,7 +983,7 @@ impl<'a> Scheduler<'a> {
 
             match self.bpf.dequeue_task() {
                 Ok(Some(mut task)) => {
-                    let (deadline, slice_ns, label, features, is_kernel_worker) =
+                    let (deadline, slice_ns, label, features, is_kernel_worker, latency_critical) =
                         self.ai_classify_and_enqueue(&mut task);
                     let timestamp = Self::now_ns();
 
@@ -941,6 +1016,7 @@ impl<'a> Scheduler<'a> {
                         deadline,
                         timestamp,
                         label,
+                        latency_critical,
                         is_kernel_worker,
                         slice_ns,
                         qtask: task,
