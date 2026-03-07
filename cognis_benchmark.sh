@@ -119,11 +119,9 @@ print_monitor_guide() {
     say "  cong          → Congestion events. Occasional spikes are fine."
     say "                  Sustained high values = scheduler under pressure."
     say ""
-    say "  slice         → AI-adjusted time-slice. Should shrink during"
-    say "                  interactive-heavy phases and grow during compute phases."
-    say ""
-    say "  reward        → EMA reward score. Higher = better balance."
-    say "                  Aim for ≥ 0.3 during the full benchmark."
+    say "  slice         → Deterministic time-slice derived from runnable load."
+    say "                  It should shrink immediately as load rises and recover"
+    say "                  once the workload thins out."
     sep
 }
 

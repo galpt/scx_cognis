@@ -4,7 +4,7 @@ Sometimes a Linux desktop feels fine right up until it doesn't. A browser starts
 
 `scx_cognis` is an experiment in pushing back on that failure mode.
 
-It is a Rust userspace scheduler built on top of `sched_ext` and `scx_rustland_core`. Cognis combines a deterministic task classifier, a fixed-size trust table, a compact burst predictor, and a tabular Q-learning slice controller. The goal is not to be magical. The goal is simpler: keep interactive work responsive under pressure without turning the scheduler itself into the problem.
+It is a Rust userspace scheduler built on top of `sched_ext` and `scx_rustland_core`. Cognis combines a deterministic task classifier, a fixed-size trust table, a compact burst predictor, and a deterministic load-driven slice controller. The goal is not to be magical. The goal is simpler: keep interactive work responsive under pressure without turning the scheduler itself into the problem.
 
 That framing matters, because Cognis is still exactly what it says it is: **an attempt at an intelligent CPU scheduler**. It is stable enough to build, test, benchmark, and run on `sched_ext`-enabled systems, but it is still an implementation-driven project rather than a broadly validated production scheduler.
 
@@ -50,7 +50,7 @@ That framing matters, because Cognis is still exactly what it says it is: **an a
 - Language/runtime model: Rust 2021 userspace scheduler on top of `sched_ext`
 - Core dependencies include `scx_rustland_core = 2.4.10`, `libbpf-rs = 0.26.0-beta.1`, `ratatui = 0.26`, and `crossterm = 0.27`
 - CI workflows currently cover Ubuntu, Arch Linux, and CachyOS compile/test paths
-- Unit tests: 33
+- Unit tests: 35
 
 This README describes the scheduler behavior, scripts, and workflows that come with Cognis today.
 
@@ -83,7 +83,7 @@ Today, Cognis does a few concrete things:
 1. It classifies each scheduling event using a deterministic heuristic.
 2. It dispatches normal user tasks to the shared dispatch queue so any eligible CPU can pick them up.
 3. It keeps fixed-size, preallocated state for trust scoring and burst prediction.
-4. It adjusts the effective slice with a small tabular Q-learning controller that runs off the hot path.
+4. It adjusts the effective slice with a deterministic load-driven controller that runs off the hot path.
 5. It exports live metrics and can render them in a terminal dashboard.
 
 Just as important are the things it does **not** currently do. It does not claim to be a general replacement for the kernel default on every machine. It does not train models online. It does not hide that some of its policy choices are still implementation-specific and benchmark-driven.
@@ -135,7 +135,7 @@ Cognis is probably **not** what you are looking for when your workload looks lik
 
 If you want the short version, here it is.
 
-When the kernel hands a task to Cognis, the userspace scheduler computes a small feature set, classifies the task, looks up trust state, reads the current burst prediction, computes a slice, and queues the task in a fixed-capacity per-label FIFO. When it is time to dispatch, Cognis drains those queues in priority order, gives recent latency-sensitive interactive wakeups one temporary boosted lane ahead of the normal interactive FIFO, selectively accepts explicit idle-CPU placement for those wakeups when that idle CPU matches the scheduler's topology preference and stays in the task's previous LLC when that locality information is available, and only performs bounded rescue dispatches for aged compute tasks before sending work back to BPF for execution.
+When the kernel hands a task to Cognis, the userspace scheduler computes a small feature set, classifies the task, looks up trust state, reads the current burst prediction, computes a slice, and queues the task in a fixed-capacity per-label FIFO. When it is time to dispatch, Cognis drains those queues in priority order, gives recent latency-sensitive interactive wakeups one temporary boosted lane ahead of the normal interactive FIFO, gives those same wakeups a small temporary vtime credit when handing them back to BPF so the urgency survives the shared-queue handoff, selectively accepts explicit idle-CPU placement for those wakeups when that idle CPU matches the scheduler's topology preference and stays in the task's previous LLC when that locality information is available, and only performs bounded rescue dispatches for aged compute tasks before sending work back to BPF for execution.
 
 The implementation is intentionally biased toward bounded work:
 
@@ -148,15 +148,15 @@ At a high level, the pipeline in `src/main.rs` is:
 
 ```text
 ops.enqueue    -> feature extraction -> heuristic classification -> trust lookup -> burst predictor read
-ops.dispatch   -> slice computation -> bounded wake-boost lane for recent latency-sensitive wakeups -> topology-aware idle-CPU and LLC-locality check -> queue pop in priority order -> BPF dispatch
+ops.dispatch   -> deterministic slice computation -> bounded wake-boost lane -> wakeup vtime credit -> topology-aware idle-CPU and LLC-locality check -> queue pop in priority order -> BPF dispatch
 ops.select_cpu -> idle-CPU hinting in BPF, while user-task placement still goes through SHARED_DSQ
 ```
 
 ### Why user tasks go through SHARED_DSQ
 
-This is one of the most important behavioral details in the current design.
+This is one of the most important behavioral details in the design.
 
-Older Cognis iterations tried to dispatch user tasks toward per-CPU DSQs. The current scheduler still sends the bulk of user work to `RL_CPU_ANY`, which means the BPF side places it in the shared dispatch queue. Kernel workers and explicit `--percpu-local` tasks are the obvious exceptions, and there are now two narrower interactive exceptions inside that shared-queue model: recent latency-sensitive wakeups can be moved into a temporary boosted FIFO ahead of the normal interactive lane, and those same wakeups may use a concrete idle CPU when BPF can hand one back and it matches Cognis's topology and LLC-locality rules.
+The scheduler sends the bulk of user work to `RL_CPU_ANY`, which means the BPF side places it in the shared dispatch queue. Kernel workers and explicit `--percpu-local` tasks are the obvious exceptions, and there are two narrower interactive exceptions inside that shared-queue model: recent latency-sensitive wakeups can be moved into a temporary boosted FIFO ahead of the normal interactive lane, and those same wakeups may use a concrete idle CPU when BPF can hand one back and it matches Cognis's topology and LLC-locality rules.
 
 That choice is there for a reason. The comments in `src/main.rs` document the failure mode plainly: pinning userspace-managed work to a CPU-specific DSQ could interact badly with the userspace scheduler thread itself and lead to stalls serious enough to trip the `sched_ext` watchdog. Sending regular user work through the shared queue avoids that class of stall by letting any available CPU drain it. The narrower wakeup boost and placement hints for latency-sensitive interactive tasks are deliberately opportunistic instead of universal: Cognis only gives the temporary queue boost to wakeups that look like recent frame-sized sleeps rather than generic backlog, and it only takes the explicit-CPU path when the BPF selector can identify an idle target right then, when the topology model says that target is a sensible fit for the task's current performance criticality, and when taking that hint does not throw the task onto a different LLC without a good reason.
 
@@ -183,19 +183,19 @@ That extra `exec_ratio` guard matters. The code comments call out the reason dir
 
 There is another special case before the classifier even runs: `src/main.rs` checks `comm` names to detect kernel worker threads and force them into the `RealTime` bucket. That logic exists to avoid starving kernel workers that would otherwise look deceptively compute-like.
 
-After labeling, Cognis also applies a narrower wakeup heuristic for latency-sensitive interactive work. The idea is simple: a compositor frame, browser renderer wakeup, or similar desktop-critical burst is more valuable when it gets one temporary step ahead of older interactive backlog and, when possible, lands on an idle CPU immediately. The current heuristic keeps that bounded by combining wakeup-heavy burst behavior with a small fixed set of well-known desktop process-name prefixes, then only granting the queue boost to wakeups that return after a recent frame-sized sleep gap. Explicit idle-CPU placement is filtered through a lightweight topology model so hybrid systems can prefer the more suitable core type and multi-LLC systems can preserve cache locality instead of accepting any idle CPU blindly.
+After labeling, Cognis also applies a narrower wakeup heuristic for latency-sensitive interactive work. The idea is simple: a compositor frame, browser renderer wakeup, or similar desktop-critical burst is more valuable when it gets one temporary step ahead of older interactive backlog, carries a small temporary urgency credit into the shared dispatch queue, and, when possible, lands on an idle CPU immediately. The current heuristic keeps that bounded by combining wakeup-heavy burst behavior with a small fixed set of well-known desktop process-name prefixes, then only granting the queue boost to wakeups that return after a recent frame-sized sleep gap. Explicit idle-CPU placement is filtered through a lightweight topology model so hybrid systems can prefer the more suitable core type and multi-LLC systems can preserve cache locality instead of accepting any idle CPU blindly.
 
 ### How slices are adjusted
 
 The slice story in Cognis is layered.
 
-First, the policy controller in [src/ai/policy.rs](src/ai/policy.rs) computes an auto base from current load using a targeted latency model:
+First, the deterministic slice controller in [src/ai/policy.rs](src/ai/policy.rs) computes an auto base from current load using a targeted latency model:
 
 ```text
 TARGETED_LATENCY_NS / max(tasks_per_cpu, 1)
 ```
 
-The result is clamped between 250 µs and 8 ms, then smoothed. That is intentionally much tighter than a throughput-first desktop policy because Cognis is explicitly trying to stay inside a 120 Hz-style interaction budget under load. If the user passes `--slice-us N`, that value acts as a ceiling, not as a promise that every task will receive exactly `N` microseconds.
+The result is clamped between 250 µs and 8 ms and applied directly. That is intentionally much tighter than a throughput-first desktop policy because Cognis is explicitly trying to stay inside a 120 Hz-style interaction budget under load. If the user passes `--slice-us N`, that value acts as a ceiling, not as a promise that every task will receive exactly `N` microseconds.
 
 Then Cognis applies policy and label-specific adjustments:
 
@@ -211,7 +211,7 @@ Burst prediction can still reduce the final slice further when the scheduler alr
 
 There is also a separate deadline-side guardrail now: non-compute tasks do not carry an `exec_runtime` penalty past roughly one 120 Hz frame budget. That keeps a browser, renderer, or compositor from missing a wakeup and then spending the next 100 ms paying for it.
 
-The Q-learning controller itself is deliberately modest. It is a bounded tabular controller with 625 discrete states and three actions: shrink, keep, or grow. It runs periodically, not in the inner dispatch loop, and it now reacts to a decayed recent label mix rather than the full lifetime history of the scheduler process.
+The slice controller is deliberately direct. It re-runs the load formula on a short periodic tick and updates the global base slice immediately. The point is not to be clever. The point is to make slice changes predictable enough that desktop-critical wakeups are not waiting on a slower control loop to notice that the machine just got busy.
 
 ### Trust tracking and burst prediction
 
@@ -235,17 +235,17 @@ Cognis exposes metrics through `scx_stats` and formats them in [src/stats.rs](sr
 The line format starts like this:
 
 ```text
-[cognis vx.y.z] tldr: ... | r:... | q:... | pf:... | d→u:... k:... c:... b:... f:... | cong:... | 🧠 Interactive:... Compute:... IOwait:... RT:... Unknown:... | quarantine:... flagged:... | slice:...µs reward:...
+[cognis vx.y.z] tldr: ... | r:... | q:... | pf:... | d→u:... k:... c:... b:... f:... | cong:... | 🧠 Interactive:... Compute:... IOwait:... RT:... Unknown:... | quarantine:... flagged:... | slice:...µs
 ```
 
-The `tldr` message is not free-form prose; it comes from a fixed set of status messages selected from current metrics such as page faults, failures, congestion, load, label mix, and reward EMA.
+The `tldr` message is not free-form prose; it comes from a fixed set of status messages selected from current metrics such as page faults, failures, congestion, load, and label mix.
 
 If you prefer a visual view, the TUI in [src/tui/dashboard.rs](src/tui/dashboard.rs) currently renders:
 
 1. a header
 2. an overview panel
 3. a task-classification panel
-4. a Q-learning policy panel
+4. a slice-control panel
 5. an inference-latency chart
 6. a trust “wall of shame”
 
@@ -474,7 +474,7 @@ If you want numbers you can trust on your own hardware, keep the governor fixed,
 The scheduler is capable, but it is not shy about its limits.
 
 - The burst predictor uses fixed compile-time weights rather than online learning.
-- The Q-learning controller is deliberately small and bounded; it is a practical policy knob, not a grand adaptive intelligence layer.
+- The deterministic slice controller is intentionally global. That keeps the implementation simple and predictable, but it is still not the same thing as LF-BMQ's fully per-task slice expiry and preemption model.
 - Runtime behavior still depends heavily on kernel version, workload shape, CPU topology, and how `sched_ext` behaves on the target machine.
 - CI can prove build/test health, but not real `sched_ext` runtime behavior.
 - Some benchmark and policy conclusions in this README are still best read as evidence about the current implementation, not as universal scheduler laws.

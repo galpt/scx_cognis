@@ -4,11 +4,11 @@
 // scx_cognis — Adaptive CPU Scheduler
 //
 // Built on scx_rustland_core (sched_ext), this scheduler combines deterministic
-// heuristics and statistical/RL-based components in a multi-stage pipeline:
+// heuristics and bounded statistical helpers in a multi-stage pipeline:
 //
 //   ┌─────────────────────────────────────────────────────────────────────┐
 //   │  ops.enqueue  → Heuristic classifier + Trust check                  │
-//   │  ops.dispatch → Q-learning policy (adaptive time slice)              │
+//   │  ops.dispatch → deterministic slice control                           │
 //   │             → SHARED_DSQ (RL_CPU_ANY) for all user tasks             │
 //   │  ops.select_cpu → kernel idle-CPU query (pick_idle_cpu, atomic)      │
 //   │  ops.tick     → Trust-based anomaly detection (behavioural, zero-alloc) │
@@ -58,7 +58,7 @@ use scx_utils::UserExitInfo;
 
 use ai::{
     BurstPredictor, CpuCoreType, CpuSelector, CpuState, ExitObservation, HeuristicClassifier,
-    PolicyController, SchedulerSignal, TaskFeatures, TaskLabel, TrustTable, SHAME_MAX,
+    SliceController, TaskFeatures, TaskLabel, TrustTable, SHAME_MAX,
 };
 use stats::Metrics;
 use task_queue::{QueuePush, TaskQueue};
@@ -74,11 +74,11 @@ const RAPID_FAILURE_LIMIT: u32 = 20;
 
 // ── CLI Options ────────────────────────────────────────────────────────────
 
-/// scx_cognis: an adaptive CPU scheduler combining heuristics, statistical models, and RL.
+/// scx_cognis: an adaptive CPU scheduler combining heuristics and bounded runtime models.
 ///
 /// Scheduling pipeline: a deterministic heuristic task classifier, Elman RNN burst prediction
 /// (fixed offline-trained weights), a combined trust/anomaly table for reputation tracking, and
-/// a tabular Q-learning policy controller — all targeting sub-10µs per-event latency with zero
+/// a deterministic load-driven slice controller — all targeting sub-10µs per-event latency with zero
 /// hot-path heap allocations. User tasks are dispatched to SHARED_DSQ (RL_CPU_ANY) so any
 /// available CPU can pick them up, preventing the per-CPU DSQ stall that the previous
 /// bpf.select_cpu() dispatch caused. Kernel workers are still pinned to their affinity CPU.
@@ -224,7 +224,7 @@ struct Scheduler<'a> {
     classifier: HeuristicClassifier,
     burst_pred: BurstPredictor,
     trust: Box<TrustTable>,
-    policy: PolicyController,
+    slice_controller: SliceController,
     cpu_selector: CpuSelector,
 
     // Fixed-size per-PID lifetime table (Fibonacci hash, zero-alloc after init).
@@ -242,7 +242,7 @@ struct Scheduler<'a> {
 
     // Periodic tick timers.
     last_trust_tick: Instant,
-    last_policy_tick: Instant,
+    last_slice_tick: Instant,
     /// Rate-limiter for [`flush_trust_updates`]: only runs once per second
     /// and only evicts PIDs that have not been seen for ≥ 2 s.
     last_trust_flush: Instant,
@@ -252,18 +252,8 @@ struct Scheduler<'a> {
 
     // Running counters for scheduling policy metrics.
     label_counts: [u64; 5],
-    /// Recent classification counts for the policy controller.
-    ///
-    /// Unlike `label_counts`, this window is decayed every policy tick so the
-    /// slice controller reacts to the current workload instead of the full
-    /// lifetime history of the scheduler process.
-    recent_label_counts: [u64; 5],
     total_inference_ns: u64,
     inference_samples: u64,
-    /// Exponential moving average of user-space scheduling latency
-    /// (enqueue → dispatch), in nanoseconds. Updated on every successful
-    /// dispatch. Used as `latency_p99_norm` in the Q-learning reward signal.
-    sched_latency_ema_ns: f64,
     /// Number of higher-priority dispatches since the last compute rescue.
     ///
     /// This prevents aged compute tasks from taking over the queue as soon as
@@ -283,18 +273,16 @@ impl<'a> Scheduler<'a> {
     ) -> Result<Self> {
         let stats_server = StatsServer::new(stats::server_data()).launch()?;
 
-        // When --slice-us is 0 (the default), the auto-slice mode is active:
-        // PolicyController.update_load() computes the slice from system load and
-        // targeted_latency.  base_slice_ns = 0 signals to PolicyController that
-        // the user has not pinned a ceiling, so it uses auto_base_ns exclusively.
+        // When --slice-us is 0 (the default), auto mode derives the slice from
+        // current runnable load and the targeted latency budget.
         //
         // When --slice-us > 0, the user has chosen an explicit ceiling; we use
-        // it as the reference for vruntime fairness AND as the PolicyController
-        // ceiling override.
+        // it as the reference for vruntime fairness and as an upper bound on
+        // the load-derived slice.
         let base_slice_ns = opts.slice_us * NSEC_PER_USEC; // 0 when auto mode
         let slice_ns_min = opts.slice_us_min * NSEC_PER_USEC;
 
-        let policy = PolicyController::new(base_slice_ns);
+        let slice_controller = SliceController::new(base_slice_ns);
         let cpu_selector = Self::build_cpu_selector();
 
         let bpf = BpfScheduler::init(
@@ -352,7 +340,7 @@ impl<'a> Scheduler<'a> {
             classifier: HeuristicClassifier::new(),
             burst_pred: BurstPredictor::new(),
             trust: TrustTable::new(),
-            policy,
+            slice_controller,
             cpu_selector,
             lifetime_table: {
                 // SAFETY: TaskLifetime is a plain struct with u64/bool fields;
@@ -381,14 +369,12 @@ impl<'a> Scheduler<'a> {
             last_tui_render: Instant::now(),
             last_tui_hist: Instant::now(),
             last_trust_tick: Instant::now(),
-            last_policy_tick: Instant::now(),
+            last_slice_tick: Instant::now(),
             last_trust_flush: Instant::now(),
             stats_channel_failed: false,
             label_counts: [0; 5],
-            recent_label_counts: [0; 5],
             total_inference_ns: 0,
             inference_samples: 0,
-            sched_latency_ema_ns: 0.0,
             compute_rescue_credit: 0,
             placement_perf_ema: 0.5,
         })
@@ -605,6 +591,19 @@ impl<'a> Scheduler<'a> {
             && (WAKE_BOOST_MIN_SLEEP_NS..=WAKE_BOOST_MAX_SLEEP_NS).contains(&sleep_ns)
             && exec_ratio >= 0.60
             && cpu_intensity >= 0.45
+    }
+
+    #[inline(always)]
+    fn wake_deadline_credit_ns(&self, task: &Task) -> u64 {
+        const WAKE_DEADLINE_CREDIT_NS: u64 = 2_000_000;
+
+        if task.wake_boosted {
+            task.slice_ns
+                .max(self.slice_ns_min)
+                .min(WAKE_DEADLINE_CREDIT_NS)
+        } else {
+            0
+        }
     }
 
     /// Route a task to the correct per-label bucket.
@@ -910,7 +909,9 @@ impl<'a> Scheduler<'a> {
                     self.base_slice_ns
                 } else {
                     // auto mode: clamp to at least 1 ms so cpu_intensity is meaningful.
-                    self.policy.auto_base_ns.max(NSEC_PER_USEC * 1_000)
+                    self.slice_controller
+                        .auto_base_ns
+                        .max(NSEC_PER_USEC * 1_000)
                 }
             });
 
@@ -936,7 +937,6 @@ impl<'a> Scheduler<'a> {
         let latency_sensitive = Self::is_latency_sensitive(task, label, &features);
         let perf_cri = Self::placement_perf_cri(label, &features, latency_sensitive, is_kworker);
         self.label_counts[label as usize] += 1;
-        self.recent_label_counts[label as usize] += 1;
         self.placement_perf_ema = self.placement_perf_ema * 0.90 + perf_cri * 0.10;
 
         // Trust-based slice factor.
@@ -946,11 +946,11 @@ impl<'a> Scheduler<'a> {
         // Burst predictor — read prediction for this PID (updated on exit path).
         let predicted_burst = self.burst_pred.prediction_for(task.pid);
 
-        // Q-learning-adjusted base slice.
-        let ai_slice = self.policy.read_slice_ns();
+        // Load-adjusted deterministic base slice.
+        let ai_slice = self.slice_controller.read_slice_ns();
 
         // Final time-slice:
-        //   base = Q-learning policy slice × label_multiplier × (weight / 100)
+        //   base = deterministic slice × label_multiplier × (weight / 100)
         //   clamped to [slice_ns_min .. base_slice * 8]
         let mut slice = (ai_slice as f64
             * label.slice_multiplier()
@@ -981,7 +981,7 @@ impl<'a> Scheduler<'a> {
         let ref_base = if self.base_slice_ns > 0 {
             self.base_slice_ns
         } else {
-            self.policy.auto_base_ns
+            self.slice_controller.auto_base_ns
         };
         let clamp_max = (ref_base * 8).max(self.slice_ns_min);
         slice = slice.clamp(self.slice_ns_min, clamp_max);
@@ -1149,13 +1149,6 @@ impl<'a> Scheduler<'a> {
             return true;
         };
 
-        // Measure real user-space scheduling latency: the time this task waited
-        // in the queues between enqueue (drain_queued_tasks) and now (dispatch).
-        // This is a true measure of scheduler responsiveness.
-        let wait_ns = Self::now_ns().saturating_sub(task.timestamp);
-        // α = 0.05: smooth out per-task jitter while tracking trends over ~20 dispatches.
-        self.sched_latency_ema_ns = self.sched_latency_ema_ns * 0.95 + wait_ns as f64 * 0.05;
-
         // Quarantine status reduces task slice (enforced in ai_classify_and_enqueue);
         // CPU-level isolation is applied via SHARED_DSQ: quarantined tasks still receive
         // reduced slices; the BPF idle-kick mechanism ensures them fair access to any CPU.
@@ -1173,6 +1166,7 @@ impl<'a> Scheduler<'a> {
             0
         } else {
             task.deadline
+                .saturating_sub(self.wake_deadline_credit_ns(&task))
         };
 
         // CPU selection: most user tasks still go to SHARED_DSQ (RL_CPU_ANY).
@@ -1254,42 +1248,22 @@ impl<'a> Scheduler<'a> {
         // through the TUI wall-of-shame instead.
     }
 
-    /// Q-learning policy update (every 250 ms).
-    fn tick_policy(&mut self) {
-        if self.last_policy_tick.elapsed() < Duration::from_millis(250) {
+    /// Deterministic slice update (every 50 ms).
+    fn tick_slice_controller(&mut self) {
+        if self.last_slice_tick.elapsed() < Duration::from_millis(50) {
             return;
         }
-        self.last_policy_tick = Instant::now();
+        self.last_slice_tick = Instant::now();
 
         let nr_cpus = (*self.bpf.nr_online_cpus_mut()).max(1);
         let nr_running = *self.bpf.nr_running_mut();
-        let total_labeled = self.recent_label_counts.iter().sum::<u64>().max(1) as f64;
-        let interactive_frac =
-            self.recent_label_counts[TaskLabel::Interactive as usize] as f64 / total_labeled;
-        let compute_frac =
-            self.recent_label_counts[TaskLabel::Compute as usize] as f64 / total_labeled;
 
-        // Update the auto-computed slice ceiling based on current load.
-        // This mirrors LAVD's slice = targeted_latency / nr_tasks approach and
-        // removes the need for a human to tune --slice-us for their workload.
-        self.policy.update_load(nr_running, nr_cpus);
-
-        let sig = SchedulerSignal {
-            load_norm: (nr_running as f64 / nr_cpus as f64).min(1.0),
-            interactive_frac,
-            compute_frac,
-            // Real enqueue→dispatch scheduling latency, normalised by 10 ms.
-            // Typical: < 100 µs (0.01). Overloaded: 1–5 ms (0.1–0.5).
-            latency_p99_norm: (self.sched_latency_ema_ns / 10_000_000.0).min(1.0),
-            congestion_rate: *self.bpf.nr_sched_congested_mut() as f64,
-        };
-        self.policy.update(&sig);
+        // Mirror the targeted-latency load formula directly with no delayed
+        // learning step or exploration. Desktop-critical wakeups need the
+        // slice ceiling to reflect current load immediately.
+        self.slice_controller.update(nr_running, nr_cpus);
         self.cpu_selector
             .update_avg_perf_cri(self.placement_perf_ema);
-
-        for count in &mut self.recent_label_counts {
-            *count = (*count * 3) / 4;
-        }
     }
 
     /// Emit trust updates for finished tasks.
@@ -1394,9 +1368,8 @@ impl<'a> Scheduler<'a> {
             nr_unknown: self.label_counts[TaskLabel::Unknown as usize],
             nr_quarantined: quarantined_count,
             nr_flagged: self.trust.flagged_count(),
-            ai_slice_us: self.policy.read_slice_ns() / NSEC_PER_USEC,
-            ai_inference_us: avg_inference_us as u64,
-            reward_ema_x100: (self.policy.reward_ema * 100.0) as i64,
+            slice_us: self.slice_controller.read_slice_ns() / NSEC_PER_USEC,
+            inference_us: avg_inference_us as u64,
         }
     }
 
@@ -1454,7 +1427,7 @@ impl<'a> Scheduler<'a> {
     // no-op immediately if its own timer has not elapsed.
     fn housekeeping(&mut self) {
         self.tick_trust();
-        self.tick_policy();
+        self.tick_slice_controller();
         self.flush_trust_updates();
     }
 
@@ -1510,7 +1483,7 @@ impl<'a> Scheduler<'a> {
                 }
             }
 
-            // Background housekeeping (trust engine tick, Q-learning policy update, trust flush).
+            // Background housekeeping (trust engine tick, deterministic slice update, trust flush).
             // Runs outside schedule() so the BPF dispatch path is never
             // delayed by periodic work.  50 ms outer gate plus each
             // function's inner timer ensures at most one unit of work

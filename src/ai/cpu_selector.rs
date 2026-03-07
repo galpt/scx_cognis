@@ -201,7 +201,7 @@ impl CpuSelector {
 
     /// Update the system-wide average performance criticality score.
     ///
-    /// Called from `tick_policy()` with the EWMA of per-task `perf_cri` values
+    /// Called from the periodic slice-control tick with the EWMA of per-task `perf_cri` values
     /// observed in the most recent scheduling window.  α = 0.15 provides a
     /// gentle adaptation that avoids over-reacting to short workload bursts.
     pub fn update_avg_perf_cri(&mut self, new_avg: f32) {

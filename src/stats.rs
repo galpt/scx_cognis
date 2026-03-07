@@ -60,12 +60,10 @@ pub struct Metrics {
     pub nr_quarantined: u64,
     #[stat(desc = "PIDs flagged by the anomaly detection system")]
     pub nr_flagged: u64,
-    #[stat(desc = "Current Q-learning policy time slice (µs)")]
-    pub ai_slice_us: u64,
+    #[stat(desc = "Current deterministic time slice (µs)")]
+    pub slice_us: u64,
     #[stat(desc = "Average per-event scheduling pipeline latency (µs)")]
-    pub ai_inference_us: u64,
-    #[stat(desc = "Policy controller reward EMA (×100 for integer display)")]
-    pub reward_ema_x100: i64,
+    pub inference_us: u64,
 }
 
 impl Metrics {
@@ -73,7 +71,6 @@ impl Metrics {
     /// Scenarios are checked highest-severity first so the most pressing issue
     /// always surfaces in the output.
     pub fn tldr(&self) -> &'static str {
-        let reward = self.reward_ema_x100 as f64 / 100.0;
         let cpus = self.nr_cpus.max(1);
         let load = self.nr_running as f64 / cpus as f64;
         let classified = self.nr_interactive + self.nr_compute + self.nr_iowait + self.nr_realtime;
@@ -88,10 +85,6 @@ impl Metrics {
         // Any dispatch failure means a kernel/BPF-level error.
         if self.nr_failed_dispatches > 0 {
             return "Dispatch failures detected! Something unexpected went wrong — check dmesg.";
-        }
-        // Reward deeply negative → sustained, uncontrolled congestion.
-        if reward < -0.5 {
-            return "SOS! The system is overwhelmed. Hanging on by a thread here!";
         }
         // Many rule-breakers caught simultaneously.
         if self.nr_flagged > 5 && self.nr_quarantined > 5 {
@@ -117,11 +110,6 @@ impl Metrics {
         if self.nr_sched_congested > 0 {
             return "Getting a little crowded in here, but I've got it handled.";
         }
-        // Reward negative without explicit congestion events.
-        if reward < 0.0 {
-            return "Working hard under pressure — might get bumpy. Stay with me!";
-        }
-
         // ── Middle ground ──────────────────────────────────────────────────
         // High load, compute-dominated.
         if load >= 0.85 && compute_heavy {
@@ -135,26 +123,22 @@ impl Metrics {
         if load >= 0.85 {
             return "Running hot! Balancing a heavy mixed workload across all cores.";
         }
-        // Moderate-high load, smooth reward.
+        // Moderate-high load.
         if load >= 0.65 {
             return "A solid workload — distributing tasks evenly and keeping things smooth.";
         }
 
         // ── Best ───────────────────────────────────────────────────────────
-        // Great reward, low-to-moderate load.
-        if reward >= 0.7 && load < 0.5 {
-            return "Smooth sailing! Everything is running beautifully right now.";
-        }
-        // Good reward, mostly interactive.
-        if reward >= 0.4 && interactive_heavy {
+        // Mostly interactive, low-to-moderate load.
+        if interactive_heavy && load < 0.5 {
             return "Rest assured! I'm keeping your system responsive.";
         }
-        // Good reward, compute in progress.
-        if reward >= 0.4 && compute_heavy {
+        // Compute in progress but not overloaded.
+        if compute_heavy && load < 0.65 {
             return "Compute tasks are in full swing — prioritising steady progress while preserving responsiveness where possible.";
         }
-        // Good reward, balanced mix.
-        if reward >= 0.4 {
+        // Balanced mix under control.
+        if load < 0.5 {
             return "Balancing work steadily — nothing to worry about.";
         }
         // System mostly idle (cold start or light desktop).
@@ -169,7 +153,7 @@ impl Metrics {
         writeln!(
             w,
             "[cognis v{}] tldr: {:<55} | r:{:>3}/{:<3} q:{:<3}/{:<3} | pf:{:<4} | d→u:{:<6} k:{:<4} c:{:<4} b:{:<4} f:{:<4} | cong:{:<4} | \
-             🧠 Interactive:{:<4} Compute:{:<4} IOwait:{:<4} RT:{:<4} Unknown:{:<4} | quarantine:{} flagged:{} | slice:{}µs reward:{:.2}",
+             🧠 Interactive:{:<4} Compute:{:<4} IOwait:{:<4} RT:{:<4} Unknown:{:<4} | quarantine:{} flagged:{} | slice:{}µs",
             self.version,
             self.tldr(),
             self.nr_running,
@@ -190,8 +174,7 @@ impl Metrics {
             self.nr_unknown,
             self.nr_quarantined,
             self.nr_flagged,
-            self.ai_slice_us,
-            self.reward_ema_x100 as f64 / 100.0,
+            self.slice_us,
         )?;
         Ok(())
     }

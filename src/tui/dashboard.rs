@@ -7,7 +7,7 @@
 //   1. Header (scheduler name, live CPU/queued/slice counts).
 //   2. System overview (running/queued tasks, CPUs, dispatch/congestion stats).
 //   3. Task classification breakdown (interactive/compute/io/rt gauges).
-//   4. AI policy state (Q-learning reward EMA, slice, inference latency).
+//   4. Slice control state (deterministic slice, inference latency).
 //   5. Scheduling latency chart (rolling 120-sample line chart).
 //   6. Trust "Wall of Shame" — flagged/quarantined processes.
 //
@@ -119,14 +119,8 @@ pub struct DashboardState {
     pub metrics: Metrics,
     pub inference_us: f64, // Most recent inference latency (µs)
     pub inference_hist: HistoryRing,
-    pub reward_hist: HistoryRing,
-    pub throughput_hist: HistoryRing,
     pub wall_of_shame: [WallEntry; SHAME_MAX],
     pub wall_len: usize,
-    /// AI slice history stored as u64 microseconds in a fixed ring buffer.
-    pub ai_slice_hist: [u64; HISTORY_LEN],
-    pub ai_slice_head: usize,
-    pub ai_slice_len: usize,
 }
 
 impl Default for DashboardState {
@@ -135,13 +129,8 @@ impl Default for DashboardState {
             metrics: Metrics::default(),
             inference_us: 0.0,
             inference_hist: HistoryRing::new(),
-            reward_hist: HistoryRing::new(),
-            throughput_hist: HistoryRing::new(),
             wall_of_shame: [WallEntry::ZERO; SHAME_MAX],
             wall_len: 0,
-            ai_slice_hist: [0u64; HISTORY_LEN],
-            ai_slice_head: 0,
-            ai_slice_len: 0,
         }
     }
 }
@@ -149,16 +138,6 @@ impl Default for DashboardState {
 impl DashboardState {
     pub fn push_history(&mut self) {
         self.inference_hist.push(self.inference_us);
-        self.reward_hist
-            .push(self.metrics.reward_ema_x100 as f64 / 100.0);
-        self.throughput_hist
-            .push(self.metrics.nr_user_dispatches as f64);
-        // Push AI slice into the fixed u64 ring.
-        self.ai_slice_hist[self.ai_slice_head] = self.metrics.ai_slice_us;
-        self.ai_slice_head = (self.ai_slice_head + 1) % HISTORY_LEN;
-        if self.ai_slice_len < HISTORY_LEN {
-            self.ai_slice_len += 1;
-        }
     }
 
     pub fn set_wall_of_shame(&mut self, entries: &[WallEntry; SHAME_MAX], len: usize) {
@@ -233,7 +212,7 @@ pub fn draw(frame: &mut Frame, state: &DashboardState) {
         .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
         .split(root[1]);
 
-    // Left column: overview + classification + AI policy.
+    // Left column: overview + classification + slice control.
     let left = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -245,7 +224,7 @@ pub fn draw(frame: &mut Frame, state: &DashboardState) {
 
     draw_overview(frame, left[0], &state.metrics);
     draw_classification(frame, left[1], &state.metrics);
-    draw_ai_policy(frame, left[2], state);
+    draw_slice_control(frame, left[2], state);
 
     // Right column: inference latency chart + wall of shame.
     let right = Layout::default()
@@ -269,7 +248,7 @@ fn draw_header(f: &mut Frame, area: Rect, m: &Metrics) {
         Span::styled(
             format!(
                 "CPUs: {}  Running: {}  Queued: {}  Slice: {}µs",
-                m.nr_cpus, m.nr_running, m.nr_queued, m.ai_slice_us
+                m.nr_cpus, m.nr_running, m.nr_queued, m.slice_us
             ),
             Style::default().fg(Color::Green),
         ),
@@ -351,22 +330,11 @@ fn gauge_line(label: &str, n: u64, total: u64, color: Color) -> Line<'static> {
     ])
 }
 
-fn draw_ai_policy(f: &mut Frame, area: Rect, state: &DashboardState) {
-    let reward = state.metrics.reward_ema_x100 as f64 / 100.0;
-    let reward_color = if reward > 0.0 {
-        Color::Green
-    } else {
-        Color::Red
-    };
-
+fn draw_slice_control(f: &mut Frame, area: Rect, state: &DashboardState) {
     let items = [
-        Line::from(vec![
-            Span::raw("  Q-learning Reward: "),
-            Span::styled(format!("{:+.4}", reward), Style::default().fg(reward_color)),
-        ]),
         Line::from(format!(
-            "  Q-learning Slice: {}µs  (base × policy factor)",
-            state.metrics.ai_slice_us
+            "  Deterministic Slice: {}µs",
+            state.metrics.slice_us
         )),
         Line::from(format!("  Inference:        {:.2}µs", state.inference_us)),
         Line::from(vec![
@@ -386,7 +354,7 @@ fn draw_ai_policy(f: &mut Frame, area: Rect, state: &DashboardState) {
         ]),
     ];
     let block = Block::default().borders(Borders::ALL).title(Span::styled(
-        " Q-learning Policy ",
+        " Slice Control ",
         Style::default()
             .fg(Color::Yellow)
             .add_modifier(Modifier::BOLD),
