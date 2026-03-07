@@ -52,11 +52,13 @@ use procfs::process::Process;
 use scx_stats::prelude::*;
 use scx_utils::build_id;
 use scx_utils::libbpf_clap_opts::LibbpfOpts;
+use scx_utils::CoreType as TopologyCoreType;
+use scx_utils::Topology;
 use scx_utils::UserExitInfo;
 
 use ai::{
-    BurstPredictor, ExitObservation, HeuristicClassifier, PolicyController, SchedulerSignal,
-    TaskFeatures, TaskLabel, TrustTable, SHAME_MAX,
+    BurstPredictor, CpuCoreType, CpuSelector, CpuState, ExitObservation, HeuristicClassifier,
+    PolicyController, SchedulerSignal, TaskFeatures, TaskLabel, TrustTable, SHAME_MAX,
 };
 use stats::Metrics;
 use task_queue::{QueuePush, TaskQueue};
@@ -144,13 +146,14 @@ struct Opts {
 /// Tasks are partitioned into per-label FIFO rings. `deadline` is retained for
 /// dispatch-time vtime handoff to BPF, while queue ordering stays O(1):
 /// RealTime > Interactive > IoWait > Unknown > Compute, FIFO within each band.
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, PartialEq, Clone)]
 struct Task {
     qtask: QueuedTask,
     deadline: u64,
     timestamp: u64,
     label: TaskLabel,
     latency_sensitive: bool,
+    perf_cri: f32,
     /// Kernel worker threads should stay on their previously used CPU even
     /// when they reach Rust with a widened affinity mask on newer kernels.
     is_kernel_worker: bool,
@@ -218,6 +221,7 @@ struct Scheduler<'a> {
     burst_pred: BurstPredictor,
     trust: Box<TrustTable>,
     policy: PolicyController,
+    cpu_selector: CpuSelector,
 
     // Fixed-size per-PID lifetime table (Fibonacci hash, zero-alloc after init).
     lifetime_table: Box<[TaskLifetime; LIFETIME_TABLE_SIZE]>,
@@ -262,6 +266,9 @@ struct Scheduler<'a> {
     /// they cross the starvation threshold, while still guaranteeing periodic
     /// progress under a sustained interactive load.
     compute_rescue_credit: u8,
+    /// Smoothed placement criticality signal used to bias topology-aware CPU
+    /// preference on hybrid systems.
+    placement_perf_ema: f32,
 }
 
 impl<'a> Scheduler<'a> {
@@ -284,6 +291,7 @@ impl<'a> Scheduler<'a> {
         let slice_ns_min = opts.slice_us_min * NSEC_PER_USEC;
 
         let policy = PolicyController::new(base_slice_ns);
+        let cpu_selector = Self::build_cpu_selector();
 
         let bpf = BpfScheduler::init(
             shutdown,
@@ -340,6 +348,7 @@ impl<'a> Scheduler<'a> {
             burst_pred: BurstPredictor::new(),
             trust: TrustTable::new(),
             policy,
+            cpu_selector,
             lifetime_table: {
                 // SAFETY: TaskLifetime is a plain struct with u64/bool fields;
                 // all-zero bytes produce valid TaskLifetime::default() values.
@@ -376,6 +385,7 @@ impl<'a> Scheduler<'a> {
             inference_samples: 0,
             sched_latency_ema_ns: 0.0,
             compute_rescue_credit: 0,
+            placement_perf_ema: 0.5,
         })
     }
 
@@ -398,9 +408,71 @@ impl<'a> Scheduler<'a> {
         Ok(st.majflt)
     }
 
+    fn build_cpu_selector() -> CpuSelector {
+        let mut selector = CpuSelector::new();
+
+        match Topology::new() {
+            Ok(topology) => {
+                for cpu in topology.all_cpus.values() {
+                    let core_type = match cpu.core_type {
+                        TopologyCoreType::Little => CpuCoreType::Efficient,
+                        TopologyCoreType::Big { .. } => CpuCoreType::Performance,
+                    };
+                    selector.update_cpu(CpuState {
+                        cpu_id: cpu.id as i32,
+                        core_type,
+                        numa_node: cpu.node_id as u32,
+                        restricted: false,
+                    });
+                }
+
+                info!(
+                    "topology-aware placement: {} CPUs across {} NUMA node(s){}",
+                    selector.nr_cpus,
+                    topology.nodes.len(),
+                    if selector.has_little_cores() {
+                        ", hybrid cores detected"
+                    } else {
+                        ""
+                    }
+                );
+            }
+            Err(err) => warn!("topology init failed, falling back to shared placement: {err}"),
+        }
+
+        selector
+    }
+
     fn scale_by_weight_inverse(task: &QueuedTask, value: u64) -> u64 {
         let weight = task.weight.max(1);
         value.saturating_mul(100) / weight
+    }
+
+    #[inline(always)]
+    fn placement_perf_cri(
+        label: TaskLabel,
+        features: &TaskFeatures,
+        latency_sensitive: bool,
+        is_kernel_worker: bool,
+    ) -> f32 {
+        let mut perf_cri = match label {
+            TaskLabel::RealTime => 1.0,
+            TaskLabel::Interactive => {
+                0.45 + features.exec_ratio * 0.25 + features.cpu_intensity * 0.20
+            }
+            TaskLabel::IoWait => 0.20 + features.exec_ratio * 0.20,
+            TaskLabel::Unknown => 0.30 + features.exec_ratio * 0.15,
+            TaskLabel::Compute => 0.10 + (1.0 - features.exec_ratio) * 0.10,
+        };
+
+        if latency_sensitive {
+            perf_cri = perf_cri.max(0.80);
+        }
+        if is_kernel_worker {
+            perf_cri = 1.0;
+        }
+
+        perf_cri.clamp(0.0, 1.0)
     }
 
     /// Returns true if the task's comm identifies a kernel worker thread.
@@ -769,7 +841,7 @@ impl<'a> Scheduler<'a> {
     fn ai_classify_and_enqueue(
         &mut self,
         task: &mut QueuedTask,
-    ) -> (u64, u64, TaskLabel, TaskFeatures, bool, bool) {
+    ) -> (u64, u64, TaskLabel, TaskFeatures, bool, bool, f32) {
         let t0 = Self::now_ns();
 
         let nr_cpus = (*self.bpf.nr_online_cpus_mut()).max(1) as i32;
@@ -821,8 +893,10 @@ impl<'a> Scheduler<'a> {
             self.classifier.classify(&features)
         };
         let latency_sensitive = Self::is_latency_sensitive(task, label, &features);
+        let perf_cri = Self::placement_perf_cri(label, &features, latency_sensitive, is_kworker);
         self.label_counts[label as usize] += 1;
         self.recent_label_counts[label as usize] += 1;
+        self.placement_perf_ema = self.placement_perf_ema * 0.90 + perf_cri * 0.10;
 
         // Trust-based slice factor.
         let rep_factor = self.trust.slice_factor(task.pid);
@@ -930,6 +1004,7 @@ impl<'a> Scheduler<'a> {
             features,
             is_kworker,
             latency_sensitive,
+            perf_cri,
         )
     }
 
@@ -957,8 +1032,15 @@ impl<'a> Scheduler<'a> {
 
             match self.bpf.dequeue_task() {
                 Ok(Some(mut task)) => {
-                    let (deadline, slice_ns, label, features, is_kernel_worker, latency_sensitive) =
-                        self.ai_classify_and_enqueue(&mut task);
+                    let (
+                        deadline,
+                        slice_ns,
+                        label,
+                        features,
+                        is_kernel_worker,
+                        latency_sensitive,
+                        perf_cri,
+                    ) = self.ai_classify_and_enqueue(&mut task);
                     let timestamp = Self::now_ns();
 
                     // Check trust flag before borrowing lifetime table mutably.
@@ -991,6 +1073,7 @@ impl<'a> Scheduler<'a> {
                         timestamp,
                         label,
                         latency_sensitive,
+                        perf_cri,
                         is_kernel_worker,
                         slice_ns,
                         qtask: task,
@@ -1071,9 +1154,19 @@ impl<'a> Scheduler<'a> {
         dispatched.cpu = if self.opts.percpu_local || task.is_kernel_worker {
             task.qtask.cpu
         } else if task.latency_sensitive {
-            self.bpf
-                .select_cpu(task.qtask.pid, task.qtask.cpu, task.qtask.flags)
-                .max(RL_CPU_ANY)
+            let idle_cpu = self
+                .bpf
+                .select_cpu(task.qtask.pid, task.qtask.cpu, task.qtask.flags);
+
+            if idle_cpu >= 0
+                && self
+                    .cpu_selector
+                    .prefers_cpu(idle_cpu, task.label, _quarantined, task.perf_cri)
+            {
+                idle_cpu
+            } else {
+                RL_CPU_ANY
+            }
         } else {
             RL_CPU_ANY
         };
@@ -1134,6 +1227,8 @@ impl<'a> Scheduler<'a> {
             congestion_rate: *self.bpf.nr_sched_congested_mut() as f64,
         };
         self.policy.update(&sig);
+        self.cpu_selector
+            .update_avg_perf_cri(self.placement_perf_ema);
 
         for count in &mut self.recent_label_counts {
             *count = (*count * 3) / 4;

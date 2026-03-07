@@ -187,6 +187,45 @@ impl CpuSelector {
         self.avg_perf_cri = self.avg_perf_cri * 0.85 + new_avg * 0.15;
     }
 
+    /// Returns true when the topology contains both preferred and efficient cores.
+    #[inline(always)]
+    pub fn has_little_cores(&self) -> bool {
+        self.all_mask != 0 && self.p_mask != 0 && self.p_mask != self.all_mask
+    }
+
+    /// Returns whether `cpu` is an eligible CPU of the preferred core class.
+    ///
+    /// This is intended for schedulers that still rely on the kernel's idle-CPU
+    /// selector but want to reject placements that land latency-sensitive work
+    /// on the wrong core type on hybrid systems.
+    #[inline(always)]
+    pub fn prefers_cpu(&self, cpu: i32, label: TaskLabel, quarantine: bool, perf_cri: f32) -> bool {
+        let bit = cpu_bit(cpu);
+        if bit == 0 {
+            return false;
+        }
+
+        let pool = if quarantine {
+            self.restricted_mask
+        } else {
+            self.all_mask & !self.restricted_mask
+        };
+        if (pool & bit) == 0 {
+            return false;
+        }
+
+        if !self.has_little_cores() {
+            return true;
+        }
+
+        let want_p = matches!(label, TaskLabel::RealTime) || perf_cri >= self.avg_perf_cri;
+        if want_p {
+            (self.p_mask & bit) != 0
+        } else {
+            (self.p_mask & bit) == 0
+        }
+    }
+
     /// Select the best CPU for a task.
     ///
     /// Cost: 4–8 bit operations + TZCNT = O(1), approximately 2–3 ns.
