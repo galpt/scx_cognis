@@ -50,6 +50,8 @@ pub struct CpuState {
     pub core_type: CoreType,
     /// NUMA node of this CPU (accepted but not yet used for NUMA mask routing).
     pub numa_node: u32,
+    /// Last-level cache domain identifier for this CPU.
+    pub llc_id: u16,
     /// If `true`, this CPU is reserved exclusively for quarantined tasks.
     pub restricted: bool,
 }
@@ -103,6 +105,10 @@ pub struct CpuSelector {
     /// Initialised to 0.5 (the centre of [0, 1]) so the P/E split is symmetric
     /// until real observations drive it to reflect the actual workload.
     pub avg_perf_cri: f32,
+    /// LLC identifier indexed by CPU id. `u16::MAX` means unknown / untracked.
+    cpu_llc_ids: [u16; MAX_CPUS],
+    /// Number of distinct LLC ids present in `cpu_llc_ids`.
+    nr_llcs: u16,
 }
 
 impl CpuSelector {
@@ -115,6 +121,8 @@ impl CpuSelector {
             idle_mask: 0,
             nr_cpus: 0,
             avg_perf_cri: 0.5,
+            cpu_llc_ids: [u16::MAX; MAX_CPUS],
+            nr_llcs: 0,
         }
     }
 
@@ -132,6 +140,20 @@ impl CpuSelector {
         self.all_mask |= bit;
         self.idle_mask = self.all_mask; // keep idle_mask in sync during init
         self.nr_cpus = self.all_mask.count_ones();
+        self.cpu_llc_ids[state.cpu_id as usize] = state.llc_id;
+        let mut llc_count = 0u16;
+        for idx in 0..MAX_CPUS {
+            let llc_id = self.cpu_llc_ids[idx];
+            if llc_id == u16::MAX {
+                continue;
+            }
+
+            let seen_before = self.cpu_llc_ids[..idx].contains(&llc_id);
+            if !seen_before {
+                llc_count = llc_count.saturating_add(1);
+            }
+        }
+        self.nr_llcs = llc_count.max(1);
 
         if matches!(state.core_type, CoreType::Performance) {
             self.p_mask |= bit;
@@ -193,6 +215,30 @@ impl CpuSelector {
         self.all_mask != 0 && self.p_mask != 0 && self.p_mask != self.all_mask
     }
 
+    /// Returns true when multiple LLC domains are visible in the topology.
+    #[inline(always)]
+    pub fn has_multiple_llcs(&self) -> bool {
+        self.nr_llcs > 1
+    }
+
+    #[inline(always)]
+    fn llc_id(&self, cpu: i32) -> Option<u16> {
+        let bit = cpu_bit(cpu);
+        if bit == 0 {
+            return None;
+        }
+        let llc_id = self.cpu_llc_ids[cpu as usize];
+        (llc_id != u16::MAX).then_some(llc_id)
+    }
+
+    #[inline(always)]
+    pub fn shares_llc(&self, cpu_a: i32, cpu_b: i32) -> bool {
+        match (self.llc_id(cpu_a), self.llc_id(cpu_b)) {
+            (Some(llc_a), Some(llc_b)) => llc_a == llc_b,
+            _ => true,
+        }
+    }
+
     /// Returns whether `cpu` is an eligible CPU of the preferred core class.
     ///
     /// This is intended for schedulers that still rely on the kernel's idle-CPU
@@ -224,6 +270,33 @@ impl CpuSelector {
         } else {
             (self.p_mask & bit) == 0
         }
+    }
+
+    /// Returns whether an explicit idle CPU should be accepted for a wakeup.
+    ///
+    /// For latency-sensitive tasks on multi-LLC systems, require the selected
+    /// idle CPU to stay within the task's previous LLC when that information is
+    /// available. This preserves cache warmth without forcing a busy per-CPU
+    /// dispatch when the locality target is not idle.
+    #[inline(always)]
+    pub fn accepts_idle_cpu(
+        &self,
+        cpu: i32,
+        prev_cpu: i32,
+        label: TaskLabel,
+        quarantine: bool,
+        perf_cri: f32,
+        prefer_same_llc: bool,
+    ) -> bool {
+        if !self.prefers_cpu(cpu, label, quarantine, perf_cri) {
+            return false;
+        }
+
+        if !prefer_same_llc || !self.has_multiple_llcs() || prev_cpu < 0 {
+            return true;
+        }
+
+        self.shares_llc(cpu, prev_cpu)
     }
 
     /// Select the best CPU for a task.
@@ -316,6 +389,7 @@ mod tests {
             cpu_id: id,
             core_type: ctype,
             numa_node: 0,
+            llc_id: 0,
             restricted,
         }
     }
@@ -387,5 +461,27 @@ mod tests {
             chosen >= 0,
             "must fall back to any eligible cpu, got {chosen}"
         );
+    }
+
+    #[test]
+    fn rejects_idle_cpu_from_other_llc_when_locality_requested() {
+        let mut sel = CpuSelector::new();
+        sel.update_cpu(CpuState {
+            cpu_id: 0,
+            core_type: CoreType::Performance,
+            numa_node: 0,
+            llc_id: 0,
+            restricted: false,
+        });
+        sel.update_cpu(CpuState {
+            cpu_id: 1,
+            core_type: CoreType::Performance,
+            numa_node: 0,
+            llc_id: 1,
+            restricted: false,
+        });
+
+        assert!(!sel.accepts_idle_cpu(1, 0, TaskLabel::Interactive, false, 0.9, true));
+        assert!(sel.accepts_idle_cpu(0, 0, TaskLabel::Interactive, false, 0.9, true));
     }
 }

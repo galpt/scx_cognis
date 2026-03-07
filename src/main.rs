@@ -422,14 +422,16 @@ impl<'a> Scheduler<'a> {
                         cpu_id: cpu.id as i32,
                         core_type,
                         numa_node: cpu.node_id as u32,
+                        llc_id: cpu.llc_id as u16,
                         restricted: false,
                     });
                 }
 
                 info!(
-                    "topology-aware placement: {} CPUs across {} NUMA node(s){}",
+                    "topology-aware placement: {} CPUs across {} NUMA node(s), {} LLC domain(s){}",
                     selector.nr_cpus,
                     topology.nodes.len(),
+                    topology.all_llcs.len(),
                     if selector.has_little_cores() {
                         ", hybrid cores detected"
                     } else {
@@ -1159,9 +1161,14 @@ impl<'a> Scheduler<'a> {
                 .select_cpu(task.qtask.pid, task.qtask.cpu, task.qtask.flags);
 
             if idle_cpu >= 0
-                && self
-                    .cpu_selector
-                    .prefers_cpu(idle_cpu, task.label, _quarantined, task.perf_cri)
+                && self.cpu_selector.accepts_idle_cpu(
+                    idle_cpu,
+                    task.qtask.cpu,
+                    task.label,
+                    _quarantined,
+                    task.perf_cri,
+                    true,
+                )
             {
                 idle_cpu
             } else {
