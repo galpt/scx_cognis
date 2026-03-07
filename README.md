@@ -135,7 +135,7 @@ Cognis is probably **not** what you are looking for when your workload looks lik
 
 If you want the short version, here it is.
 
-When the kernel hands a task to Cognis, the userspace scheduler computes a small feature set, classifies the task, looks up trust state, reads the current burst prediction, computes a slice, and queues the task in a fixed-capacity per-label FIFO. When it is time to dispatch, Cognis drains those queues in priority order, keeps tighter latency bounds for interactive and I/O-heavy work, and only performs bounded rescue dispatches for aged compute tasks before sending work back to BPF for execution.
+When the kernel hands a task to Cognis, the userspace scheduler computes a small feature set, classifies the task, looks up trust state, reads the current burst prediction, computes a slice, and queues the task in a fixed-capacity per-label FIFO. When it is time to dispatch, Cognis drains those queues in priority order, keeps tighter latency bounds for interactive and I/O-heavy work, selectively asks BPF for an explicit idle CPU for latency-sensitive interactive wakeups, and only performs bounded rescue dispatches for aged compute tasks before sending work back to BPF for execution.
 
 The implementation is intentionally biased toward bounded work:
 
@@ -148,7 +148,7 @@ At a high level, the pipeline in `src/main.rs` is:
 
 ```text
 ops.enqueue    -> feature extraction -> heuristic classification -> trust lookup -> burst predictor read
-ops.dispatch   -> slice computation -> queue pop in priority order -> BPF dispatch
+ops.dispatch   -> slice computation -> optional idle-CPU placement for latency-sensitive work -> queue pop in priority order -> BPF dispatch
 ops.select_cpu -> idle-CPU hinting in BPF, while user-task placement still goes through SHARED_DSQ
 ```
 
@@ -156,9 +156,9 @@ ops.select_cpu -> idle-CPU hinting in BPF, while user-task placement still goes 
 
 This is one of the most important behavioral details in the current design.
 
-Older Cognis iterations tried to dispatch user tasks toward per-CPU DSQs. The current scheduler does not. In `dispatch_task()`, user tasks are sent to `RL_CPU_ANY`, which means the BPF side places them in the shared dispatch queue. Kernel workers and explicit `--percpu-local` tasks are the main exceptions.
+Older Cognis iterations tried to dispatch user tasks toward per-CPU DSQs. The current scheduler still sends the bulk of user work to `RL_CPU_ANY`, which means the BPF side places it in the shared dispatch queue. Kernel workers and explicit `--percpu-local` tasks are the obvious exceptions, and there is now one narrower exception for latency-sensitive interactive tasks when BPF can hand back a concrete idle CPU.
 
-That choice is there for a reason. The comments in `src/main.rs` document the failure mode plainly: pinning userspace-managed work to a CPU-specific DSQ could interact badly with the userspace scheduler thread itself and lead to stalls serious enough to trip the `sched_ext` watchdog. Sending regular user work through the shared queue avoids that class of stall by letting any available CPU drain it.
+That choice is there for a reason. The comments in `src/main.rs` document the failure mode plainly: pinning userspace-managed work to a CPU-specific DSQ could interact badly with the userspace scheduler thread itself and lead to stalls serious enough to trip the `sched_ext` watchdog. Sending regular user work through the shared queue avoids that class of stall by letting any available CPU drain it. The narrower placement hint for latency-sensitive interactive tasks is deliberately opportunistic instead of universal: Cognis only takes the explicit-CPU path when the BPF selector can identify an idle target right then.
 
 ### How tasks are classified
 
@@ -182,6 +182,8 @@ The primary signal is `cpu_intensity`, which is the fraction of the previously a
 That extra `exec_ratio` guard matters. The code comments call out the reason directly: a task that wakes frequently, does meaningful work, and sleeps again can use a large fraction of its slice without behaving like a classic CPU hog. Without that guard, high-value interactive work can be mislabeled as compute-heavy background work.
 
 There is another special case before the classifier even runs: `src/main.rs` checks `comm` names to detect kernel worker threads and force them into the `RealTime` bucket. That logic exists to avoid starving kernel workers that would otherwise look deceptively compute-like.
+
+After labeling, Cognis also applies a narrower placement heuristic for latency-sensitive interactive work. The idea is simple: a compositor frame, browser renderer wakeup, or similar desktop-critical burst is more valuable when it lands on an idle CPU immediately than when it is merely told “you are interactive” and then left to compete in the generic shared path. The current heuristic keeps that bounded by combining wakeup-heavy burst behavior with a small fixed set of well-known desktop process-name prefixes.
 
 ### How slices are adjusted
 

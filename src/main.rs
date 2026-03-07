@@ -150,6 +150,7 @@ struct Task {
     deadline: u64,
     timestamp: u64,
     label: TaskLabel,
+    latency_sensitive: bool,
     /// Kernel worker threads should stay on their previously used CPU even
     /// when they reach Rust with a widened affinity mask on newer kernels.
     is_kernel_worker: bool,
@@ -725,10 +726,50 @@ impl<'a> Scheduler<'a> {
         }
     }
 
+    #[inline(always)]
+    fn task_comm_matches(task: &QueuedTask, names: &[&[u8]]) -> bool {
+        let bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(task.comm.as_ptr() as *const u8, task.comm.len()) };
+        let len = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+        let comm = &bytes[..len];
+
+        names.iter().any(|name| comm.starts_with(name))
+    }
+
+    #[inline(always)]
+    fn is_latency_sensitive(task: &QueuedTask, label: TaskLabel, features: &TaskFeatures) -> bool {
+        if !matches!(label, TaskLabel::Interactive) {
+            return false;
+        }
+
+        if Self::task_comm_matches(
+            task,
+            &[
+                b"kwin_wayland",
+                b"kwin_x11",
+                b"Xwayland",
+                b"firefox",
+                b"chrome",
+                b"chromium",
+                b"brave",
+                b"Web Content",
+                b"GPU Process",
+                b"plasmashell",
+                b"gnome-shell",
+                b"pipewire",
+                b"wireplumber",
+            ],
+        ) {
+            return true;
+        }
+
+        features.exec_ratio >= 0.70 && features.cpu_intensity >= 0.55
+    }
+
     fn ai_classify_and_enqueue(
         &mut self,
         task: &mut QueuedTask,
-    ) -> (u64, u64, TaskLabel, TaskFeatures, bool) {
+    ) -> (u64, u64, TaskLabel, TaskFeatures, bool, bool) {
         let t0 = Self::now_ns();
 
         let nr_cpus = (*self.bpf.nr_online_cpus_mut()).max(1) as i32;
@@ -779,6 +820,7 @@ impl<'a> Scheduler<'a> {
         } else {
             self.classifier.classify(&features)
         };
+        let latency_sensitive = Self::is_latency_sensitive(task, label, &features);
         self.label_counts[label as usize] += 1;
         self.recent_label_counts[label as usize] += 1;
 
@@ -881,7 +923,14 @@ impl<'a> Scheduler<'a> {
         self.total_inference_ns += elapsed;
         self.inference_samples += 1;
 
-        (deadline, slice, label, features, is_kworker)
+        (
+            deadline,
+            slice,
+            label,
+            features,
+            is_kworker,
+            latency_sensitive,
+        )
     }
 
     // ── Drain queued tasks (runs scheduling pipeline per task) ──────────────
@@ -908,7 +957,7 @@ impl<'a> Scheduler<'a> {
 
             match self.bpf.dequeue_task() {
                 Ok(Some(mut task)) => {
-                    let (deadline, slice_ns, label, features, is_kernel_worker) =
+                    let (deadline, slice_ns, label, features, is_kernel_worker, latency_sensitive) =
                         self.ai_classify_and_enqueue(&mut task);
                     let timestamp = Self::now_ns();
 
@@ -941,6 +990,7 @@ impl<'a> Scheduler<'a> {
                         deadline,
                         timestamp,
                         label,
+                        latency_sensitive,
                         is_kernel_worker,
                         slice_ns,
                         qtask: task,
@@ -990,7 +1040,7 @@ impl<'a> Scheduler<'a> {
             task.deadline
         };
 
-        // CPU selection: always dispatch user tasks to the shared DSQ (RL_CPU_ANY).
+        // CPU selection: most user tasks still go to SHARED_DSQ (RL_CPU_ANY).
         //
         // Why not per-CPU DSQs?  The BPF ops.dispatch callback picks tasks in this order:
         //   1. SCHED_DSQ  (userspace scheduler process, if pending work exists)
@@ -1010,10 +1060,20 @@ impl<'a> Scheduler<'a> {
         // BPF dispatch_task() helper (kick_task_cpu → scx_bpf_kick_cpu) so a sleeping CPU
         // wakes up and drains SHARED_DSQ promptly.
         //
+        // Latency-sensitive interactive tasks are the exception: they may ask
+        // the BPF idle-CPU selector for an explicit target CPU when one is
+        // available. This preserves the shared-queue safety path for the bulk
+        // of user work while giving render/compositor/browser wakeups a chance
+        // to land on an idle core with better cache locality.
+        //
         // Kernel workers and --percpu-local tasks are still dispatched to their affined CPU:
         // kthreads must stay on interrupt-affined CPUs; percpu_local is an explicit user request.
         dispatched.cpu = if self.opts.percpu_local || task.is_kernel_worker {
             task.qtask.cpu
+        } else if task.latency_sensitive {
+            self.bpf
+                .select_cpu(task.qtask.pid, task.qtask.cpu, task.qtask.flags)
+                .max(RL_CPU_ANY)
         } else {
             RL_CPU_ANY
         };
