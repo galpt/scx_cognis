@@ -430,18 +430,18 @@ The script is focused on what to watch: not just `bogo ops/s`, but also frame pa
 
 ### Reference results
 
-The table below comes from one recorded comparison on a Lenovo IdeaPad Gaming 3 15ARH7 running CachyOS with a `6.19.5-3-cachyos` kernel. It reflects a `v1.3.6` benchmark run, so treat it as a concrete reference point for this machine and workload rather than a promise that every later release or every other system will reproduce the same numbers.
+The table below comes from one recorded comparison on a Lenovo IdeaPad Gaming 3 15ARH7 running CachyOS with a `6.19.5-3-cachyos` kernel, KDE Plasma on Wayland, and the panel's default 500-fish Aquarium workload. During both runs, `stress-ng` reported that the CPU scaling governors were still set to `powersave`, so treat this as a concrete reference point for this machine and setup rather than a promise that every later release or every other system will reproduce the same numbers.
 
 | Phase | Metric | Baseline | Cognis | Delta |
 |:--|:--|--:|--:|--:|
-| CPU | bogo ops/s (real) | 22,055.82 | 22,210.24 | +0.7% |
-| CPU | bogo ops/s (usr) | 1,411.10 | 1,411.04 | 0.0% |
-| I/O | bogo ops/s (real) | 178,202.08 | 180,383.24 | +1.2% |
-| I/O | bogo ops/s (usr) | 40,448.66 | 40,180.41 | -0.7% |
-| Mixed CPU | bogo ops/s (real) | 19,760.80 | 19,781.18 | +0.1% |
-| Mixed CPU | bogo ops/s (usr) | 1,417.85 | 1,419.61 | +0.1% |
-| Mixed VM | bogo ops/s (real) | 24,555.34 | 24,566.91 | +0.0% |
-| Mixed VM | bogo ops/s (usr) | 14,789.09 | 14,021.45 | -5.2% |
+| CPU | bogo ops/s (real) | 20,588.69 | 21,497.25 | +4.4% |
+| CPU | bogo ops/s (usr) | 1,373.80 | 1,399.02 | +1.8% |
+| I/O | bogo ops/s (real) | 183,211.76 | 180,076.39 | -1.7% |
+| I/O | bogo ops/s (usr) | 43,187.95 | 42,844.41 | -0.8% |
+| Mixed CPU | bogo ops/s (real) | 18,402.63 | 18,748.51 | +1.9% |
+| Mixed CPU | bogo ops/s (usr) | 1,394.70 | 1,401.14 | +0.5% |
+| Mixed VM | bogo ops/s (real) | 24,523.72 | 24,540.00 | +0.1% |
+| Mixed VM | bogo ops/s (usr) | 14,936.02 | 14,387.09 | -3.7% |
 
 The two screenshots below show the comparison used in this benchmark section:
 
@@ -461,7 +461,7 @@ The two screenshots below show the comparison used in this benchmark section:
 
 The useful point of the benchmark is not “Cognis always produces a larger benchmark number.” The more honest reading is narrower than that.
 
-On the recorded reference machine, the numbers above stayed close to baseline while Cognis was tuned for responsiveness-first behavior. That is useful context, but it is still only one machine, one governor configuration, and one set of runs.
+On the recorded reference machine, this run improved CPU-heavy throughput modestly, stayed nearly even in the mixed phase, and gave back a little throughput in the I/O-heavy and VM-user-time numbers. That is useful context, but it is still only one machine, one governor configuration, and one set of runs.
 
 If you want numbers you can trust on your own hardware, keep the governor fixed, run both modes multiple times, and compare medians. Then watch the Aquarium while you do it. The whole project makes a lot more sense when you look at throughput and interaction quality at the same time.
 
