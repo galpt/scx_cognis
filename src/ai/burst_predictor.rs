@@ -10,8 +10,10 @@
 //   h[t] = tanh( W_h · h[t-1]  +  W_x · x[t]  +  b )
 //   y[t] = W_out · h[t]  +  b_out
 //
-// Weights are compile-time constants derived from offline gradient descent.
-// The forward pass runs in O(H · X) = O(12) multiplications — ~1 ns.
+// Core weights are compile-time constants derived from offline training.
+// A bounded per-PID residual term adapts predictions online without changing
+// the fixed table layout or introducing variable-size state.
+// The forward pass runs in O(H · X) = O(12) multiplications.
 //
 // ── Storage change (v2 overhaul) ─────────────────────────────────────────
 //
@@ -35,7 +37,7 @@ pub const PRED_TABLE_SIZE: usize = 4096;
 /// Fibonacci multiplier for 32-bit integer hashing.
 const FIB32: u32 = 2_654_435_769;
 
-// ── Model constants (offline-trained weights) ─────────────────────────────
+// ── Model constants (fixed core weights) ──────────────────────────────────
 
 const H: usize = 4;
 const X: usize = 3;
@@ -67,6 +69,7 @@ struct RnnState {
     h: [f32; H],
     ema_burst_ns: f64,
     ema_actual_ns: f64,
+    ema_residual_ns: f64,
 }
 
 impl Default for RnnState {
@@ -75,6 +78,7 @@ impl Default for RnnState {
             h: [0.0; H],
             ema_burst_ns: 0.0,
             ema_actual_ns: 0.0,
+            ema_residual_ns: 0.0,
         }
     }
 }
@@ -183,12 +187,17 @@ impl BurstPredictor {
             + B_OUT;
         let y_norm = y_norm.clamp(0.0, 1.0);
         let predicted_ns = (y_norm as f64 * BURST_MAX_NS) as u64;
+        let corrected_ns = (predicted_ns as f64 + state.ema_residual_ns).clamp(0.0, BURST_MAX_NS);
 
         // EMA smoothing: α = 0.15 filters per-tick jitter while tracking trends.
+        // A per-PID residual term lets the offline-trained core adapt online
+        // without changing the fixed table shape or adding heap-backed state.
         state.ema_burst_ns =
-            self.ema_alpha * predicted_ns as f64 + (1.0 - self.ema_alpha) * state.ema_burst_ns;
+            self.ema_alpha * corrected_ns + (1.0 - self.ema_alpha) * state.ema_burst_ns;
         state.ema_actual_ns =
             self.ema_alpha * burst_ns as f64 + (1.0 - self.ema_alpha) * state.ema_actual_ns;
+        state.ema_residual_ns = self.ema_alpha * (burst_ns as f64 - predicted_ns as f64)
+            + (1.0 - self.ema_alpha) * state.ema_residual_ns;
 
         state.ema_burst_ns as u64
     }
@@ -276,6 +285,23 @@ mod tests {
             pred.prediction_for(20),
             p20_before,
             "evicting PID 10 should not affect PID 20"
+        );
+    }
+
+    #[test]
+    fn residual_correction_tracks_shift_in_burst_size() {
+        let mut pred = BurstPredictor::new();
+        for _ in 0..20 {
+            pred.observe_and_predict(7, 2_000_000, 0.8, 0.6);
+        }
+        let before = pred.prediction_for(7);
+        for _ in 0..20 {
+            pred.observe_and_predict(7, 10_000_000, 0.8, 0.6);
+        }
+        let after = pred.prediction_for(7);
+        assert!(
+            after > before,
+            "prediction should move upward with sustained larger bursts"
         );
     }
 }

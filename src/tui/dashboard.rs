@@ -8,7 +8,7 @@
 //   2. System overview (running/queued tasks, CPUs, dispatch/congestion stats).
 //   3. Task classification breakdown (interactive/compute/io/rt gauges).
 //   4. Slice control state (deterministic slice, inference latency).
-//   5. Scheduling latency chart (rolling 120-sample line chart).
+//   5. Inference latency chart (rolling 120-sample line chart).
 //   6. Trust watchlist — flagged/quarantined processes.
 //
 // All history buffers use HistoryRing — a fixed-size circular array that
@@ -119,7 +119,7 @@ pub struct DashboardState {
     pub metrics: Metrics,
     pub inference_us: f64, // Most recent inference latency (µs)
     pub inference_hist: HistoryRing,
-    pub wall_of_shame: [WallEntry; SHAME_MAX],
+    pub watchlist_entries: [WallEntry; SHAME_MAX],
     pub wall_len: usize,
 }
 
@@ -129,7 +129,7 @@ impl Default for DashboardState {
             metrics: Metrics::default(),
             inference_us: 0.0,
             inference_hist: HistoryRing::new(),
-            wall_of_shame: [WallEntry::ZERO; SHAME_MAX],
+            watchlist_entries: [WallEntry::ZERO; SHAME_MAX],
             wall_len: 0,
         }
     }
@@ -140,8 +140,8 @@ impl DashboardState {
         self.inference_hist.push(self.inference_us);
     }
 
-    pub fn set_wall_of_shame(&mut self, entries: &[WallEntry; SHAME_MAX], len: usize) {
-        self.wall_of_shame = *entries;
+    pub fn set_watchlist(&mut self, entries: &[WallEntry; SHAME_MAX], len: usize) {
+        self.watchlist_entries = *entries;
         self.wall_len = len.min(SHAME_MAX);
     }
 }
@@ -233,7 +233,7 @@ pub fn draw(frame: &mut Frame, state: &DashboardState) {
         .split(body[1]);
 
     draw_latency_chart(frame, right[0], state);
-    draw_wall_of_shame(frame, right[1], &state.wall_of_shame[..state.wall_len]);
+    draw_watchlist(frame, right[1], &state.watchlist_entries[..state.wall_len]);
 }
 
 fn draw_header(f: &mut Frame, area: Rect, m: &Metrics) {
@@ -410,7 +410,7 @@ fn draw_latency_chart(f: &mut Frame, area: Rect, state: &DashboardState) {
     f.render_widget(chart, area);
 }
 
-fn draw_wall_of_shame(f: &mut Frame, area: Rect, entries: &[WallEntry]) {
+fn draw_watchlist(f: &mut Frame, area: Rect, entries: &[WallEntry]) {
     let header = ListItem::new(Line::from(vec![Span::styled(
         " PID     COMM                TRUST   FLAG",
         Style::default()

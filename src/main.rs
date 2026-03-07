@@ -7,11 +7,11 @@
 // heuristics and bounded statistical helpers in a multi-stage pipeline:
 //
 //   ┌─────────────────────────────────────────────────────────────────────┐
-//   │  ops.enqueue  → Heuristic classifier + Trust check                  │
-//   │  ops.dispatch → deterministic slice control                           │
-//   │             → SHARED_DSQ (RL_CPU_ANY) for all user tasks             │
-//   │  ops.select_cpu → kernel idle-CPU query (pick_idle_cpu, atomic)      │
-//   │  ops.tick     → Trust-based anomaly detection (behavioural, zero-alloc) │
+//   │  ops.enqueue    → Heuristic classifier + trust lookup                │
+//   │  ops.dispatch   → load-driven slice base + bounded wake urgency      │
+//   │               → SHARED_DSQ (RL_CPU_ANY) for most user tasks          │
+//   │  ops.select_cpu → kernel idle-CPU query (pick_idle_cpu, atomic)     │
+//   │  housekeeping   → trust flush + slice-base refresh outside dispatch  │
 //   └─────────────────────────────────────────────────────────────────────┘
 //
 // All hot-path data structures are fixed-size and allocated once at startup:
@@ -77,8 +77,9 @@ const RAPID_FAILURE_LIMIT: u32 = 20;
 /// scx_cognis: an adaptive CPU scheduler combining heuristics and bounded runtime models.
 ///
 /// Scheduling pipeline: a deterministic heuristic task classifier, Elman RNN burst prediction
-/// (fixed offline-trained weights), a combined trust/anomaly table for reputation tracking, and
-/// a deterministic load-driven slice controller — all targeting sub-10µs per-event latency with zero
+/// with fixed core weights plus bounded per-PID residual correction, a combined trust/anomaly
+/// table for reputation tracking, and a load-driven slice base with bounded per-task interactive
+/// renewal — all targeting sub-10µs per-event latency with zero
 /// hot-path heap allocations. User tasks are dispatched to SHARED_DSQ (RL_CPU_ANY) so any
 /// available CPU can pick them up, preventing the per-CPU DSQ stall that the previous
 /// bpf.select_cpu() dispatch caused. Kernel workers are still pinned to their affinity CPU.
@@ -86,8 +87,8 @@ const RAPID_FAILURE_LIMIT: u32 = 20;
 struct Opts {
     /// Base scheduling slice duration in microseconds.
     ///
-    /// Set to 0 (default) to let the scheduler auto-compute the optimal slice
-    /// from system load: `targeted_latency (15 ms) / nr_runnable_tasks_per_cpu`.
+    /// Set to 0 (default) to let the scheduler auto-compute the slice ceiling
+    /// from system load: `targeted_latency (6 ms) / nr_runnable_tasks_per_cpu`.
     /// This is the recommended mode — no manual tuning required.
     ///
     /// Set to a non-zero value to pin the maximum slice to that value, overriding
@@ -153,6 +154,7 @@ struct Task {
     timestamp: u64,
     label: TaskLabel,
     wake_boosted: bool,
+    wake_credit_ns: u64,
     latency_sensitive: bool,
     perf_cri: f32,
     /// Kernel worker threads should stay on their previously used CPU even
@@ -169,6 +171,14 @@ struct TaskLifetime {
     slice_used_ns: u64,
     preempted: bool,
     cheat_flagged: bool,
+    /// Bounded per-task interactive slice credit. This acts like a small
+    /// budget bank for wake-heavy desktop tasks so they do not restart every
+    /// burst from the same purely global slice recommendation.
+    interactive_slice_credit_ns: u64,
+    /// Bounded per-PID additive renewal bias. Positive values add headroom to
+    /// future latency-sensitive interactive slices; negative values trim that
+    /// headroom back when the task stops using it.
+    interactive_slice_bias_ns: i64,
     /// The time-slice (ns) that was assigned to this task on its most recent
     /// scheduling event.  Used in the next cycle as the denominator for
     /// `cpu_intensity = burst_ns / last_slice_ns`, which gives a reliable
@@ -594,16 +604,133 @@ impl<'a> Scheduler<'a> {
     }
 
     #[inline(always)]
+    fn should_wake_preempt(
+        wake_boosted: bool,
+        latency_sensitive: bool,
+        wake_credit_ns: u64,
+        queued_ns: u64,
+    ) -> bool {
+        const WAKE_PREEMPT_MIN_CREDIT_NS: u64 = 1_000_000;
+        const WAKE_PREEMPT_MAX_QUEUE_NS: u64 = 6_000_000;
+
+        wake_boosted
+            && latency_sensitive
+            && wake_credit_ns >= WAKE_PREEMPT_MIN_CREDIT_NS
+            && queued_ns <= WAKE_PREEMPT_MAX_QUEUE_NS
+    }
+
+    #[inline(always)]
     fn wake_deadline_credit_ns(&self, task: &Task) -> u64 {
-        const WAKE_DEADLINE_CREDIT_NS: u64 = 2_000_000;
+        const WAKE_DEADLINE_CREDIT_NS: u64 = 4_000_000;
 
         if task.wake_boosted {
-            task.slice_ns
-                .max(self.slice_ns_min)
+            task.wake_credit_ns
+                .max(task.slice_ns / 2)
                 .min(WAKE_DEADLINE_CREDIT_NS)
         } else {
             0
         }
+    }
+
+    #[inline(always)]
+    fn interactive_slice_credit_cap_ns(&self, ref_base: u64) -> u64 {
+        ref_base
+            .max(self.slice_ns_min)
+            .saturating_mul(4)
+            .min(NON_COMPUTE_EXEC_CAP_NS.saturating_mul(2))
+    }
+
+    #[inline(always)]
+    fn interactive_slice_bias_cap_ns(&self, ref_base: u64) -> i64 {
+        (self.interactive_slice_credit_cap_ns(ref_base) / 2) as i64
+    }
+
+    #[inline(always)]
+    fn apply_slice_bias_ns(slice_ns: u64, bias_ns: i64) -> u64 {
+        if bias_ns >= 0 {
+            slice_ns.saturating_add(bias_ns as u64)
+        } else {
+            slice_ns.saturating_sub((-bias_ns) as u64)
+        }
+    }
+
+    #[inline(always)]
+    fn interactive_sleep_bonus_ns(&self, sleep_ns: u64, ref_base: u64) -> u64 {
+        const WAKE_BOOST_MIN_SLEEP_NS: u64 = 750_000;
+        const WAKE_BOOST_MAX_SLEEP_NS: u64 = 25_000_000;
+
+        if !(WAKE_BOOST_MIN_SLEEP_NS..=WAKE_BOOST_MAX_SLEEP_NS).contains(&sleep_ns) {
+            return 0;
+        }
+
+        (sleep_ns / 4).clamp(self.slice_ns_min / 2, ref_base.max(self.slice_ns_min))
+    }
+
+    #[inline(always)]
+    fn next_interactive_slice_credit_ns(
+        &self,
+        prev_credit_ns: u64,
+        last_slice_ns: u64,
+        burst_ns: u64,
+        sleep_ns: u64,
+        label: TaskLabel,
+        latency_sensitive: bool,
+        exec_ratio: f32,
+        cpu_intensity: f32,
+        ref_base: u64,
+    ) -> u64 {
+        let cap = self.interactive_slice_credit_cap_ns(ref_base);
+
+        if !matches!(label, TaskLabel::Interactive) || !latency_sensitive {
+            return (prev_credit_ns / 2).min(cap);
+        }
+
+        let wake_pattern =
+            Self::should_wake_boost(latency_sensitive, exec_ratio, cpu_intensity, sleep_ns);
+        let used_enough = burst_ns.saturating_add(last_slice_ns / 5) >= last_slice_ns;
+
+        if wake_pattern && used_enough {
+            let earn = (last_slice_ns / 2).max(self.interactive_sleep_bonus_ns(sleep_ns, ref_base));
+            prev_credit_ns.saturating_add(earn).min(cap)
+        } else if burst_ns < last_slice_ns / 3 {
+            (prev_credit_ns / 2).min(cap)
+        } else {
+            prev_credit_ns.saturating_sub(last_slice_ns / 4).min(cap)
+        }
+    }
+
+    #[inline(always)]
+    fn next_interactive_slice_bias_ns(
+        &self,
+        prev_bias_ns: i64,
+        last_slice_ns: u64,
+        burst_ns: u64,
+        sleep_ns: u64,
+        label: TaskLabel,
+        latency_sensitive: bool,
+        exec_ratio: f32,
+        cpu_intensity: f32,
+        ref_base: u64,
+    ) -> i64 {
+        let cap = self.interactive_slice_bias_cap_ns(ref_base);
+        let decayed = prev_bias_ns * 3 / 4;
+
+        if !matches!(label, TaskLabel::Interactive) || !latency_sensitive {
+            return decayed.clamp(-cap, cap);
+        }
+
+        let wake_pattern =
+            Self::should_wake_boost(latency_sensitive, exec_ratio, cpu_intensity, sleep_ns);
+        let full_use_mark = last_slice_ns.saturating_sub(last_slice_ns / 8);
+        let update = if wake_pattern && burst_ns >= full_use_mark {
+            (last_slice_ns / 5) as i64
+        } else if burst_ns <= last_slice_ns / 2 {
+            -((last_slice_ns / 6) as i64)
+        } else {
+            0
+        };
+
+        decayed.saturating_add(update).clamp(-cap, cap)
     }
 
     /// Route a task to the correct per-label bucket.
@@ -697,6 +824,18 @@ impl<'a> Scheduler<'a> {
         }
 
         let now = Self::now_ns();
+
+        if self.boosted_interactive_queue.front().is_some_and(|task| {
+            Self::should_wake_preempt(
+                task.wake_boosted,
+                task.latency_sensitive,
+                task.wake_credit_ns,
+                now.saturating_sub(task.timestamp),
+            )
+        }) {
+            self.compute_rescue_credit = self.compute_rescue_credit.saturating_add(1);
+            return self.boosted_interactive_queue.pop_front();
+        }
 
         if Self::queue_is_starved(
             self.boosted_interactive_queue.front(),
@@ -881,7 +1020,19 @@ impl<'a> Scheduler<'a> {
     fn ai_classify_and_enqueue(
         &mut self,
         task: &mut QueuedTask,
-    ) -> (u64, u64, TaskLabel, TaskFeatures, bool, bool, f32) {
+    ) -> (
+        u64,
+        u64,
+        TaskLabel,
+        TaskFeatures,
+        bool,
+        bool,
+        f32,
+        bool,
+        u64,
+        i64,
+        u64,
+    ) {
         let t0 = Self::now_ns();
 
         let nr_cpus = (*self.bpf.nr_online_cpus_mut()).max(1) as i32;
@@ -914,6 +1065,18 @@ impl<'a> Scheduler<'a> {
                         .max(NSEC_PER_USEC * 1_000)
                 }
             });
+        let recent_sleep_ns = self
+            .lifetime_get(task.pid)
+            .map(|lt| Self::now_ns().saturating_sub(lt.last_seen_ns))
+            .unwrap_or(0);
+        let prev_interactive_credit_ns = self
+            .lifetime_get(task.pid)
+            .map(|lt| lt.interactive_slice_credit_ns)
+            .unwrap_or(0);
+        let prev_interactive_bias_ns = self
+            .lifetime_get(task.pid)
+            .map(|lt| lt.interactive_slice_bias_ns)
+            .unwrap_or(0);
 
         // Build features.
         let features = Self::compute_features(task, self.base_slice_ns, prev_slice_ns, nr_cpus);
@@ -948,6 +1111,11 @@ impl<'a> Scheduler<'a> {
 
         // Load-adjusted deterministic base slice.
         let ai_slice = self.slice_controller.read_slice_ns();
+        let ref_base = if self.base_slice_ns > 0 {
+            self.base_slice_ns
+        } else {
+            self.slice_controller.auto_base_ns
+        };
 
         // Final time-slice:
         //   base = deterministic slice × label_multiplier × (weight / 100)
@@ -975,19 +1143,63 @@ impl<'a> Scheduler<'a> {
             slice = slice.min(predicted_burst * 2);
         }
 
+        let wake_boosted = Self::should_wake_boost(
+            latency_sensitive,
+            features.exec_ratio,
+            features.cpu_intensity,
+            recent_sleep_ns,
+        );
+        if matches!(label, TaskLabel::Interactive) && latency_sensitive {
+            let carry_bonus_ns =
+                prev_interactive_credit_ns.min(self.interactive_slice_credit_cap_ns(ref_base)) / 2;
+            let sleep_bonus_ns = self.interactive_sleep_bonus_ns(recent_sleep_ns, ref_base);
+            slice = slice
+                .saturating_add(carry_bonus_ns)
+                .saturating_add(sleep_bonus_ns);
+            slice = Self::apply_slice_bias_ns(slice, prev_interactive_bias_ns / 2);
+        }
+
         // Ensure clamp min ≤ max even if user passes large --slice-us-min.
         // When in auto mode (base_slice_ns == 0), use the policy's current
         // auto_base_ns as the ceiling reference so clamp_max is meaningful.
-        let ref_base = if self.base_slice_ns > 0 {
-            self.base_slice_ns
-        } else {
-            self.slice_controller.auto_base_ns
-        };
         let clamp_max = (ref_base * 8).max(self.slice_ns_min);
         slice = slice.clamp(self.slice_ns_min, clamp_max);
         if quarantined {
             slice = self.slice_ns_min;
         }
+
+        let burst_ns = task.stop_ts.saturating_sub(task.start_ts);
+        let renewed_slice_credit_ns = self.next_interactive_slice_credit_ns(
+            prev_interactive_credit_ns,
+            prev_slice_ns,
+            burst_ns,
+            recent_sleep_ns,
+            label,
+            latency_sensitive,
+            features.exec_ratio,
+            features.cpu_intensity,
+            ref_base,
+        );
+        let renewed_slice_bias_ns = self.next_interactive_slice_bias_ns(
+            prev_interactive_bias_ns,
+            prev_slice_ns,
+            burst_ns,
+            recent_sleep_ns,
+            label,
+            latency_sensitive,
+            features.exec_ratio,
+            features.cpu_intensity,
+            ref_base,
+        );
+        let wake_credit_ns = if wake_boosted {
+            self.interactive_sleep_bonus_ns(recent_sleep_ns, ref_base)
+                .saturating_add(renewed_slice_credit_ns / 2)
+                .saturating_add(renewed_slice_bias_ns.max(0) as u64 / 2)
+                .max(self.slice_ns_min)
+                .min(4_000_000)
+        } else {
+            0
+        };
 
         // Update vruntime / deadline.
         //
@@ -1010,7 +1222,7 @@ impl<'a> Scheduler<'a> {
             let vruntime_min = self.vruntime_now.saturating_sub(ref_base);
             task.vtime.max(vruntime_min)
         };
-        let slice_ns_actual = task.stop_ts.saturating_sub(task.start_ts);
+        let slice_ns_actual = burst_ns;
         let vslice = Self::scale_by_weight_inverse(task, slice_ns_actual);
         task.vtime = task.vtime.saturating_add(vslice);
         // Advance the virtual clock to the new task vtime front.
@@ -1046,6 +1258,10 @@ impl<'a> Scheduler<'a> {
             is_kworker,
             latency_sensitive,
             perf_cri,
+            wake_boosted,
+            wake_credit_ns,
+            renewed_slice_bias_ns,
+            renewed_slice_credit_ns,
         )
     }
 
@@ -1081,18 +1297,12 @@ impl<'a> Scheduler<'a> {
                         is_kernel_worker,
                         latency_sensitive,
                         perf_cri,
+                        wake_boosted,
+                        wake_credit_ns,
+                        renewed_slice_bias_ns,
+                        renewed_slice_credit_ns,
                     ) = self.ai_classify_and_enqueue(&mut task);
                     let timestamp = Self::now_ns();
-                    let recent_sleep_ns = self
-                        .lifetime_get(task.pid)
-                        .map(|lt| timestamp.saturating_sub(lt.last_seen_ns))
-                        .unwrap_or(0);
-                    let wake_boosted = Self::should_wake_boost(
-                        latency_sensitive,
-                        features.exec_ratio,
-                        features.cpu_intensity,
-                        recent_sleep_ns,
-                    );
 
                     // Check trust flag before borrowing lifetime table mutably.
                     let cheat_flagged = self.trust.is_flagged(task.pid);
@@ -1106,6 +1316,8 @@ impl<'a> Scheduler<'a> {
                     e.slice_used_ns = task.stop_ts.saturating_sub(task.start_ts);
                     e.preempted = e.slice_used_ns >= slice_ns.saturating_sub(slice_ns / 8);
                     e.cheat_flagged = cheat_flagged;
+                    e.interactive_slice_bias_ns = renewed_slice_bias_ns;
+                    e.interactive_slice_credit_ns = renewed_slice_credit_ns;
                     e.last_seen_ns = Self::now_ns();
 
                     // Update burst predictor — reuse the features already
@@ -1124,6 +1336,7 @@ impl<'a> Scheduler<'a> {
                         timestamp,
                         label,
                         wake_boosted,
+                        wake_credit_ns,
                         latency_sensitive,
                         perf_cri,
                         is_kernel_worker,
@@ -1245,7 +1458,7 @@ impl<'a> Scheduler<'a> {
         let now = Self::now_ns();
         let (_flagged, _n) = self.trust.tick(now);
         // No per-TGID warning needed; trust.worst_actors() exposes bad actors
-        // through the TUI wall-of-shame instead.
+        // through the TUI trust watchlist instead.
     }
 
     /// Deterministic slice update (every 50 ms).
@@ -1444,8 +1657,8 @@ impl<'a> Scheduler<'a> {
         };
 
         let (actors, n_actors) = self.trust.worst_actors();
-        let mut shame = [tui::WallEntry::ZERO; SHAME_MAX];
-        for (dst, src) in shame.iter_mut().zip(actors.iter()).take(n_actors) {
+        let mut watchlist = [tui::WallEntry::ZERO; SHAME_MAX];
+        for (dst, src) in watchlist.iter_mut().zip(actors.iter()).take(n_actors) {
             *dst = tui::WallEntry {
                 pid: src.pid,
                 comm: src.comm,
@@ -1457,7 +1670,7 @@ impl<'a> Scheduler<'a> {
         if let Ok(mut s) = state.lock() {
             s.metrics = metrics.clone();
             s.inference_us = avg_us;
-            s.set_wall_of_shame(&shame, n_actors);
+            s.set_watchlist(&watchlist, n_actors);
         }
     }
 
@@ -1809,5 +2022,25 @@ mod tests {
     #[test]
     fn wake_boost_rejects_long_sleepers() {
         assert!(!Scheduler::should_wake_boost(true, 0.92, 0.78, 40_000_000));
+    }
+
+    #[test]
+    fn wake_preempt_requires_recent_creditful_task() {
+        assert!(!Scheduler::should_wake_preempt(
+            true, true, 500_000, 1_000_000
+        ));
+        assert!(!Scheduler::should_wake_preempt(
+            true, true, 2_000_000, 10_000_000
+        ));
+        assert!(!Scheduler::should_wake_preempt(
+            false, true, 2_000_000, 1_000_000
+        ));
+    }
+
+    #[test]
+    fn wake_preempt_accepts_fresh_high_credit_wakeup() {
+        assert!(Scheduler::should_wake_preempt(
+            true, true, 2_000_000, 1_500_000
+        ));
     }
 }

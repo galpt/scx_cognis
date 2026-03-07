@@ -1,14 +1,11 @@
 // Copyright (c) scx_cognis contributors
 // SPDX-License-Identifier: GPL-2.0-only
 //
-// Deterministic slice controller.
+// Load-driven slice-base controller.
 //
-// Cognis previously used a tabular Q-learning loop to adjust one global slice
-// value. That added smoothing, exploration, and delayed feedback on a path
-// where desktop frame pacing needs direct, predictable behaviour. The current
-// controller is intentionally simpler: derive the slice from current runnable
-// load, clamp it to a tight desktop-oriented window, and publish that value
-// immediately.
+// This module computes the global slice ceiling from current runnable load.
+// Task-specific adjustments, including bounded interactive renewal, are
+// applied later in `main.rs` so this controller can stay simple and O(1).
 
 /// Targeted scheduling latency: the time window in which all runnable tasks
 /// should be served at least once under nominal desktop load.
@@ -20,7 +17,7 @@ const AUTO_SLICE_MIN_NS: u64 = 250_000; // 250 us
 /// Absolute maximum slice even when the machine is mostly idle.
 const AUTO_SLICE_MAX_NS: u64 = 8_000_000; // 8 ms
 
-/// Load-driven deterministic slice controller.
+/// Load-driven slice-base controller.
 pub struct SliceController {
     /// Current slice recommendation (nanoseconds).
     current_slice_ns: u64,

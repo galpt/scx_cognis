@@ -238,7 +238,7 @@ run_with_cognis() {
     say ""
     say "Tip: open a second terminal and run:"
     say "  scx_cognis --monitor 1.0"
-    say "to watch the AI scheduler adapt in real-time during the test."
+    say "to watch the scheduler respond in real time during the test."
     print_monitor_guide
 
     open_aquarium

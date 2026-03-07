@@ -44,8 +44,10 @@
 //
 // Lookup + update cost: 1 multiply (Fibonacci hash) + 5 array reads/writes ≈ 2 ns.
 //
-// Runs inside `ops.exit` (update_on_exit), with reads on `ops.enqueue` and
-// `ops.dispatch` (is_quarantined / is_flagged / slice_factor).
+// Reads happen on `ops.enqueue` and `ops.dispatch`.
+// Updates are applied from the periodic stale-PID flush in `main.rs`, which
+// converts lifetime snapshots into `ExitObservation` records without adding
+// any per-event heap allocation.
 
 #![allow(dead_code)]
 
@@ -57,16 +59,16 @@ pub const TRUST_TABLE_SIZE: usize = 4096;
 pub const TRUST_THRESHOLD: f32 = -0.35;
 
 /// Maximum number of entries returned by `worst_actors()`.
-/// Matches the TUI wall-of-shame display limit.
+/// Matches the TUI trust-watchlist display limit.
 pub const SHAME_MAX: usize = 20;
 
 /// Fibonacci multiplier for 32-bit integer hashing.
 /// Maps pid (i32) → slot uniformly across the table with no modulo bias.
 const FIB32: u32 = 2_654_435_769;
 
-// ── Wall-of-Shame entry ──────────────────────────────────────────────────────
+// ── Trust-watchlist entry ───────────────────────────────────────────────────
 
-/// One entry in the Wall-of-Shame result returned by `worst_actors()`.
+/// One entry in the trust-watchlist result returned by `worst_actors()`.
 #[derive(Debug, Clone, Copy)]
 pub struct ShameEntry {
     pub pid: i32,
@@ -330,7 +332,7 @@ impl TrustTable {
         }
     }
 
-    // ── Wall-of-Shame (replacing both wall_of_shame methods) ─────────────────
+    // ── Trust watchlist (worst trust scores first) ───────────────────────────
 
     /// Return the up-to-`SHAME_MAX` most distrusted PIDs (worst trust scores).
     ///
