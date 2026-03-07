@@ -1,6 +1,6 @@
 [package]
 name = "scx_cognis"
-version = "1.3.11"
+version = "1.3.12"
 authors = ["scx_cognis contributors"]
 edition = "2021"
 description = "An attempt to make an intelligent CPU scheduler — AI-driven, sched_ext-based, user-space Linux CPU scheduler"
