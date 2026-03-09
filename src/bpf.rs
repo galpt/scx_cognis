@@ -22,6 +22,7 @@ use anyhow::Result;
 use plain::Plain;
 
 use libbpf_rs::libbpf_sys::bpf_object_open_opts;
+use libbpf_rs::AsRawLibbpf;
 use libbpf_rs::OpenObject;
 use libbpf_rs::ProgramInput;
 
@@ -475,10 +476,10 @@ impl<'cb> BpfScheduler<'cb> {
     pub fn set_kernel_boost(&mut self, boost_q: u64) -> Result<(), i32> {
         // Get the underlying libbpf map fd.
         let map = &self.skel.maps.kernel_boost;
-        let map_fd = unsafe { libbpf_sys::bpf_map__fd(map.as_libbpf_object().as_ptr()) };
+        let map_fd = unsafe { libbpf_rs::libbpf_sys::bpf_map__fd(map.as_libbpf_object().as_ptr()) };
         let key: u32 = 0;
         let ret = unsafe {
-            libbpf_sys::bpf_map_update_elem(
+            libbpf_rs::libbpf_sys::bpf_map_update_elem(
                 map_fd,
                 &key as *const _ as *const _,
                 &boost_q as *const _ as *const _,
