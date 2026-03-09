@@ -303,13 +303,20 @@ impl<'cb> BpfScheduler<'cb> {
             }
         }
 
-        Ok(Self {
+        let mut instance = Self {
             skel,
             shutdown,
             queued,
             dispatched,
             struct_ops,
-        })
+        };
+
+        // Initialize kernel_boost to 1.0 (Q16.16 = 65536) so the BPF map
+        // is populated and the `set_kernel_boost()` helper is exercised
+        // (avoids dead_code warning and ensures the map exists).
+        let _ = instance.set_kernel_boost(65536u64);
+
+        Ok(instance)
     }
 
     // Set the name of the scx ops.
