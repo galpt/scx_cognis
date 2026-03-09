@@ -311,10 +311,9 @@ impl<'cb> BpfScheduler<'cb> {
             struct_ops,
         };
 
-        // Initialize kernel_boost to 1.0 (Q16.16 = 65536) so the BPF map
-        // is populated and the `set_kernel_boost()` helper is exercised
-        // (avoids dead_code warning and ensures the map exists).
-        let _ = instance.set_kernel_boost(65536u64);
+        // Initialize kernel_boost credit to 0 (no boost = neutral default).
+        // Callers can raise it at runtime via set_kernel_boost(credit_ns).
+        let _ = instance.set_kernel_boost(0u64);
 
         Ok(instance)
     }
@@ -478,8 +477,14 @@ impl<'cb> BpfScheduler<'cb> {
             .nr_bpf_ewma_updates
     }
 
-    /// Set the global kernel boost multiplier (Q16.16) at index 0.
-    /// Returns Ok(()) on success or Err(ret) with the raw bpf error code.
+    /// Set the global kthread vtime credit (nanoseconds) at index 0.
+    ///
+    /// The BPF dispatch path subtracts this value from a kthread's `dsq_vtime`
+    /// before inserting it into the per-CPU DSQ, giving it higher priority over
+    /// user tasks competing on the same DSQ.  A value of `0` (the default) means
+    /// no boost is applied.  Example: `8_333_333` ≈ one 120 Hz frame budget (~8.3 ms).
+    ///
+    /// Returns `Ok(())` on success or `Err(ret)` with the raw BPF error code.
     pub fn set_kernel_boost(&mut self, boost_q: u64) -> Result<(), i32> {
         // Get the underlying libbpf map fd.
         let map = &self.skel.maps.kernel_boost;

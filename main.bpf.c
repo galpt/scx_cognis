@@ -219,9 +219,18 @@ struct {
 
 /* Fixed-point EWMA alpha (Q16.16) as compile-time constant for PoC. */
 #define EWMA_ALPHA_Q 9830 /* ~0.15 * 65536 */
-#define Q16_ONE 65536ULL
 
-/* Kernel boost multiplier (Q16.16).  Userspace can update index 0 to tune the boost. */
+/*
+ * Kernel vtime credit (nanoseconds).  When non-zero, this amount is
+ * subtracted from a kthread's dsq_vtime before it is inserted into its
+ * per-CPU DSQ, giving kthreads lower (higher-priority) vtime and reducing
+ * the chance that a user task with an artificially low vtime preempts
+ * latency-sensitive kernel work like kworkers or ksoftirqd.
+ *
+ * index 0: vtime credit in nanoseconds (default 0 = no boost).
+ * Userspace can tune this at runtime via set_kernel_boost().
+ * A sensible starting value is one 120 Hz frame budget: ~8,333,333 ns.
+ */
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
 	__uint(max_entries, 1);
@@ -692,26 +701,6 @@ static void get_task_info(struct queued_task_ctx *task,
 	task->enq_cnt = ++tctx->enq_cnt;
 
 	bpf_core_read(&task->comm, sizeof(task->comm), &p->comm);
-
-	/*
-	 * Apply kernel boost multiplier (PoC): read the global kernel_boost
-	 * Q16.16 multiplier at index 0 and apply to the task weight when
-	 * boost != 1.0. This is a simple, verifier-friendly fixed-point
-	 * multiplication applied to the integer `weight` field.
-	 */
-	{
-		u32 k = 0;
-		u64 *boost_q = bpf_map_lookup_elem(&kernel_boost, &k);
-		if (boost_q && *boost_q != Q16_ONE) {
-			u64 orig = task->weight;
-			u64 neww = (orig * (*boost_q)) >> 16; /* Q16.16 multiply */
-			/* avoid zero-weight */
-			if (neww == 0)
-				neww = 1;
-			task->weight = neww;
-			__sync_fetch_and_add(&nr_kernel_boosts, 1);
-		}
-	}
 }
 
 /*
@@ -807,8 +796,30 @@ void BPF_STRUCT_OPS(rustland_enqueue, struct task_struct *p, u64 enq_flags)
 	 * redundant checks removed.
 	 */
 	if (is_kthread(p)) {
+		u64 vtime = p->scx.dsq_vtime;
+
+		/*
+		 * Apply a vtime credit to kthreads so they land ahead of user
+		 * tasks that may have accumulated artificially low vtimes.
+		 * This is the LAVD-inspired in-BPF kernel-task priority boost:
+		 * simply subtract a configurable ns credit from the kthread's
+		 * vtime before inserting it into the per-CPU DSQ.
+		 *
+		 * A lower vtime = higher dispatch priority in the vtime-ordered
+		 * DSQ.  The credit is clamped at zero to avoid underflow.
+		 * Default credit = 0 (neutral); tune via set_kernel_boost().
+		 */
+		{
+			u32 k = 0;
+			u64 *credit = bpf_map_lookup_elem(&kernel_boost, &k);
+			if (credit && *credit > 0) {
+				vtime = vtime > *credit ? vtime - *credit : 0;
+				__sync_fetch_and_add(&nr_kernel_boosts, 1);
+			}
+		}
+
 		scx_bpf_dsq_insert_vtime(p, cpu_to_dsq(prev_cpu),
-					 slice_ns, p->scx.dsq_vtime, enq_flags);
+					 slice_ns, vtime, enq_flags);
 		__sync_fetch_and_add(&nr_kernel_dispatches, 1);
 		goto out_kick;
 	}

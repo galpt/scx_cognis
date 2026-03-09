@@ -251,12 +251,12 @@ Example `--monitor` output
 
 As an incremental experiment, Cognis now ships a small BPF-side proof-of-concept (PoC) that moves tiny, deterministic pieces of telemetry and a global "kernel boost" multiplier into the BPF program to reduce userspace roundtrips for a very targeted set of observations.
 - `kernel_ewma` — a bounded per-PID LRU map maintained in BPF that stores a fixed-point (Q16.16) EWMA of recent `exec_runtime` samples. It is cheap, bounded, and intended only as a hot-path hinting signal that userspace can read for parity checks.
-- `kernel_boost` — a single-entry ARRAY map (Q16.16 multiplier) that userspace can update to apply a fixed-point boost to the queued `weight` the BPF side reports to the scheduler. The userspace API exposes a helper `set_kernel_boost(boost_q)` that writes the Q16.16 value into BPF.
+- `kernel_boost` — a single-entry ARRAY map (plain `u64`, nanoseconds) that userspace can update to apply a vtime credit to kthreads at dispatch time. The BPF dispatch path subtracts the credit from a kthread's `dsq_vtime` before inserting it into the per-CPU DSQ, giving it higher priority. The userspace API exposes a helper `set_kernel_boost(credit_ns)` that writes the value into BPF. Default is `0` (no boost).
 - New monitor counters: `nr_bpf_ewma_updates` and `nr_kernel_boosts` appear in `--monitor` output so you can observe PoC activity in real time (they show EWMA updates and times the boost path was exercised).
 
 Why a PoC and not a full port? The PoC follows the hybrid principle: keep rich, adaptive, or floating-point-heavy logic (the RNN burst predictor and the `TrustTable`) in Rust, and only port small deterministic numeric helpers and counters to BPF using fixed-point math. This preserves safety and makes it much easier to validate parity between BPF and userspace before moving anything larger.
 
-The PoC is intentionally conservative and labelled experimental. It is safe to leave enabled in production as a diagnostic, but if you tune `kernel_boost` be mindful that it applies globally and uses fixed-point arithmetic (Q16.16). See "Limitations" for details and guidance.
+The PoC is intentionally conservative and labelled experimental. It is safe to leave enabled in production as a diagnostic, but if you tune `kernel_boost` be mindful that it applies globally. See "Limitations" for details and guidance.
 
 If you prefer a visual view, the TUI in [src/tui/dashboard.rs](src/tui/dashboard.rs) currently renders:
 
@@ -501,8 +501,8 @@ The scheduler has clear limits.
 - Runtime behavior still depends heavily on kernel version, workload shape, CPU topology, and how `sched_ext` behaves on the target machine.
 - CI can prove build/test health, but not real `sched_ext` runtime behavior.
 - Some benchmark and policy conclusions in this README are still best read as evidence about the current implementation, not as universal scheduler laws.
-- Experimental BPF PoC: the repository now contains a small BPF-side proof-of-concept that keeps a bounded per-PID EWMA and a single global `kernel_boost` multiplier in-kernel using fixed-point math (Q16.16). This is intentionally tiny — the design goal was to avoid floating-point or large verifier-unfriendly constructs in BPF. Treat these features as diagnostics: they are useful for parity checks and low-latency hints, but the canonical implementations of burst prediction and trust remain in userspace Rust.
-- Fixed-point note: any values stored in the BPF maps for the PoC use Q16.16 fixed-point representation. When you configure `kernel_boost`, compute the multiplier as `round(multiplier * 65536)` (for example, `1.25 × 65536 = 81920`).
+- Experimental BPF PoC: the repository now contains a small BPF-side proof-of-concept that keeps a bounded per-PID EWMA (Q16.16 fixed-point, updated in `rustland_stopping()`) and a single global `kernel_boost` vtime credit (plain `u64` nanoseconds, applied in the kthread dispatch path). This is intentionally tiny — the design goal was to avoid floating-point or large verifier-unfriendly constructs in BPF. Treat these features as diagnostics: they are useful for parity checks and low-latency hints, but the canonical implementations of burst prediction and trust remain in userspace Rust.
+- Kernel boost note: `kernel_boost` stores a vtime credit in nanoseconds (not a multiplier). To give kthreads roughly one 120 Hz frame budget of priority, set the credit to `8_333_333` (≈ 8.3 ms). The default is `0` (no boost). The EWMA alpha is still Q16.16 internally but is not exposed as a tunable.
 
 [↑ Back to Table of Contents](#table-of-contents)
 
