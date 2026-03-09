@@ -1,6 +1,6 @@
 [package]
 name = "scx_cognis"
-version = "1.4.0"
+version = "1.4.1"
 authors = ["scx_cognis contributors"]
 edition = "2021"
 description = "Adaptive, sched_ext-based, user-space Linux CPU scheduler for desktop responsiveness"
