@@ -42,6 +42,10 @@ pub struct Metrics {
     pub nr_failed_dispatches: u64,
     #[stat(desc = "Scheduler congestion events")]
     pub nr_sched_congested: u64,
+    #[stat(desc = "BPF-side per-pid EWMA updates (PoC)")]
+    pub nr_bpf_ewma_updates: u64,
+    #[stat(desc = "BPF-side kernel boost applications (PoC)")]
+    pub nr_kernel_boosts: u64,
 
     // ── Scheduling policy metrics ──────────────────────────────────────────
     #[stat(desc = "Tasks classified as Interactive")]
@@ -154,7 +158,7 @@ impl Metrics {
     pub fn format<W: Write>(&self, w: &mut W) -> Result<()> {
         writeln!(
             w,
-            "[cognis v{}] tldr: {:<55} | r:{:>3}/{:<3} q:{:<3}/{:<3} | pf:{:<4} | d→u:{:<6} k:{:<4} c:{:<4} b:{:<4} f:{:<4} | cong:{:<4} | \
+            "[cognis v{}] tldr: {:<55} | r:{:>3}/{:<3} q:{:<3}/{:<3} | pf:{:<4} | d→u:{:<6} k:{:<4} c:{:<4} b:{:<4} f:{:<4} ewma:{:<6} kb:{:<4} | cong:{:<4} | \
              🧠 Interactive:{:<4} Compute:{:<4} IOwait:{:<4} RT:{:<4} Unknown:{:<4} | quarantine:{} flagged:{} | slice(base/assigned):{}/{}µs",
             self.version,
             self.tldr(),
@@ -176,6 +180,8 @@ impl Metrics {
             self.nr_unknown,
             self.nr_quarantined,
             self.nr_flagged,
+            self.nr_bpf_ewma_updates,
+            self.nr_kernel_boosts,
             self.base_slice_us,
             self.assigned_slice_us,
         )?;
@@ -203,6 +209,10 @@ impl Metrics {
             nr_sched_congested: self
                 .nr_sched_congested
                 .saturating_sub(rhs.nr_sched_congested),
+            nr_bpf_ewma_updates: self
+                .nr_bpf_ewma_updates
+                .saturating_sub(rhs.nr_bpf_ewma_updates),
+            nr_kernel_boosts: self.nr_kernel_boosts.saturating_sub(rhs.nr_kernel_boosts),
             // Major page faults — per-interval delta so --monitor shows faults/sec.
             // (nr_page_faults is already baseline-subtracted in get_metrics(), but
             // delta() must subtract again so each --monitor line shows only the faults

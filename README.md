@@ -242,6 +242,22 @@ The line format starts like this:
 
 The `tldr` message is not free-form prose; it comes from a fixed set of status messages selected from current metrics such as page faults, failures, congestion, load, and label mix. The exported slice pair now distinguishes the current global load-driven base slice from a recent EMA of the final per-task assigned slices after label, trust, burst, and interactive-renewal adjustments.
 
+Example `--monitor` output
+```text
+[cognis v1.3.19] tldr: Keeping an eye on things — all nominal. | r: 4/8 q: 0/0 | pf: 0 | d→u: 12 k: 3 c: 0 b: 0 f: 0 ewma: 24 kb: 5 | cong: 0 | 🧠 Interactive:3 Compute:1 IOwait:0 RT:0 Unknown:0 | quarantine:0 flagged:0 | slice(base/assigned):500/600µs
+```
+
+#### BPF PoC: lightweight in-kernel counters and boost
+
+As an incremental experiment, Cognis now ships a small BPF-side proof-of-concept (PoC) that moves tiny, deterministic pieces of telemetry and a global "kernel boost" multiplier into the BPF program to reduce userspace roundtrips for a very targeted set of observations.
+- `kernel_ewma` — a bounded per-PID LRU map maintained in BPF that stores a fixed-point (Q16.16) EWMA of recent `exec_runtime` samples. It is cheap, bounded, and intended only as a hot-path hinting signal that userspace can read for parity checks.
+- `kernel_boost` — a single-entry ARRAY map (Q16.16 multiplier) that userspace can update to apply a fixed-point boost to the queued `weight` the BPF side reports to the scheduler. The userspace API exposes a helper `set_kernel_boost(boost_q)` that writes the Q16.16 value into BPF.
+- New monitor counters: `nr_bpf_ewma_updates` and `nr_kernel_boosts` appear in `--monitor` output so you can observe PoC activity in real time (they show EWMA updates and times the boost path was exercised).
+
+Why a PoC and not a full port? The PoC follows the hybrid principle: keep rich, adaptive, or floating-point-heavy logic (the RNN burst predictor and the `TrustTable`) in Rust, and only port small deterministic numeric helpers and counters to BPF using fixed-point math. This preserves safety and makes it much easier to validate parity between BPF and userspace before moving anything larger.
+
+The PoC is intentionally conservative and labelled experimental. It is safe to leave enabled in production as a diagnostic, but if you tune `kernel_boost` be mindful that it applies globally and uses fixed-point arithmetic (Q16.16). See "Limitations" for details and guidance.
+
 If you prefer a visual view, the TUI in [src/tui/dashboard.rs](src/tui/dashboard.rs) currently renders:
 
 1. a header
@@ -319,6 +335,11 @@ If the scheduler is already running and exporting stats, you can watch it with:
 
 ```bash
 scx_cognis --monitor 1.0
+```
+
+Sample output (single-line per-interval snapshot):
+```text
+[cognis v1.3.19] tldr: Keeping an eye on things — all nominal. | r: 4/8 q: 0/0 | pf: 0 | d→u: 12 k: 3 c: 0 b: 0 f: 0 ewma: 24 kb: 5 | cong: 0 | 🧠 Interactive:3 Compute:1 IOwait:0 RT:0 Unknown:0 | quarantine:0 flagged:0 | slice(base/assigned):500/600µs
 ```
 
 The installer and service configuration are set up so that, when installed through the provided service flow, the stats socket at `/run/scx/root/stats` is intended to be reachable by non-root users.
@@ -480,6 +501,8 @@ The scheduler has clear limits.
 - Runtime behavior still depends heavily on kernel version, workload shape, CPU topology, and how `sched_ext` behaves on the target machine.
 - CI can prove build/test health, but not real `sched_ext` runtime behavior.
 - Some benchmark and policy conclusions in this README are still best read as evidence about the current implementation, not as universal scheduler laws.
+- Experimental BPF PoC: the repository now contains a small BPF-side proof-of-concept that keeps a bounded per-PID EWMA and a single global `kernel_boost` multiplier in-kernel using fixed-point math (Q16.16). This is intentionally tiny — the design goal was to avoid floating-point or large verifier-unfriendly constructs in BPF. Treat these features as diagnostics: they are useful for parity checks and low-latency hints, but the canonical implementations of burst prediction and trust remain in userspace Rust.
+- Fixed-point note: any values stored in the BPF maps for the PoC use Q16.16 fixed-point representation. When you configure `kernel_boost`, compute the multiplier as `round(multiplier * 65536)` (for example, `1.25 × 65536 = 81920`).
 
 [↑ Back to Table of Contents](#table-of-contents)
 

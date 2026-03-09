@@ -446,6 +446,52 @@ impl<'cb> BpfScheduler<'cb> {
         &mut self.skel.maps.bss_data.as_mut().unwrap().nr_sched_congested
     }
 
+    // Counter of kernel-boost applications in BPF (PoC).
+    #[allow(dead_code)]
+    pub fn nr_kernel_boosts_mut(&mut self) -> &mut u64 {
+        &mut self
+            .skel
+            .maps
+            .bss_data
+            .as_mut()
+            .unwrap()
+            .nr_kernel_boosts
+    }
+
+    // Counter of per-pid EWMA updates performed in BPF (PoC).
+    #[allow(dead_code)]
+    pub fn nr_bpf_ewma_updates_mut(&mut self) -> &mut u64 {
+        &mut self
+            .skel
+            .maps
+            .bss_data
+            .as_mut()
+            .unwrap()
+            .nr_bpf_ewma_updates
+    }
+
+    /// Set the global kernel boost multiplier (Q16.16) at index 0.
+    /// Returns Ok(()) on success or Err(ret) with the raw bpf error code.
+    pub fn set_kernel_boost(&mut self, boost_q: u64) -> Result<(), i32> {
+        // Get the underlying libbpf map fd.
+        let map = &self.skel.maps.kernel_boost;
+        let map_fd = unsafe { libbpf_sys::bpf_map__fd(map.as_libbpf_object().as_ptr()) };
+        let key: u32 = 0;
+        let ret = unsafe {
+            libbpf_sys::bpf_map_update_elem(
+                map_fd,
+                &key as *const _ as *const _,
+                &boost_q as *const _ as *const _,
+                0,
+            )
+        };
+        if ret != 0 {
+            Err(ret)
+        } else {
+            Ok(())
+        }
+    }
+
     // Set scheduling class for the scheduler itself to SCHED_EXT
     fn use_sched_ext() -> i32 {
         #[cfg(target_env = "gnu")]

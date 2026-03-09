@@ -1603,6 +1603,8 @@ impl<'a> Scheduler<'a> {
             nr_bounce_dispatches: *self.bpf.nr_bounce_dispatches_mut(),
             nr_failed_dispatches: *self.bpf.nr_failed_dispatches_mut(),
             nr_sched_congested: *self.bpf.nr_sched_congested_mut(),
+            nr_bpf_ewma_updates: *self.bpf.nr_bpf_ewma_updates_mut(),
+            nr_kernel_boosts: *self.bpf.nr_kernel_boosts_mut(),
             nr_interactive: self.label_counts[TaskLabel::Interactive as usize],
             nr_compute: self.label_counts[TaskLabel::Compute as usize],
             nr_iowait: self.label_counts[TaskLabel::IoWait as usize],

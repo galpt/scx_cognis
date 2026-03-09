@@ -98,6 +98,10 @@ volatile u64 nr_running, nr_online_cpus;
 volatile u64 nr_user_dispatches, nr_kernel_dispatches,
 	     nr_cancel_dispatches, nr_bounce_dispatches;
 
+/* Additional BPF-side metrics for PoC */
+volatile u64 nr_kernel_boosts; /* number of times kernel boost applied (PoC) */
+volatile u64 nr_bpf_ewma_updates; /* number of per-pid EWMA updates */
+
 /* Failure statistics */
 volatile u64 nr_failed_dispatches, nr_sched_congested;
 
@@ -203,6 +207,27 @@ struct {
 	__type(key, int);
 	__type(value, struct task_ctx);
 } task_ctx_stor SEC(".maps");
+
+/* Per-pid EWMA map: store fixed-point Q16.16 EWMA of recent exec_runtime (ns).
+ * Bounded LRU_HASH to limit kernel memory usage. */
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 4096);
+    __type(key, u32);
+    __type(value, u64);
+} kernel_ewma SEC(".maps");
+
+/* Fixed-point EWMA alpha (Q16.16) as compile-time constant for PoC. */
+#define EWMA_ALPHA_Q 9830 /* ~0.15 * 65536 */
+#define Q16_ONE 65536ULL
+
+/* Kernel boost multiplier (Q16.16).  Userspace can update index 0 to tune the boost. */
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, u32);
+	__type(value, u64);
+} kernel_boost SEC(".maps");
 
 /*
  * Return a local task context from a generic task or NULL if the context
@@ -667,6 +692,26 @@ static void get_task_info(struct queued_task_ctx *task,
 	task->enq_cnt = ++tctx->enq_cnt;
 
 	bpf_core_read(&task->comm, sizeof(task->comm), &p->comm);
+
+	/*
+	 * Apply kernel boost multiplier (PoC): read the global kernel_boost
+	 * Q16.16 multiplier at index 0 and apply to the task weight when
+	 * boost != 1.0. This is a simple, verifier-friendly fixed-point
+	 * multiplication applied to the integer `weight` field.
+	 */
+	{
+		u32 k = 0;
+		u64 *boost_q = bpf_map_lookup_elem(&kernel_boost, &k);
+		if (boost_q && *boost_q != Q16_ONE) {
+			u64 orig = task->weight;
+			u64 neww = (orig * (*boost_q)) >> 16; /* Q16.16 multiply */
+			/* avoid zero-weight */
+			if (neww == 0)
+				neww = 1;
+			task->weight = neww;
+			__sync_fetch_and_add(&nr_kernel_boosts, 1);
+		}
+	}
 }
 
 /*
@@ -969,6 +1014,30 @@ void BPF_STRUCT_OPS(rustland_stopping, struct task_struct *p, bool runnable)
 	 * Update the partial execution time since last sleep.
 	 */
 	tctx->exec_runtime += now - tctx->start_ts;
+
+	/*
+	 * PoC: update a lightweight per-pid EWMA of the last exec runtime (ns)
+	 * stored as Q16.16 fixed-point in `kernel_ewma` LRU hash map.
+	 */
+	{
+		u32 key = (u32)p->pid;
+		u64 sample_q = (tctx->exec_runtime) << 16; /* Q16.16 */
+		u64 *old_q = bpf_map_lookup_elem(&kernel_ewma, &key);
+		u64 new_q;
+
+		if (!old_q) {
+			/* initialize with the current sample */
+			new_q = sample_q;
+			bpf_map_update_elem(&kernel_ewma, &key, &new_q, BPF_ANY);
+		} else {
+			/* diff-based EWMA: new = old + ((sample - old) * alpha) */
+			long diff = (long)sample_q - (long)*old_q;
+			long delta = (diff * (long)EWMA_ALPHA_Q) >> 16;
+			new_q = (u64)((long)*old_q + delta);
+			bpf_map_update_elem(&kernel_ewma, &key, &new_q, BPF_ANY);
+		}
+		__sync_fetch_and_add(&nr_bpf_ewma_updates, 1);
+	}
 }
 
 /*
