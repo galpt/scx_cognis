@@ -200,7 +200,7 @@ In the current implementation, `tasks_per_cpu` is fed from the combined pressure
 
   The result is normally clamped between 250 µs and 8 ms and applied directly. That is intentionally much tighter than a throughput-first desktop policy because Cognis is explicitly trying to stay inside a 120 Hz-style interaction budget under load. If the user passes `--slice-us N`, that value acts as a ceiling, not as a promise that every task will receive exactly `N` microseconds.
 
-  Note: the deterministic auto base is the canonical source for most policy decisions, but the autopilot can safely request a temporary relaxation of the lower clamp under telemetry-guided conditions. When the adaptive `min` is lowered below the normal 250 µs auto floor, the slice controller will consult the raw (unclamped) computed base so effective slices can go below 250 µs for controlled experiments; such changes are still governed by the autopilot's overhead guard, smoothing, step cap, cooldown, and rollback checks. See the "Autopilot" section for details.
+  Note: the deterministic auto base is the canonical source for most policy decisions, but the autopilot can safely request a temporary relaxation of the lower clamp under telemetry-guided conditions. When the adaptive `min` is lowered below the normal 250 µs auto floor, the slice controller will consult the raw (unclamped) computed base so effective slices can go below 250 µs for controlled experiments; such changes are still governed by the autopilot's overhead guard, smoothing, step cap, cooldown, and rollback checks. See the [Autopilot: always-on conservative autoslicing](#autopilot-always-on-conservative-autoslicing) section for details.
 
 Then Cognis applies policy and label-specific adjustments:
 
@@ -238,7 +238,7 @@ Defaults and bounds used by the current conservative proposer:
 - cooldown: 5 s
 - step cap: 10%
 
-The proposer takes its safety cues from the scheduling pipeline percentiles (p50/p95/p99) that Cognis now records and exports. See "Observability" for how to read those values. The autopilot is intended as a safe, conservative assist — it is not doing aggressive exploration, and it will not push Caps beyond the hard bounds above.
+The proposer takes its safety cues from the scheduling pipeline percentiles (p50/p95/p99) that Cognis now records and exports. See [Observability: monitor output and the TUI](#observability-monitor-output-and-the-tui) for how to read those values. The autopilot is intended as a safe, conservative assist — it is not doing aggressive exploration, and it will not push Caps beyond the hard bounds above.
 
 
 ### Trust tracking and burst prediction
@@ -283,7 +283,7 @@ As an incremental experiment, Cognis now ships a small BPF-side proof-of-concept
 
 Why a PoC and not a full port? The PoC follows the hybrid principle: keep rich, adaptive, or floating-point-heavy logic (the RNN burst predictor and the `TrustTable`) in Rust, and only port small deterministic numeric helpers and counters to BPF using fixed-point math. This preserves safety and makes it much easier to validate parity between BPF and userspace before moving anything larger.
 
-The PoC is intentionally conservative and labelled experimental. It is safe to leave enabled in production as a diagnostic, but if you tune `kernel_boost` be mindful that it applies globally. See "Limitations" for details and guidance.
+The PoC is intentionally conservative and labelled experimental. It is safe to leave enabled in production as a diagnostic, but if you tune `kernel_boost` be mindful that it applies globally. See [Limitations](#limitations) for details and guidance.
 
 If you prefer a visual view, the TUI in [src/tui/dashboard.rs](src/tui/dashboard.rs) currently renders:
 
