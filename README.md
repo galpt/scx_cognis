@@ -198,7 +198,9 @@ TARGETED_LATENCY_NS / max(tasks_per_cpu, 1)
 
 In the current implementation, `tasks_per_cpu` is fed from the combined pressure that Cognis can see at that moment: currently running tasks plus the queued BPF-to-userspace backlog and any userspace tasks still pending dispatch. That means the base slice can tighten before all of that pressure has already turned into actively running work.
 
-The result is clamped between 250 µs and 8 ms and applied directly. That is intentionally much tighter than a throughput-first desktop policy because Cognis is explicitly trying to stay inside a 120 Hz-style interaction budget under load. If the user passes `--slice-us N`, that value acts as a ceiling, not as a promise that every task will receive exactly `N` microseconds.
+  The result is normally clamped between 250 µs and 8 ms and applied directly. That is intentionally much tighter than a throughput-first desktop policy because Cognis is explicitly trying to stay inside a 120 Hz-style interaction budget under load. If the user passes `--slice-us N`, that value acts as a ceiling, not as a promise that every task will receive exactly `N` microseconds.
+
+  Note: the deterministic auto base is the canonical source for most policy decisions, but the autopilot can safely request a temporary relaxation of the lower clamp under telemetry-guided conditions. When the adaptive `min` is lowered below the normal 250 µs auto floor, the slice controller will consult the raw (unclamped) computed base so effective slices can go below 250 µs for controlled experiments; such changes are still governed by the autopilot's overhead guard, smoothing, step cap, cooldown, and rollback checks. See the "Autopilot" section for details.
 
 Then Cognis applies policy and label-specific adjustments:
 
@@ -269,7 +271,7 @@ The `tldr` message is not free-form prose; it comes from a fixed set of status m
 
 Example `--monitor` output
 ```text
-[cognis v1.4.2] tldr: Balancing work steadily — nothing to worry about.       | r:  1/16  q:1  /0   | pf:0    | d→u:0      k:2002 c:0    b:0    f:0    ewma:0      kb:0    sched:3/12/30 | cong:0    | 🧠 Interactive:0    Compute:0    IOwait:0    RT:0    Unknown:0    | quarantine:2009 flagged:0 | slice(base/assigned):6000/12128µs
+[cognis v1.4.3] tldr: Balancing work steadily — nothing to worry about.       | r:  1/16  q:1  /0   | pf:0    | d→u:0      k:2002 c:0    b:0    f:0    ewma:0      kb:0    sched:3/12/30 | cong:0    | 🧠 Interactive:0    Compute:0    IOwait:0    RT:0    Unknown:0    | quarantine:2009 flagged:0 | slice(base/assigned):6000/12128µs
 ```
 
 #### BPF PoC: lightweight in-kernel counters and boost
@@ -366,7 +368,7 @@ scx_cognis --monitor 1.0
 
 Sample output (single-line per-interval snapshot):
 ```text
-[cognis v1.4.2] tldr: Balancing work steadily — nothing to worry about.       | r:  1/16  q:1  /0   | pf:0    | d→u:0      k:2002 c:0    b:0    f:0    ewma:0      kb:0    sched:3/12/30 | cong:0    | 🧠 Interactive:0    Compute:0    IOwait:0    RT:0    Unknown:0    | quarantine:2009 flagged:0 | slice(base/assigned):6000/12128µs
+[cognis v1.4.3] tldr: Balancing work steadily — nothing to worry about.       | r:  1/16  q:1  /0   | pf:0    | d→u:0      k:2002 c:0    b:0    f:0    ewma:0      kb:0    sched:3/12/30 | cong:0    | 🧠 Interactive:0    Compute:0    IOwait:0    RT:0    Unknown:0    | quarantine:2009 flagged:0 | slice(base/assigned):6000/12128µs
 ```
 
 The installer and service configuration are set up so that, when installed through the provided service flow, the stats socket at `/run/scx/root/stats` is intended to be reachable by non-root users.
