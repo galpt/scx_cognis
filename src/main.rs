@@ -1649,6 +1649,8 @@ impl<'a> Scheduler<'a> {
             nr_flagged: self.trust.flagged_count(),
             base_slice_us: self.slice_controller.read_slice_ns() / NSEC_PER_USEC,
             assigned_slice_us: self.assigned_slice_ema_ns / NSEC_PER_USEC,
+            autopilot_min_us: self.slice_controller.read_min() / NSEC_PER_USEC,
+            autopilot_max_us: self.slice_controller.read_max() / NSEC_PER_USEC,
             inference_us: avg_inference_us as u64,
             sched_p50_us: p50_us,
             sched_p95_us: p95_us,

@@ -68,6 +68,10 @@ pub struct Metrics {
     pub base_slice_us: u64,
     #[stat(desc = "Recent EMA of final per-task assigned slices after adjustments (µs)")]
     pub assigned_slice_us: u64,
+    #[stat(desc = "Autopilot adaptive minimum cap (µs)")]
+    pub autopilot_min_us: u64,
+    #[stat(desc = "Autopilot adaptive maximum cap (µs)")]
+    pub autopilot_max_us: u64,
     #[stat(desc = "Average per-event scheduling pipeline latency (µs)")]
     pub inference_us: u64,
     #[stat(desc = "Scheduling pipeline latency p50 (µs)")]

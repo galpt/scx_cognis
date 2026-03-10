@@ -350,6 +350,11 @@ fn draw_slice_control(f: &mut Frame, area: Rect, state: &DashboardState) {
             "  Assigned Slice≈   {}µs",
             state.metrics.assigned_slice_us
         )),
+        Line::from(format!(
+            "  Autopilot:        {}µs min/{}µs max",
+            state.metrics.autopilot_min_us,
+            state.metrics.autopilot_max_us
+        )),
         Line::from(format!("  Inference:        {:.2}µs", state.inference_us)),
         Line::from(vec![
             Span::raw("  Latency Budget:   "),
