@@ -70,6 +70,12 @@ pub struct Metrics {
     pub assigned_slice_us: u64,
     #[stat(desc = "Average per-event scheduling pipeline latency (µs)")]
     pub inference_us: u64,
+    #[stat(desc = "Scheduling pipeline latency p50 (µs)")]
+    pub sched_p50_us: u64,
+    #[stat(desc = "Scheduling pipeline latency p95 (µs)")]
+    pub sched_p95_us: u64,
+    #[stat(desc = "Scheduling pipeline latency p99 (µs)")]
+    pub sched_p99_us: u64,
 }
 
 impl Metrics {
@@ -158,7 +164,7 @@ impl Metrics {
     pub fn format<W: Write>(&self, w: &mut W) -> Result<()> {
         writeln!(
             w,
-            "[cognis v{}] tldr: {:<55} | r:{:>3}/{:<3} q:{:<3}/{:<3} | pf:{:<4} | d→u:{:<6} k:{:<4} c:{:<4} b:{:<4} f:{:<4} ewma:{:<6} kb:{:<4} | cong:{:<4} | \
+            "[cognis v{}] tldr: {:<55} | r:{:>3}/{:<3} q:{:<3}/{:<3} | pf:{:<4} | d→u:{:<6} k:{:<4} c:{:<4} b:{:<4} f:{:<4} ewma:{:<6} kb:{:<4} sched:{:<5}/{:<5}/{:<5} | cong:{:<4} | \
              🧠 Interactive:{:<4} Compute:{:<4} IOwait:{:<4} RT:{:<4} Unknown:{:<4} | quarantine:{} flagged:{} | slice(base/assigned):{}/{}µs",
             self.version,
             self.tldr(),
@@ -174,6 +180,9 @@ impl Metrics {
             self.nr_failed_dispatches,
             self.nr_bpf_ewma_updates,
             self.nr_kernel_boosts,
+            self.sched_p50_us,
+            self.sched_p95_us,
+            self.sched_p99_us,
             self.nr_sched_congested,
             self.nr_interactive,
             self.nr_compute,

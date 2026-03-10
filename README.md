@@ -215,6 +215,29 @@ There is also a separate deadline-side guardrail now: non-compute tasks do not c
 
 The slice controller is deliberately direct. It re-runs the load formula on a short periodic tick and updates the global base slice immediately from the current running-plus-queued pressure signal. The point is not to be clever. The point is to make slice changes predictable enough that desktop-critical wakeups are not waiting on a slower control loop to notice that the machine just got busy.
 
+### Autopilot: always-on conservative autoslicing
+
+Cognis now includes a conservative, always-on autopilot proposer that adjusts the adaptive `min`/`max` slice caps at runtime. The autopilot runs entirely in userspace and is deliberately conservative by default: it is enabled by default and applies only bounded, rate-limited changes so a single noisy probe cannot destabilise latency.
+
+Key safety features the autopilot implements:
+
+- Overhead guard: the autopilot measures the scheduler's own per-cycle overhead (median / p50) and never proposes a `min` below 4× that median. This prevents short-slice modes from being dominated by scheduler overhead.
+- Smoothing: targets are smoothed using an EMA to prevent step noise from driving rapid changes.
+- Step cap: each update is limited to a small fractional change (default ~10%).
+- Cooldown: writes are rate-limited (default 5 s between applied changes) so changes have time to settle and be validated against tail latency.
+- Rollback on regression: the autopilot tracks a p99 threshold and will revert to the last-good caps if tail latency worsens beyond the stored threshold after a change.
+
+Defaults and bounds used by the current conservative proposer:
+
+- absolute hard floor: 10 µs
+- absolute hard ceiling: 50 ms
+- smoothing alpha: 0.25
+- cooldown: 5 s
+- step cap: 10%
+
+The proposer takes its safety cues from the scheduling pipeline percentiles (p50/p95/p99) that Cognis now records and exports. See "Observability" for how to read those values. The autopilot is intended as a safe, conservative assist — it is not doing aggressive exploration, and it will not push Caps beyond the hard bounds above.
+
+
 ### Trust tracking and burst prediction
 
 Two other pieces round out the current policy.
@@ -234,17 +257,18 @@ Both pieces are designed around fixed-size storage and bounded lookup/update cos
 
 Cognis exposes metrics through `scx_stats` and formats them in [src/stats.rs](src/stats.rs).
 
+
 The line format starts like this:
 
 ```text
-[cognis vx.y.z] tldr: ... | r:... | q:... | pf:... | d→u:... k:... c:... b:... f:... | cong:... | 🧠 Interactive:... Compute:... IOwait:... RT:... Unknown:... | quarantine:... flagged:... | slice(base/assigned):.../...µs
+[cognis vx.y.z] tldr: ... | r:... | q:... | pf:... | d→u:... k:... c:... b:... f:... ewma:... kb:... sched:p50/p95/p99 | cong:... | 🧠 Interactive:... Compute:... IOwait:... RT:... Unknown:... | quarantine:... flagged:... | slice(base/assigned):.../...µs
 ```
 
 The `tldr` message is not free-form prose; it comes from a fixed set of status messages selected from current metrics such as page faults, failures, congestion, load, and label mix. The exported slice pair now distinguishes the current global load-driven base slice from a recent EMA of the final per-task assigned slices after label, trust, burst, and interactive-renewal adjustments.
 
 Example `--monitor` output
 ```text
-[cognis v1.4.2] tldr: Balancing work steadily — nothing to worry about.       | r:  1/16  q:1  /0   | pf:0    | d→u:0      k:2002 c:0    b:0    f:0    ewma:0      kb:0    | cong:0    | 🧠 Interactive:0    Compute:0    IOwait:0    RT:0    Unknown:0    | quarantine:2009 flagged:0 | slice(base/assigned):6000/12128µs
+[cognis v1.4.2] tldr: Balancing work steadily — nothing to worry about.       | r:  1/16  q:1  /0   | pf:0    | d→u:0      k:2002 c:0    b:0    f:0    ewma:0      kb:0    sched:3/12/30 | cong:0    | 🧠 Interactive:0    Compute:0    IOwait:0    RT:0    Unknown:0    | quarantine:2009 flagged:0 | slice(base/assigned):6000/12128µs
 ```
 
 #### BPF PoC: lightweight in-kernel counters and boost
@@ -268,6 +292,8 @@ If you prefer a visual view, the TUI in [src/tui/dashboard.rs](src/tui/dashboard
 6. a trust watchlist
 
 The TUI exits on `q` or `Esc`.
+
+The header now includes scheduling pipeline percentiles (`sched:` p50/p95/p99 in µs) so you can observe median and tail scheduler overhead directly from the dashboard.
 
 <p align="center">
 	<img src="https://github.com/galpt/scx_cognis/blob/main/img/cognis-ratatui.png" alt="scx_cognis TUI" style="max-width:100%;height:auto;" />
@@ -339,7 +365,7 @@ scx_cognis --monitor 1.0
 
 Sample output (single-line per-interval snapshot):
 ```text
-[cognis v1.4.2] tldr: Balancing work steadily — nothing to worry about.       | r:  1/16  q:1  /0   | pf:0    | d→u:0      k:2002 c:0    b:0    f:0    ewma:0      kb:0    | cong:0    | 🧠 Interactive:0    Compute:0    IOwait:0    RT:0    Unknown:0    | quarantine:2009 flagged:0 | slice(base/assigned):6000/12128µs
+[cognis v1.4.2] tldr: Balancing work steadily — nothing to worry about.       | r:  1/16  q:1  /0   | pf:0    | d→u:0      k:2002 c:0    b:0    f:0    ewma:0      kb:0    sched:3/12/30 | cong:0    | 🧠 Interactive:0    Compute:0    IOwait:0    RT:0    Unknown:0    | quarantine:2009 flagged:0 | slice(base/assigned):6000/12128µs
 ```
 
 The installer and service configuration are set up so that, when installed through the provided service flow, the stats socket at `/run/scx/root/stats` is intended to be reachable by non-root users.

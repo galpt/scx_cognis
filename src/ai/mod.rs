@@ -12,6 +12,7 @@ pub mod burst_predictor;
 pub mod classifier;
 pub mod cpu_selector;
 pub mod policy;
+pub mod slice_autopilot;
 pub mod trust;
 
 // Re-export the most commonly used types for convenience.
@@ -19,4 +20,5 @@ pub use burst_predictor::BurstPredictor;
 pub use classifier::{HeuristicClassifier, TaskFeatures, TaskLabel};
 pub use cpu_selector::{CoreType as CpuCoreType, CpuSelector, CpuState};
 pub use policy::SliceController;
+pub use slice_autopilot::Autopilot;
 pub use trust::{ExitObservation, TrustTable, SHAME_MAX};

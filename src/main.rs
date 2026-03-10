@@ -58,7 +58,7 @@ use scx_utils::UserExitInfo;
 
 use ai::{
     BurstPredictor, CpuCoreType, CpuSelector, CpuState, ExitObservation, HeuristicClassifier,
-    SliceController, TaskFeatures, TaskLabel, TrustTable, SHAME_MAX,
+    SliceController, Autopilot, TaskFeatures, TaskLabel, TrustTable, SHAME_MAX,
 };
 use stats::Metrics;
 use task_queue::{QueuePush, TaskQueue};
@@ -236,6 +236,7 @@ struct Scheduler<'a> {
     trust: Box<TrustTable>,
     slice_controller: SliceController,
     cpu_selector: CpuSelector,
+    autopilot: Autopilot,
 
     // Fixed-size per-PID lifetime table (Fibonacci hash, zero-alloc after init).
     lifetime_table: Box<[TaskLifetime; LIFETIME_TABLE_SIZE]>,
@@ -300,6 +301,9 @@ impl<'a> Scheduler<'a> {
         let initial_assigned_slice_ns = slice_controller.read_slice_ns();
         let cpu_selector = Self::build_cpu_selector();
 
+        // Autopilot proposer (always-on, conservative-by-default).
+        let autopilot = Autopilot::new(slice_controller.read_min(), slice_controller.read_max());
+        
         let bpf = BpfScheduler::init(
             shutdown,
             open_object,
@@ -356,6 +360,7 @@ impl<'a> Scheduler<'a> {
             burst_pred: BurstPredictor::new(),
             trust: TrustTable::new(),
             slice_controller,
+            autopilot,
             cpu_selector,
             lifetime_table: {
                 // SAFETY: TaskLifetime is a plain struct with u64/bool fields;
@@ -1506,6 +1511,26 @@ impl<'a> Scheduler<'a> {
         self.slice_controller.update(effective_pressure, nr_cpus);
         self.cpu_selector
             .update_avg_perf_cri(self.placement_perf_ema);
+        // Autopilot: propose bounded min/max adjustments periodically.
+        if let Some((min_ns, max_ns)) = self.autopilot.propose(
+            &self.slice_controller,
+            self.assigned_slice_ema_ns,
+            self.slice_controller.read_auto_base_ns(),
+            nr_running,
+            nr_queued,
+        ) {
+            let prev_min = self.slice_controller.read_min();
+            let prev_max = self.slice_controller.read_max();
+            if min_ns != prev_min || max_ns != prev_max {
+                info!(
+                    "Autopilot: applying adaptive caps min={}µs max={}µs",
+                    min_ns / NSEC_PER_USEC,
+                    max_ns / NSEC_PER_USEC
+                );
+            }
+            self.slice_controller.write_min(min_ns);
+            self.slice_controller.write_max(max_ns);
+        }
     }
 
     /// Emit trust updates for finished tasks.
@@ -1590,6 +1615,12 @@ impl<'a> Scheduler<'a> {
 
         let quarantined_count = self.trust.quarantined_count();
 
+        // Scheduling latency percentiles (ns → µs)
+        let (p50_ns, p95_ns, p99_ns) = self.slice_controller.compute_sched_percentiles();
+        let p50_us = p50_ns / NSEC_PER_USEC;
+        let p95_us = p95_ns / NSEC_PER_USEC;
+        let p99_us = p99_ns / NSEC_PER_USEC;
+
         Metrics {
             version: env!("CARGO_PKG_VERSION").to_string(),
             nr_running: *self.bpf.nr_running_mut(),
@@ -1615,12 +1646,18 @@ impl<'a> Scheduler<'a> {
             base_slice_us: self.slice_controller.read_slice_ns() / NSEC_PER_USEC,
             assigned_slice_us: self.assigned_slice_ema_ns / NSEC_PER_USEC,
             inference_us: avg_inference_us as u64,
+            sched_p50_us: p50_us,
+            sched_p95_us: p95_us,
+            sched_p99_us: p99_us,
         }
     }
 
     // ── Main scheduling loop ───────────────────────────────────────────────
 
     fn schedule(&mut self) {
+        // Measure the scheduling pipeline latency for autopilot overhead checks.
+        let sched_t0 = Self::now_ns();
+
         // 1. Drain queued tasks in a bounded batch.
         //
         // Bound the batch so each schedule() call reaches the dispatch phase
@@ -1659,6 +1696,10 @@ impl<'a> Scheduler<'a> {
 
         // 3. Notify BPF dispatcher of remaining pending work.
         self.bpf.notify_complete(self.tasks_len() as u64);
+
+        // Record the end-to-end schedule() latency (cheap, lock-free ring write).
+        let sched_elapsed = Self::now_ns().saturating_sub(sched_t0);
+        self.slice_controller.record_sched_event_latency(sched_elapsed);
     }
 
     // ── Background housekeeping ─────────────────────────────────────────────
