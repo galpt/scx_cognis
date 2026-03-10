@@ -247,8 +247,9 @@ fn draw_header(f: &mut Frame, area: Rect, m: &Metrics) {
         Span::raw("│ Adaptive CPU Scheduler for Desktop Responsiveness │ "),
         Span::styled(
             format!(
-                "CPUs: {}  Running: {}  Queued: {}  Base: {}µs  Assigned≈{}µs",
-                m.nr_cpus, m.nr_running, m.nr_queued, m.base_slice_us, m.assigned_slice_us
+                "CPUs: {}  Running: {}  Queued: {}  Base: {}µs  Assigned≈{}µs  ewma:{} kb:{}",
+                m.nr_cpus, m.nr_running, m.nr_queued, m.base_slice_us, m.assigned_slice_us,
+                m.nr_bpf_ewma_updates, m.nr_kernel_boosts
             ),
             Style::default().fg(Color::Green),
         ),
