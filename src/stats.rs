@@ -172,6 +172,8 @@ impl Metrics {
             self.nr_cancel_dispatches,
             self.nr_bounce_dispatches,
             self.nr_failed_dispatches,
+            self.nr_bpf_ewma_updates,
+            self.nr_kernel_boosts,
             self.nr_sched_congested,
             self.nr_interactive,
             self.nr_compute,
@@ -180,8 +182,6 @@ impl Metrics {
             self.nr_unknown,
             self.nr_quarantined,
             self.nr_flagged,
-            self.nr_bpf_ewma_updates,
-            self.nr_kernel_boosts,
             self.base_slice_us,
             self.assigned_slice_us,
         )?;
