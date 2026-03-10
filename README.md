@@ -22,6 +22,7 @@ That framing matters, because Cognis is still exactly what it says it is: **an a
   - [Why user tasks go through SHARED_DSQ](#why-user-tasks-go-through-shared_dsq)
   - [How tasks are classified](#how-tasks-are-classified)
   - [How slices are adjusted](#how-slices-are-adjusted)
+  - [Autopilot: always-on conservative autoslicing](#autopilot-always-on-conservative-autoslicing)
   - [Trust tracking and burst prediction](#trust-tracking-and-burst-prediction)
   - [Observability: monitor output and the TUI](#observability-monitor-output-and-the-tui)
 - [Build and Run](#build-and-run)
