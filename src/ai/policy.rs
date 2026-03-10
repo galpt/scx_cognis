@@ -109,7 +109,7 @@ impl SliceController {
     /// Write adaptive min cap (ns). Caller must ensure safety bounds.
     pub fn write_min(&mut self, v: u64) {
         self.min_ns = v.max(1); // never zero
-        // keep current slice within bounds
+                                // keep current slice within bounds
         self.current_slice_ns = self.current_slice_ns.clamp(self.min_ns, self.max_ns);
     }
 

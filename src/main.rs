@@ -57,8 +57,8 @@ use scx_utils::Topology;
 use scx_utils::UserExitInfo;
 
 use ai::{
-    BurstPredictor, CpuCoreType, CpuSelector, CpuState, ExitObservation, HeuristicClassifier,
-    SliceController, Autopilot, TaskFeatures, TaskLabel, TrustTable, SHAME_MAX,
+    Autopilot, BurstPredictor, CpuCoreType, CpuSelector, CpuState, ExitObservation,
+    HeuristicClassifier, SliceController, TaskFeatures, TaskLabel, TrustTable, SHAME_MAX,
 };
 use stats::Metrics;
 use task_queue::{QueuePush, TaskQueue};
@@ -303,7 +303,7 @@ impl<'a> Scheduler<'a> {
 
         // Autopilot proposer (always-on, conservative-by-default).
         let autopilot = Autopilot::new(slice_controller.read_min(), slice_controller.read_max());
-        
+
         let bpf = BpfScheduler::init(
             shutdown,
             open_object,
@@ -1699,7 +1699,8 @@ impl<'a> Scheduler<'a> {
 
         // Record the end-to-end schedule() latency (cheap, lock-free ring write).
         let sched_elapsed = Self::now_ns().saturating_sub(sched_t0);
-        self.slice_controller.record_sched_event_latency(sched_elapsed);
+        self.slice_controller
+            .record_sched_event_latency(sched_elapsed);
     }
 
     // ── Background housekeeping ─────────────────────────────────────────────
