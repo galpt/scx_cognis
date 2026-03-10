@@ -244,7 +244,7 @@ fn draw_header(f: &mut Frame, area: Rect, m: &Metrics) {
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::raw("│ Adaptive CPU Scheduler for Desktop Responsiveness │ "),
+        Span::raw("│ Adaptive CPU Scheduler │ "),
         Span::styled(
             format!(
                 "CPUs: {}  Running: {}  Queued: {}  Base: {}µs  Assigned≈{}µs  ewma:{} kb:{}  sched:{}:{}:{}",

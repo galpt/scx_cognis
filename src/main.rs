@@ -46,7 +46,7 @@ use anyhow::Context;
 use anyhow::Result;
 use clap::Parser;
 use libbpf_rs::OpenObject;
-use log::{info, warn};
+use log::{debug, info, warn};
 use procfs::process::Process;
 
 use scx_stats::prelude::*;
@@ -1522,7 +1522,11 @@ impl<'a> Scheduler<'a> {
             let prev_min = self.slice_controller.read_min();
             let prev_max = self.slice_controller.read_max();
             if min_ns != prev_min || max_ns != prev_max {
-                info!(
+                // Use debug level for frequent autopilot adjustments so the
+                // TUI's info/log panel isn't flooded with periodic messages.
+                // Significant regressions/alerts are still logged at higher
+                // levels elsewhere.
+                debug!(
                     "Autopilot: applying adaptive caps min={}µs max={}µs",
                     min_ns / NSEC_PER_USEC,
                     max_ns / NSEC_PER_USEC
