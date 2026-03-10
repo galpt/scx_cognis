@@ -244,10 +244,6 @@ The `tldr` message is not free-form prose; it comes from a fixed set of status m
 
 Example `--monitor` output
 ```text
-[cognis v1.4.2] tldr: A solid workload — distributing tasks evenly and keeping things smooth. | r: 12/16  q:1  /0   | pf:0    | d→u:1      k:35   c:0    b:0    f:0    ewma:0      kb:0    | cong:0    | 🧠 Interactive:1    Compute:0    IOwait:0    RT:0    Unknown:0    | quarantine:36 flagged:0 | slice(base/assigned):6000/10701µs
-[cognis v1.4.2] tldr: Balancing work steadily — nothing to worry about.       | r:  2/16  q:1  /0   | pf:0    | d→u:55     k:3162 c:0    b:0    f:0    ewma:0      kb:22   | cong:1    | 🧠 Interactive:32   Compute:0    IOwait:0    RT:0    Unknown:0    | quarantine:3305 flagged:0 | slice(base/assigned):6000/5523µs
-[cognis v1.4.2] tldr: Balancing work steadily — nothing to worry about.       | r:  1/16  q:1  /0   | pf:0    | d→u:16     k:3867 c:0    b:0    f:0    ewma:0      kb:6    | cong:0    | 🧠 Interactive:10   Compute:0    IOwait:0    RT:0    Unknown:0    | quarantine:3947 flagged:0 | slice(base/assigned):4800/3786µs
-[cognis v1.4.2] tldr: Rest assured! I'm keeping your system responsive.       | r:  0/16  q:0  /0   | pf:0    | d→u:5      k:3622 c:0    b:0    f:0    ewma:0      kb:4    | cong:0    | 🧠 Interactive:1    Compute:0    IOwait:0    RT:0    Unknown:0    | quarantine:3637 flagged:0 | slice(base/assigned):6000/12128µs
 [cognis v1.4.2] tldr: Balancing work steadily — nothing to worry about.       | r:  1/16  q:1  /0   | pf:0    | d→u:0      k:2002 c:0    b:0    f:0    ewma:0      kb:0    | cong:0    | 🧠 Interactive:0    Compute:0    IOwait:0    RT:0    Unknown:0    | quarantine:2009 flagged:0 | slice(base/assigned):6000/12128µs
 ```
 
