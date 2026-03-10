@@ -261,6 +261,7 @@ fn draw_header(f: &mut Frame, area: Rect, m: &Metrics) {
             ),
             Style::default().fg(Color::Green),
         ),
+        Span::raw(format!(" [{} v{} — core {}] ", "Cognis", env!("CARGO_PKG_VERSION"), scx_rustland_core::VERSION)),
         Span::raw("  [ press 'q' to quit ]"),
     ]);
     let block = Block::default()

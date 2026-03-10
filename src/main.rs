@@ -335,7 +335,7 @@ impl<'a> Scheduler<'a> {
             None
         };
 
-        info!(
+        debug!(
             "{} version {} — scx_rustland_core {}",
             SCHEDULER_NAME,
             build_id::full_version(env!("CARGO_PKG_VERSION")),
