@@ -343,7 +343,7 @@ scx_cognis --monitor 1.0
 
 Sample output (single-line per-interval snapshot):
 ```text
-[cognis v1.3.19] tldr: Keeping an eye on things — all nominal. | r: 4/8 q: 0/0 | pf: 0 | d→u: 12 k: 3 c: 0 b: 0 f: 0 ewma: 24 kb: 5 | cong: 0 | 🧠 Interactive:3 Compute:1 IOwait:0 RT:0 Unknown:0 | quarantine:0 flagged:0 | slice(base/assigned):500/600µs
+[cognis v1.4.2] tldr: Balancing work steadily — nothing to worry about.       | r:  1/16  q:1  /0   | pf:0    | d→u:0      k:2002 c:0    b:0    f:0    ewma:0      kb:0    | cong:0    | 🧠 Interactive:0    Compute:0    IOwait:0    RT:0    Unknown:0    | quarantine:2009 flagged:0 | slice(base/assigned):6000/12128µs
 ```
 
 The installer and service configuration are set up so that, when installed through the provided service flow, the stats socket at `/run/scx/root/stats` is intended to be reachable by non-root users.
