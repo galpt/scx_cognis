@@ -1532,8 +1532,10 @@ impl<'a> Scheduler<'a> {
                     max_ns / NSEC_PER_USEC
                 );
             }
-            self.slice_controller.write_min(min_ns);
-            self.slice_controller.write_max(max_ns);
+            // Apply both bounds via a single safe API to avoid transient
+            // `min > max` panics if the autopilot ever proposes inconsistent
+            // values. `write_min_max` will adjust and warn if needed.
+            self.slice_controller.write_min_max(min_ns, max_ns);
         }
     }
 

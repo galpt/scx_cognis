@@ -27,6 +27,7 @@ use crossterm::{
 };
 use ratatui::{
     backend::CrosstermBackend,
+    layout::Alignment,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     symbols,
@@ -201,7 +202,11 @@ pub fn draw(frame: &mut Frame, state: &DashboardState) {
     // Top-level split: header + body.
     let root = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(0)])
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(0),
+            Constraint::Length(1),
+        ])
         .split(area);
 
     draw_header(frame, root[0], &state.metrics);
@@ -234,6 +239,18 @@ pub fn draw(frame: &mut Frame, state: &DashboardState) {
 
     draw_latency_chart(frame, right[0], state);
     draw_watchlist(frame, right[1], &state.watchlist_entries[..state.wall_len]);
+
+    // Footer (single-line): version / core info centered at the bottom.
+    let footer_area = root[2];
+    let footer_text = Line::from(Span::raw(format!(
+        "Cognis v{} — core {}",
+        env!("CARGO_PKG_VERSION"),
+        scx_rustland_core::VERSION
+    )));
+    let footer_para = Paragraph::new(footer_text)
+        .block(Block::default().borders(Borders::NONE))
+        .alignment(Alignment::Center);
+    frame.render_widget(footer_para, footer_area);
 }
 
 fn draw_header(f: &mut Frame, area: Rect, m: &Metrics) {
@@ -261,7 +278,6 @@ fn draw_header(f: &mut Frame, area: Rect, m: &Metrics) {
             ),
             Style::default().fg(Color::Green),
         ),
-        Span::raw(format!(" [{} v{} — core {}] ", "Cognis", env!("CARGO_PKG_VERSION"), scx_rustland_core::VERSION)),
         Span::raw("  [ press 'q' to quit ]"),
     ]);
     let block = Block::default()

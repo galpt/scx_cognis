@@ -21,6 +21,7 @@ const AUTO_SLICE_MAX_NS: u64 = 8_000_000; // 8 ms
 const LAT_RING_CAP: usize = 2048;
 const LAT_RING_MASK: usize = LAT_RING_CAP - 1;
 
+use log::warn;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 /// Load-driven slice-base controller.
@@ -138,6 +139,26 @@ impl SliceController {
     /// Write adaptive max cap (ns). Caller must ensure safety bounds.
     pub fn write_max(&mut self, v: u64) {
         self.max_ns = v.max(1);
+        self.current_slice_ns = self.current_slice_ns.clamp(self.min_ns, self.max_ns);
+    }
+
+    /// Atomically write both adaptive min and max caps (ns) in a safe way.
+    ///
+    /// If the caller supplies `min > max` the values are adjusted so that
+    /// `min <= max` to avoid `clamp()` panics. A warning is emitted when an
+    /// adjustment is required.
+    pub fn write_min_max(&mut self, v_min: u64, v_max: u64) {
+        let mut min = v_min.max(1);
+        let mut max = v_max.max(1);
+        if min > max {
+            warn!(
+                "SliceController::write_min_max: requested min > max (min={} ns, max={} ns); adjusting max = min",
+                min, max
+            );
+            max = min;
+        }
+        self.min_ns = min;
+        self.max_ns = max;
         self.current_slice_ns = self.current_slice_ns.clamp(self.min_ns, self.max_ns);
     }
 
