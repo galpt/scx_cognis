@@ -271,7 +271,8 @@ The `tldr` message is not free-form prose; it comes from a fixed set of status m
 
 Example `--monitor` output
 ```text
-[cognis v1.5.1] elapsed: 1y2m3d 12h:30m:14s | tldr: Balancing work steadily — nothing to worry about.       | r:  1/16  q:1  /0   | pf:0    | d→u:0      k:2002 c:0    b:0    f:0    ewma:0      kb:0    sched:3/12/30 | cong:0    | 🧠 Interactive:0    Compute:0    IOwait:0    RT:0    Unknown:0    | quarantine:2009 flagged:0 | slice(base/assigned):6000/12128µs
+[cognis v1.5.1] elapsed: 1y2m3d 12h:30m:14s | tldr: Balancing work steadily — nothing to worry about.       | r:  1/16  q:1  /0   | pf:0    | d→u:0      k:2002 c:0    b:0    f:0    ewma:0      kb:0    sched:3/12/30 | cong:0    |
+             🧠 Interactive:0    Compute:0    IOwait:0    RT:0    Unknown:0    | quarantine:2009 flagged:0 | slice(base/assigned):6000/12128µs
 ```
 
 #### BPF PoC: lightweight in-kernel counters and boost
