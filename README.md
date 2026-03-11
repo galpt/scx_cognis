@@ -271,7 +271,7 @@ The `tldr` message is not free-form prose; it comes from a fixed set of status m
 
 Example `--monitor` output
 ```text
-[cognis v1.4.3] tldr: Balancing work steadily — nothing to worry about.       | r:  1/16  q:1  /0   | pf:0    | d→u:0      k:2002 c:0    b:0    f:0    ewma:0      kb:0    sched:3/12/30 | cong:0    | 🧠 Interactive:0    Compute:0    IOwait:0    RT:0    Unknown:0    | quarantine:2009 flagged:0 | slice(base/assigned):6000/12128µs
+[cognis v1.5.1] tldr: Balancing work steadily — nothing to worry about.       | r:  1/16  q:1  /0   | pf:0    | d→u:0      k:2002 c:0    b:0    f:0    ewma:0      kb:0    sched:3/12/30 | cong:0    | 🧠 Interactive:0    Compute:0    IOwait:0    RT:0    Unknown:0    | quarantine:2009 flagged:0 | slice(base/assigned):6000/12128µs
 ```
 
 #### BPF PoC: lightweight in-kernel counters and boost
@@ -297,6 +297,7 @@ If you prefer a visual view, the TUI in [src/tui/dashboard.rs](src/tui/dashboard
 The TUI exits on `q` or `Esc`.
 
 The header now includes scheduling pipeline percentiles (`sched:` p50/p95/p99 in µs) so you can observe median and tail scheduler overhead directly from the dashboard.
+The Slice Control panel also shows the Autopilot adaptive caps in real time as `Autopilot: <min>µs min/<max>µs max`, so you can watch what the proposer is requesting while observing assigned slices and inference latency.
 
 <p align="center">
 	<img src="https://github.com/galpt/scx_cognis/blob/main/img/cognis-ratatui.png" alt="scx_cognis TUI" style="max-width:100%;height:auto;" />
@@ -368,7 +369,7 @@ scx_cognis --monitor 1.0
 
 Sample output (single-line per-interval snapshot):
 ```text
-[cognis v1.4.3] tldr: Balancing work steadily — nothing to worry about.       | r:  1/16  q:1  /0   | pf:0    | d→u:0      k:2002 c:0    b:0    f:0    ewma:0      kb:0    sched:3/12/30 | cong:0    | 🧠 Interactive:0    Compute:0    IOwait:0    RT:0    Unknown:0    | quarantine:2009 flagged:0 | slice(base/assigned):6000/12128µs
+[cognis v1.5.1] tldr: Balancing work steadily — nothing to worry about.       | r:  1/16  q:1  /0   | pf:0    | d→u:0      k:2002 c:0    b:0    f:0    ewma:0      kb:0    sched:3/12/30 | cong:0    | 🧠 Interactive:0    Compute:0    IOwait:0    RT:0    Unknown:0    | quarantine:2009 flagged:0 | slice(base/assigned):6000/12128µs
 ```
 
 The installer and service configuration are set up so that, when installed through the provided service flow, the stats socket at `/run/scx/root/stats` is intended to be reachable by non-root users.
