@@ -264,14 +264,14 @@ Cognis exposes metrics through `scx_stats` and formats them in [src/stats.rs](sr
 The line format starts like this:
 
 ```text
-[cognis vx.y.z] tldr: ... | r:... | q:... | pf:... | d→u:... k:... c:... b:... f:... ewma:... kb:... sched:p50/p95/p99 | cong:... | 🧠 Interactive:... Compute:... IOwait:... RT:... Unknown:... | quarantine:... flagged:... | slice(base/assigned):.../...µs
+[cognis vx.y.z] elapsed: 1y2m3d 12h:30m:14s tldr: ... | r:... | q:... | pf:... | d→u:... k:... c:... b:... f:... ewma:... kb:... sched:p50/p95/p99 | cong:... | 🧠 Interactive:... Compute:... IOwait:... RT:... Unknown:... | quarantine:... flagged:... | slice(base/assigned):.../...µs
 ```
 
 The `tldr` message is not free-form prose; it comes from a fixed set of status messages selected from current metrics such as page faults, failures, congestion, load, and label mix. The exported slice pair now distinguishes the current global load-driven base slice from a recent EMA of the final per-task assigned slices after label, trust, burst, and interactive-renewal adjustments.
 
 Example `--monitor` output
 ```text
-[cognis v1.5.1] tldr: Balancing work steadily — nothing to worry about.       | r:  1/16  q:1  /0   | pf:0    | d→u:0      k:2002 c:0    b:0    f:0    ewma:0      kb:0    sched:3/12/30 | cong:0    | 🧠 Interactive:0    Compute:0    IOwait:0    RT:0    Unknown:0    | quarantine:2009 flagged:0 | slice(base/assigned):6000/12128µs
+[cognis v1.5.1] elapsed: 1y2m3d 12h:30m:14s tldr: Balancing work steadily — nothing to worry about.       | r:  1/16  q:1  /0   | pf:0    | d→u:0      k:2002 c:0    b:0    f:0    ewma:0      kb:0    sched:3/12/30 | cong:0    | 🧠 Interactive:0    Compute:0    IOwait:0    RT:0    Unknown:0    | quarantine:2009 flagged:0 | slice(base/assigned):6000/12128µs
 ```
 
 #### BPF PoC: lightweight in-kernel counters and boost
