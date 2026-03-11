@@ -50,9 +50,19 @@ impl Autopilot {
 
         // Basic heuristic: when assigned EMA is small and load low, allow a
         // much smaller min. When load is high or assigned slices are large,
-        // increase max to avoid harming throughput.
+        // increase max to avoid harming throughput. Also bias decisions by
+        // current runnable/queued pressure so the autopilot behaves sensibly
+        // under sustained high load.
         let mut target_min = (assigned_ema / 4).max(HARD_MIN_NS);
         let mut target_max = (base.saturating_mul(4)).min(HARD_MAX_NS);
+
+        // Use observed pressure to nudge max upward when backlog grows.
+        let pressure = nr_running.saturating_add(nr_queued);
+        if pressure > 64 {
+            target_max = (target_max.saturating_mul(125) / 100).min(HARD_MAX_NS); // +25%
+        } else if pressure > 16 {
+            target_max = (target_max.saturating_mul(110) / 100).min(HARD_MAX_NS); // +10%
+        }
 
         // Respect absolute conservative bounds.
         target_min = target_min.max(HARD_MIN_NS);
@@ -66,6 +76,12 @@ impl Autopilot {
             target_min = target_min.max(overhead_floor);
         }
 
+        // Also ensure min isn't below a mid-tail (p95) heuristic to avoid
+        // pushing too small when the higher-percentile shows instability.
+        if p95 > 0 {
+            target_min = target_min.max(p95 / 2);
+        }
+
         // Smooth changes
         self.smoothed_min = ((1.0 - SMOOTH_ALPHA) * (self.smoothed_min as f64)
             + SMOOTH_ALPHA * (target_min as f64)) as u64;
@@ -77,9 +93,10 @@ impl Autopilot {
             return None;
         }
 
-        // Apply bounded step change (10% step cap)
-        let step_min = clamp_step(self.smoothed_min, sc.read_min(), 0.10);
-        let step_max = clamp_step(self.smoothed_max, sc.read_max(), 0.10);
+        // Apply bounded step change. Use a smaller step when conservative.
+        let max_frac = if self.conservative { 0.10 } else { 0.15 };
+        let step_min = clamp_step(self.smoothed_min, sc.read_min(), max_frac);
+        let step_max = clamp_step(self.smoothed_max, sc.read_max(), max_frac);
 
         // Rollback safety: if p99 exceeded threshold, revert to last good.
         let last_thr = sc.read_last_p99_threshold();

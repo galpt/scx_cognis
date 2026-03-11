@@ -174,12 +174,6 @@ impl SliceController {
     pub fn read_auto_base_ns(&self) -> u64 {
         self.auto_base_ns
     }
-
-    /// Read raw, un-clamped auto base computed from load.
-    pub fn read_raw_auto_base_ns(&self) -> u64 {
-        self.raw_auto_base_ns
-    }
-
     pub fn read_last_p99_threshold(&self) -> u64 {
         self.last_p99_threshold.load(Ordering::Relaxed)
     }
