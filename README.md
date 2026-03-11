@@ -367,11 +367,6 @@ If the scheduler is already running and exporting stats, you can watch it with:
 scx_cognis --monitor 1.0
 ```
 
-Sample output (single-line per-interval snapshot):
-```text
-[cognis v1.5.1] tldr: Balancing work steadily — nothing to worry about.       | r:  1/16  q:1  /0   | pf:0    | d→u:0      k:2002 c:0    b:0    f:0    ewma:0      kb:0    sched:3/12/30 | cong:0    | 🧠 Interactive:0    Compute:0    IOwait:0    RT:0    Unknown:0    | quarantine:2009 flagged:0 | slice(base/assigned):6000/12128µs
-```
-
 The installer and service configuration are set up so that, when installed through the provided service flow, the stats socket at `/run/scx/root/stats` is intended to be reachable by non-root users.
 
 ### Selected command-line options
