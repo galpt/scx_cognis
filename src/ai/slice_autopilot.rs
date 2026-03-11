@@ -59,9 +59,11 @@ impl Autopilot {
         // Use observed pressure to nudge max upward when backlog grows.
         let pressure = nr_running.saturating_add(nr_queued);
         if pressure > 64 {
-            target_max = (target_max.saturating_mul(125) / 100).min(HARD_MAX_NS); // +25%
+            target_max = (target_max.saturating_mul(125) / 100).min(HARD_MAX_NS);
+            // +25%
         } else if pressure > 16 {
-            target_max = (target_max.saturating_mul(110) / 100).min(HARD_MAX_NS); // +10%
+            target_max = (target_max.saturating_mul(110) / 100).min(HARD_MAX_NS);
+            // +10%
         }
 
         // Respect absolute conservative bounds.
