@@ -129,26 +129,13 @@ impl SliceController {
         self.max_ns
     }
 
-    /// Write adaptive min cap (ns). Caller must ensure safety bounds.
-    pub fn write_min(&mut self, v: u64) {
-        self.min_ns = v.max(1); // never zero
-                                // keep current slice within bounds
-        self.current_slice_ns = self.current_slice_ns.clamp(self.min_ns, self.max_ns);
-    }
-
-    /// Write adaptive max cap (ns). Caller must ensure safety bounds.
-    pub fn write_max(&mut self, v: u64) {
-        self.max_ns = v.max(1);
-        self.current_slice_ns = self.current_slice_ns.clamp(self.min_ns, self.max_ns);
-    }
-
     /// Atomically write both adaptive min and max caps (ns) in a safe way.
     ///
     /// If the caller supplies `min > max` the values are adjusted so that
-    /// `min <= max` to avoid `clamp()` panics. A warning is emitted when an
-    /// adjustment is required.
+    /// `min <= max` to avoid `clamp()` panics. A debug message is emitted when
+    /// an adjustment is required.
     pub fn write_min_max(&mut self, v_min: u64, v_max: u64) {
-        let mut min = v_min.max(1);
+        let min = v_min.max(1);
         let mut max = v_max.max(1);
         if min > max {
             debug!(
