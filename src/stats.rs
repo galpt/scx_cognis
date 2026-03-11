@@ -20,6 +20,8 @@ use serde::Serialize;
 pub struct Metrics {
     #[stat(desc = "Scheduler version (matches the release tag)")]
     pub version: String,
+    #[stat(desc = "Elapsed uptime (e.g. 1y2m3d 12h:30m:14s)")]
+    pub elapsed: String,
     #[stat(desc = "Number of online CPUs")]
     pub nr_cpus: u64,
     #[stat(desc = "Tasks currently running")]
@@ -168,9 +170,10 @@ impl Metrics {
     pub fn format<W: Write>(&self, w: &mut W) -> Result<()> {
         writeln!(
             w,
-            "[cognis v{}] tldr: {:<55} | r:{:>3}/{:<3} q:{:<3}/{:<3} | pf:{:<4} | d→u:{:<6} k:{:<4} c:{:<4} b:{:<4} f:{:<4} ewma:{:<6} kb:{:<4} sched:{:<5}/{:<5}/{:<5} | cong:{:<4} | \
+            "[cognis v{}] elapsed: {:<22} tldr: {:<55} | r:{:>3}/{:<3} q:{:<3}/{:<3} | pf:{:<4} | d→u:{:<6} k:{:<4} c:{:<4} b:{:<4} f:{:<4} ewma:{:<6} kb:{:<4} sched:{:<5}/{:<5}/{:<5} | cong:{:<4} | \
              🧠 Interactive:{:<4} Compute:{:<4} IOwait:{:<4} RT:{:<4} Unknown:{:<4} | quarantine:{} flagged:{} | slice(base/assigned):{}/{}µs",
             self.version,
+            self.elapsed,
             self.tldr(),
             self.nr_running,
             self.nr_cpus,

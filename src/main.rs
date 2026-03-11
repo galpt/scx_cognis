@@ -227,6 +227,8 @@ struct Scheduler<'a> {
     // Time tracking.
     vruntime_now: u64,
     init_page_faults: u64,
+    /// Process start time used to compute uptime/elapsed for monitoring.
+    start_time: Instant,
     base_slice_ns: u64,
     slice_ns_min: u64,
 
@@ -388,6 +390,7 @@ impl<'a> Scheduler<'a> {
             tui_quit: false,
             last_tui_render: Instant::now(),
             last_tui_hist: Instant::now(),
+            start_time: Instant::now(),
             last_trust_tick: Instant::now(),
             last_slice_tick: Instant::now(),
             last_trust_flush: Instant::now(),
@@ -1627,8 +1630,26 @@ impl<'a> Scheduler<'a> {
         let p95_us = p95_ns / NSEC_PER_USEC;
         let p99_us = p99_ns / NSEC_PER_USEC;
 
+        // Compute human-readable elapsed uptime since scheduler start. Use
+        // an approximate mapping: 1 year = 365 days, 1 month = 30 days.
+        let dur = Instant::now().duration_since(self.start_time);
+        let secs_total = dur.as_secs();
+        let days_total = secs_total / 86_400;
+        let years = days_total / 365;
+        let days_after_years = days_total % 365;
+        let months = days_after_years / 30;
+        let days = days_after_years % 30;
+        let hours = (secs_total % 86_400) / 3600;
+        let minutes = (secs_total % 3600) / 60;
+        let seconds = secs_total % 60;
+        let elapsed = format!(
+            "{}y{}m{}d {:02}h:{:02}m:{:02}s",
+            years, months, days, hours, minutes, seconds
+        );
+
         Metrics {
             version: env!("CARGO_PKG_VERSION").to_string(),
+            elapsed,
             nr_running: *self.bpf.nr_running_mut(),
             nr_cpus: *self.bpf.nr_online_cpus_mut(),
             nr_queued: *self.bpf.nr_queued_mut(),
