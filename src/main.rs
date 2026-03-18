@@ -9,7 +9,8 @@
 //   ┌─────────────────────────────────────────────────────────────────────┐
 //   │  ops.enqueue    → Heuristic classifier + trust lookup                │
 //   │  ops.dispatch   → load-driven slice base + bounded wake urgency      │
-//   │               → SHARED_DSQ (RL_CPU_ANY) for most user tasks          │
+//   │               → local/idle fast path below saturation                │
+//   │               → SHARED_DSQ fallback under pressure                   │
 //   │  ops.select_cpu → kernel idle-CPU query (pick_idle_cpu, atomic)     │
 //   │  housekeeping   → trust flush + slice-base refresh outside dispatch  │
 //   └─────────────────────────────────────────────────────────────────────┘
@@ -80,9 +81,10 @@ const RAPID_FAILURE_LIMIT: u32 = 20;
 /// with fixed core weights plus bounded per-PID residual correction, a combined trust/anomaly
 /// table for reputation tracking, and a load-driven slice base with bounded per-task interactive
 /// renewal — all targeting sub-10µs per-event latency with zero
-/// hot-path heap allocations. User tasks are dispatched to SHARED_DSQ (RL_CPU_ANY) so any
-/// available CPU can pick them up, preventing the per-CPU DSQ stall that the previous
-/// bpf.select_cpu() dispatch caused. Kernel workers are still pinned to their affinity CPU.
+/// hot-path heap allocations. Cognis prefers local/idle dispatch while the
+/// machine is unsaturated, then falls back to SHARED_DSQ (RL_CPU_ANY) under
+/// pressure so the old per-CPU DSQ stall cannot take the desktop down again.
+/// Kernel workers are still pinned to their affinity CPU.
 #[derive(Debug, Parser)]
 struct Opts {
     /// Base scheduling slice duration in microseconds.
@@ -434,6 +436,32 @@ impl<'a> Scheduler<'a> {
         nr_running
             .saturating_add(nr_queued)
             .saturating_add(nr_scheduled)
+    }
+
+    #[inline(always)]
+    fn system_unsaturated(nr_running: u64, nr_cpus: u64) -> bool {
+        nr_running < nr_cpus.max(1)
+    }
+
+    #[inline(always)]
+    fn should_prefer_locality(
+        label: TaskLabel,
+        latency_sensitive: bool,
+        nr_running: u64,
+        nr_cpus: u64,
+    ) -> bool {
+        Self::system_unsaturated(nr_running, nr_cpus)
+            && (latency_sensitive || !matches!(label, TaskLabel::Compute))
+    }
+
+    #[inline(always)]
+    fn current_cpu() -> i32 {
+        let cpu = unsafe { libc::sched_getcpu() };
+        if cpu >= 0 {
+            cpu
+        } else {
+            -1
+        }
     }
 
     #[inline(always)]
@@ -1489,57 +1517,70 @@ impl<'a> Scheduler<'a> {
                 .saturating_sub(self.wake_deadline_credit_ns(&task))
         };
 
-        // CPU selection: most user tasks still go to SHARED_DSQ (RL_CPU_ANY).
+        // CPU selection keeps the old shared-queue safety net but no longer
+        // forces ordinary desktop work through it when the machine still has
+        // idle CPU capacity.
         //
-        // Why not per-CPU DSQs?  The BPF ops.dispatch callback picks tasks in this order:
+        // The BPF ops.dispatch order is still:
         //   1. SCHED_DSQ  (userspace scheduler process, if pending work exists)
         //   2. cpu_to_dsq(current_cpu)  (per-CPU tasks)
         //   3. SHARED_DSQ
         //
-        // As long as notify_complete(N > 0) keeps usersched_has_pending_tasks() true, step 1
-        // wins on every ops.dispatch invocation for the CPU that hosts the scheduler.  Any user
-        // task pinned to cpu_to_dsq(X) when CPU X is that hosting CPU sits unserved until
-        // the userspace scheduler's slice expires and step 1 fails for CPU X — which can easily
-        // take > 5 s under sustained load, tripping the sched_ext BPF watchdog with the
-        // "runnable task stall" error seen in production (kwin_wayla:cs0, sudo, etc.).
+        // That means blindly targeting per-CPU DSQs can still starve work on
+        // the CPU currently hosting the scheduler. To avoid reintroducing the
+        // runnable-task stall bug, the locality fast path explicitly avoids
+        // dispatching ordinary user tasks to the scheduler's current CPU and
+        // falls back to SHARED_DSQ whenever the system is saturated.
         //
-        // SHARED_DSQ is consumed at step 3 by any of the N-1 CPUs that did NOT win the
-        // SCHED_DSQ race, guaranteeing forward progress for user tasks regardless of which
-        // CPU is currently hosting the scheduler.  An idle-CPU kick is still issued by the
-        // BPF dispatch_task() helper (kick_task_cpu → scx_bpf_kick_cpu) so a sleeping CPU
-        // wakes up and drains SHARED_DSQ promptly.
+        // Below saturation we prefer:
+        //   1. an actually idle CPU chosen by BPF, then
+        //   2. the task's previous CPU for cache locality, then
+        //   3. SHARED_DSQ as the safe fallback.
         //
-        // Latency-sensitive interactive tasks are the exception: they may ask
-        // the BPF idle-CPU selector for an explicit target CPU when one is
-        // available. This preserves the shared-queue safety path for the bulk
-        // of user work while giving render/compositor/browser wakeups a chance
-        // to land on an idle core with better cache locality.
-        //
-        // Kernel workers and --percpu-local tasks are still dispatched to their affined CPU:
-        // kthreads must stay on interrupt-affined CPUs; percpu_local is an explicit user request.
+        // Kernel workers and --percpu-local tasks are still dispatched to
+        // their affined CPU: kthreads must stay on interrupt-affined CPUs;
+        // percpu_local is an explicit user request.
+        let nr_running = *self.bpf.nr_running_mut();
+        let nr_cpus = (*self.bpf.nr_online_cpus_mut()).max(1);
+        let scheduler_cpu = Self::current_cpu();
+        let prefer_locality =
+            Self::should_prefer_locality(task.label, task.latency_sensitive, nr_running, nr_cpus);
+
         dispatched.cpu = if self.opts.percpu_local || task.is_kernel_worker {
             task.qtask.cpu
-        } else if task.latency_sensitive {
-            let idle_cpu = self
-                .bpf
-                .select_cpu(task.qtask.pid, task.qtask.cpu, task.qtask.flags);
-
-            if idle_cpu >= 0
-                && self.cpu_selector.accepts_idle_cpu(
-                    idle_cpu,
-                    task.qtask.cpu,
-                    task.label,
-                    _quarantined,
-                    task.perf_cri,
-                    true,
-                )
-            {
-                idle_cpu
-            } else {
-                RL_CPU_ANY
-            }
         } else {
-            RL_CPU_ANY
+            let mut target_cpu = RL_CPU_ANY;
+            let try_idle_cpu = task.latency_sensitive || prefer_locality;
+
+            if try_idle_cpu {
+                let idle_cpu =
+                    self.bpf
+                        .select_cpu(task.qtask.pid, task.qtask.cpu, task.qtask.flags);
+                let keep_same_llc = task.latency_sensitive;
+
+                if idle_cpu >= 0
+                    && idle_cpu != scheduler_cpu
+                    && self.cpu_selector.accepts_idle_cpu(
+                        idle_cpu,
+                        task.qtask.cpu,
+                        task.label,
+                        _quarantined,
+                        task.perf_cri,
+                        keep_same_llc,
+                    )
+                {
+                    target_cpu = idle_cpu;
+                }
+            }
+
+            if target_cpu == RL_CPU_ANY && prefer_locality {
+                let prev_cpu = task.qtask.cpu;
+                if prev_cpu >= 0 && prev_cpu != scheduler_cpu {
+                    target_cpu = prev_cpu;
+                }
+            }
+
+            target_cpu
         };
 
         if self.bpf.dispatch_task(&dispatched).is_err() {
@@ -1780,8 +1821,9 @@ impl<'a> Scheduler<'a> {
         //   ops.dispatch falls through to its local per-CPU DSQ and drains
         //   kworkers normally.
         //
-        // All user tasks go to SHARED_DSQ (RL_CPU_ANY); dispatch order is
-        // maintained by pop_highest_priority_task() (RT first).
+        // Dispatch order is maintained by pop_highest_priority_task() (RT
+        // first). Each task may take either the locality-preserving per-CPU
+        // path or the shared fallback selected by dispatch_task().
         while !self.tasks_empty() {
             if !self.dispatch_task() {
                 break;
@@ -2232,5 +2274,37 @@ mod tests {
             Scheduler::effective_slice_pressure(u64::MAX, 1, 1),
             u64::MAX
         );
+    }
+
+    #[test]
+    fn locality_is_preferred_for_interactive_work_below_saturation() {
+        assert!(Scheduler::should_prefer_locality(
+            crate::ai::TaskLabel::Interactive,
+            false,
+            7,
+            8
+        ));
+        assert!(Scheduler::should_prefer_locality(
+            crate::ai::TaskLabel::Compute,
+            true,
+            7,
+            8
+        ));
+    }
+
+    #[test]
+    fn locality_is_disabled_for_compute_at_saturation() {
+        assert!(!Scheduler::should_prefer_locality(
+            crate::ai::TaskLabel::Compute,
+            false,
+            8,
+            8
+        ));
+        assert!(!Scheduler::should_prefer_locality(
+            crate::ai::TaskLabel::Interactive,
+            false,
+            8,
+            8
+        ));
     }
 }

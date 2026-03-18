@@ -324,6 +324,18 @@ static bool usersched_has_pending_tasks(void)
 }
 
 /*
+ * Return true when the system still has spare CPU capacity.
+ *
+ * In this state, letting wakeups bypass the shared queue and land directly on
+ * an idle CPU tends to preserve cache locality and frame pacing better than
+ * forcing every task through the user-space round-trip.
+ */
+static bool system_unsaturated(void)
+{
+	return nr_online_cpus && nr_running < nr_online_cpus;
+}
+
+/*
  * Return the DSQ ID associated to a CPU, or SHARED_DSQ if the CPU is not
  * valid.
  */
@@ -555,8 +567,10 @@ out_release:
  */
 static bool can_direct_dispatch(s32 cpu)
 {
-	return !scx_bpf_dsq_nr_queued(SHARED_DSQ) &&
-	       !scx_bpf_dsq_nr_queued(cpu_to_dsq(cpu));
+	if (scx_bpf_dsq_nr_queued(cpu_to_dsq(cpu)))
+		return false;
+
+	return !scx_bpf_dsq_nr_queued(SHARED_DSQ) || system_unsaturated();
 }
 
 s32 BPF_STRUCT_OPS(rustland_select_cpu, struct task_struct *p, s32 prev_cpu,

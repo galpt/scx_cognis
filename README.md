@@ -20,8 +20,8 @@ The project focuses on keeping scheduler policy inspectable and bounded: fixed-c
 
 - Runtime model: Rust 2021 userspace scheduler on top of `sched_ext`
 - Core scheduler backend: `scx_rustland_core = 2.4.10`
-- Local verification on this branch: `cargo check` and `cargo test` pass
-- Unit tests: `44`
+- Local verification on this branch: `cargo fmt --check`, `cargo check`, and `cargo test` pass
+- Unit tests: `46`
 - CI currently covers Ubuntu, Arch Linux, and CachyOS build/test paths
 
 This repository is still best treated as an experimental scheduler under active hardening, not a broadly validated drop-in replacement for mature upstream schedulers. Manual testing on the target machine still matters.
@@ -33,7 +33,7 @@ Cognis currently does the following:
 - Classifies work into `RealTime`, `Interactive`, `IoWait`, and `Compute` buckets with a deterministic heuristic.
 - Uses fixed-capacity queues and bounded per-PID tables so the scheduler path does not grow unbounded under load.
 - Adjusts slices from runnable pressure instead of using a single static desktop slice.
-- Applies bounded interactive wake boosting and selective idle-CPU placement when the task looks latency-sensitive.
+- Applies bounded interactive wake boosting and prefers idle/local CPU placement when the system is not saturated.
 - Tracks per-task trust and burst history and cleans up per-PID state when tasks exit.
 - Exports live stats and can render a ratatui dashboard.
 
@@ -48,16 +48,17 @@ The main scheduling policy lives in [src/main.rs](src/main.rs), with smaller pol
 
 At a high level, the current design is:
 
-1. `ops.enqueue` passes tasks into userspace.
+1. `ops.enqueue` keeps a small direct BPF fast path for kthreads and some idle-wakeup cases, while passing the rest of the policy-managed work into userspace.
 2. Cognis computes a compact feature set, classifies the task, reads trust and burst state, and assigns a slice.
 3. Tasks are queued in fixed-capacity FIFOs by label.
-4. `ops.dispatch` drains those queues in priority order and hands work back to BPF.
+4. `ops.dispatch` drains those queues in priority order and hands work back to BPF using either a locality-preserving per-CPU target or the shared fallback.
 5. Periodic housekeeping updates the slice controller, trust bookkeeping, stats, and TUI state outside the hot path.
 
 Important implementation details:
 
-- Normal user work is generally dispatched through the shared DSQ so any eligible CPU can pick it up.
-- Kernel workers and `--percpu-local` tasks still go to their explicit eligible CPU.
+- Below saturation, Cognis prefers an idle CPU or the task's previous CPU for most non-compute desktop work.
+- Under pressure, or when a local target would hit the scheduler's own CPU, Cognis falls back to the shared DSQ to preserve forward progress.
+- Kernel workers always stay on their explicit/previous CPU. `--percpu-local` forces explicit per-CPU dispatch instead of the normal hybrid path.
 - Interactive wake boosts are bounded and temporary; they are not a blanket priority override.
 - Per-PID state is collision-safe inside fixed-size tables rather than silently overwriting on hash collisions.
 - Task exit notifications from BPF are consumed in userspace so trust, lifetime, and burst state can be evicted promptly.
@@ -124,7 +125,7 @@ scx_cognis --monitor 1.0
 |:--|:--|
 | `-s, --slice-us <N>` | Sets the slice ceiling in microseconds; `0` keeps automatic sizing enabled |
 | `-S, --slice-us-min <N>` | Sets the minimum slice duration in microseconds |
-| `-l, --percpu-local` | Dispatches per-CPU tasks directly to their only eligible CPU |
+| `-l, --percpu-local` | Forces explicit per-CPU dispatch to each task's previous CPU instead of the normal hybrid locality/shared fallback |
 | `-p, --partial` | Only manages tasks already using `SCHED_EXT` |
 | `-v, --verbose` | Enables verbose output |
 | `-t, --tui` | Launches the TUI dashboard |
