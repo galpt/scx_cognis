@@ -98,10 +98,6 @@ volatile u64 nr_running, nr_online_cpus;
 volatile u64 nr_user_dispatches, nr_kernel_dispatches,
 	     nr_cancel_dispatches, nr_bounce_dispatches;
 
-/* Additional BPF-side metrics for PoC */
-volatile u64 nr_kernel_boosts; /* number of times kernel boost applied (PoC) */
-volatile u64 nr_bpf_ewma_updates; /* number of per-pid EWMA updates */
-
 /* Failure statistics */
 volatile u64 nr_failed_dispatches, nr_sched_congested;
 
@@ -207,36 +203,6 @@ struct {
 	__type(key, int);
 	__type(value, struct task_ctx);
 } task_ctx_stor SEC(".maps");
-
-/* Per-pid EWMA map: store fixed-point Q16.16 EWMA of recent exec_runtime (ns).
- * Bounded LRU_HASH to limit kernel memory usage. */
-struct {
-    __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, 4096);
-    __type(key, u32);
-    __type(value, u64);
-} kernel_ewma SEC(".maps");
-
-/* Fixed-point EWMA alpha (Q16.16) as compile-time constant for PoC. */
-#define EWMA_ALPHA_Q 9830 /* ~0.15 * 65536 */
-
-/*
- * Kernel vtime credit (nanoseconds).  When non-zero, this amount is
- * subtracted from a kthread's dsq_vtime before it is inserted into its
- * per-CPU DSQ, giving kthreads lower (higher-priority) vtime and reducing
- * the chance that a user task with an artificially low vtime preempts
- * latency-sensitive kernel work like kworkers or ksoftirqd.
- *
- * index 0: vtime credit in nanoseconds (default 0 = no boost).
- * Userspace can tune this at runtime via set_kernel_boost().
- * A sensible starting value is one 120 Hz frame budget: ~8,333,333 ns.
- */
-struct {
-	__uint(type, BPF_MAP_TYPE_ARRAY);
-	__uint(max_entries, 1);
-	__type(key, u32);
-	__type(value, u64);
-} kernel_boost SEC(".maps");
 
 /*
  * Return a local task context from a generic task or NULL if the context
@@ -796,30 +762,8 @@ void BPF_STRUCT_OPS(rustland_enqueue, struct task_struct *p, u64 enq_flags)
 	 * redundant checks removed.
 	 */
 	if (is_kthread(p)) {
-		u64 vtime = p->scx.dsq_vtime;
-
-		/*
-		 * Apply a vtime credit to kthreads so they land ahead of user
-		 * tasks that may have accumulated artificially low vtimes.
-		 * This is the LAVD-inspired in-BPF kernel-task priority boost:
-		 * simply subtract a configurable ns credit from the kthread's
-		 * vtime before inserting it into the per-CPU DSQ.
-		 *
-		 * A lower vtime = higher dispatch priority in the vtime-ordered
-		 * DSQ.  The credit is clamped at zero to avoid underflow.
-		 * Default credit = 0 (neutral); tune via set_kernel_boost().
-		 */
-		{
-			u32 k = 0;
-			u64 *credit = bpf_map_lookup_elem(&kernel_boost, &k);
-			if (credit && *credit > 0) {
-				vtime = vtime > *credit ? vtime - *credit : 0;
-				__sync_fetch_and_add(&nr_kernel_boosts, 1);
-			}
-		}
-
 		scx_bpf_dsq_insert_vtime(p, cpu_to_dsq(prev_cpu),
-					 slice_ns, vtime, enq_flags);
+					 slice_ns, p->scx.dsq_vtime, enq_flags);
 		__sync_fetch_and_add(&nr_kernel_dispatches, 1);
 		goto out_kick;
 	}
@@ -1026,13 +970,7 @@ void BPF_STRUCT_OPS(rustland_stopping, struct task_struct *p, bool runnable)
 	 */
 	tctx->exec_runtime += now - tctx->start_ts;
 
-	/*
-	 * Production path: keep ops.stopping minimal.
-	 *
-	 * The per-pid kernel_ewma PoC is not consumed by the userspace policy, so
-	 * updating an LRU hash here only adds scheduler-path overhead. Leave the map
-	 * and counter in place for debug compatibility, but skip the hot-path update.
-	 */
+	/* Production path: keep ops.stopping minimal. */
 }
 
 /*

@@ -23,7 +23,6 @@ use log::warn;
 use plain::Plain;
 
 use libbpf_rs::libbpf_sys::bpf_object_open_opts;
-use libbpf_rs::AsRawLibbpf;
 use libbpf_rs::OpenObject;
 use libbpf_rs::ProgramInput;
 
@@ -89,17 +88,16 @@ pub struct QueuedTask {
 }
 
 impl QueuedTask {
-    /// Convert the task's comm field (C char array) into a Rust String.
+    /// Borrow the task's comm field as UTF-8 without allocating.
     #[allow(dead_code)]
-    pub fn comm_str(&self) -> String {
+    pub fn comm_str(&self) -> &str {
         let bytes: &[u8] =
             unsafe { std::slice::from_raw_parts(self.comm.as_ptr() as *const u8, self.comm.len()) };
 
         // Find the first NUL byte, or take the whole array.
         let nul_pos = bytes.iter().position(|&c| c == 0).unwrap_or(bytes.len());
 
-        // Convert to String (handle invalid UTF-8 gracefully).
-        String::from_utf8_lossy(&bytes[..nul_pos]).into_owned()
+        std::str::from_utf8(&bytes[..nul_pos]).unwrap_or("?")
     }
 }
 
@@ -350,20 +348,14 @@ impl<'cb> BpfScheduler<'cb> {
             }
         }
 
-        let mut instance = Self {
+        Ok(Self {
             skel,
             shutdown,
             queued,
             task_exits,
             dispatched,
             struct_ops,
-        };
-
-        // Initialize kernel_boost credit to 0 (no boost = neutral default).
-        // Callers can raise it at runtime via set_kernel_boost(credit_ns).
-        let _ = instance.set_kernel_boost(0u64);
-
-        Ok(instance)
+        })
     }
 
     // Set the name of the scx ops.
@@ -499,58 +491,6 @@ impl<'cb> BpfScheduler<'cb> {
     #[allow(dead_code)]
     pub fn nr_sched_congested_mut(&mut self) -> &mut u64 {
         &mut self.skel.maps.bss_data.as_mut().unwrap().nr_sched_congested
-    }
-
-    // Counter of kernel-boost applications in BPF (PoC).
-    #[allow(dead_code)]
-    pub fn nr_kernel_boosts_mut(&mut self) -> &mut u64 {
-        &mut self
-            .skel
-            .maps
-            .bss_data
-            .as_mut()
-            .unwrap()
-            .nr_kernel_boosts
-    }
-
-    // Counter of per-pid EWMA updates performed in BPF (PoC).
-    #[allow(dead_code)]
-    pub fn nr_bpf_ewma_updates_mut(&mut self) -> &mut u64 {
-        &mut self
-            .skel
-            .maps
-            .bss_data
-            .as_mut()
-            .unwrap()
-            .nr_bpf_ewma_updates
-    }
-
-    /// Set the global kthread vtime credit (nanoseconds) at index 0.
-    ///
-    /// The BPF dispatch path subtracts this value from a kthread's `dsq_vtime`
-    /// before inserting it into the per-CPU DSQ, giving it higher priority over
-    /// user tasks competing on the same DSQ.  A value of `0` (the default) means
-    /// no boost is applied.  Example: `8_333_333` ≈ one 120 Hz frame budget (~8.3 ms).
-    ///
-    /// Returns `Ok(())` on success or `Err(ret)` with the raw BPF error code.
-    pub fn set_kernel_boost(&mut self, boost_q: u64) -> Result<(), i32> {
-        // Get the underlying libbpf map fd.
-        let map = &self.skel.maps.kernel_boost;
-        let map_fd = unsafe { libbpf_rs::libbpf_sys::bpf_map__fd(map.as_libbpf_object().as_ptr()) };
-        let key: u32 = 0;
-        let ret = unsafe {
-            libbpf_rs::libbpf_sys::bpf_map_update_elem(
-                map_fd,
-                &key as *const _ as *const _,
-                &boost_q as *const _ as *const _,
-                0,
-            )
-        };
-        if ret != 0 {
-            Err(ret)
-        } else {
-            Ok(())
-        }
     }
 
     // Set scheduling class for the scheduler itself to SCHED_EXT

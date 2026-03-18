@@ -264,14 +264,12 @@ fn draw_header(f: &mut Frame, area: Rect, m: &Metrics) {
         Span::raw("│ Adaptive CPU Scheduler │ "),
         Span::styled(
             format!(
-                "CPUs: {}  Running: {}  Queued: {}  Base: {}µs  Assigned≈{}µs  ewma:{} kb:{}  sched:{}:{}:{}",
+                "CPUs: {}  Running: {}  Queued: {}  Base: {}µs  Assigned≈{}µs  sched:{}:{}:{}",
                 m.nr_cpus,
                 m.nr_running,
                 m.nr_queued,
                 m.base_slice_us,
                 m.assigned_slice_us,
-                m.nr_bpf_ewma_updates,
-                m.nr_kernel_boosts,
                 m.sched_p50_us,
                 m.sched_p95_us,
                 m.sched_p99_us

@@ -15,13 +15,11 @@ use serde::Serialize;
 
 /// Top-level metrics snapshot exported via scx_stats.
 #[stat_doc]
-#[derive(Clone, Debug, Default, Serialize, Deserialize, Stats)]
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, Stats)]
 #[stat(top)]
 pub struct Metrics {
-    #[stat(desc = "Scheduler version (matches the release tag)")]
-    pub version: String,
-    #[stat(desc = "Elapsed uptime (e.g. 1y2m3d 12h:30m:14s)")]
-    pub elapsed: String,
+    #[stat(desc = "Elapsed uptime in seconds")]
+    pub elapsed_secs: u64,
     #[stat(desc = "Number of online CPUs")]
     pub nr_cpus: u64,
     #[stat(desc = "Tasks currently running")]
@@ -44,10 +42,6 @@ pub struct Metrics {
     pub nr_failed_dispatches: u64,
     #[stat(desc = "Scheduler congestion events")]
     pub nr_sched_congested: u64,
-    #[stat(desc = "BPF-side per-pid EWMA updates (PoC)")]
-    pub nr_bpf_ewma_updates: u64,
-    #[stat(desc = "BPF-side kernel boost applications (PoC)")]
-    pub nr_kernel_boosts: u64,
 
     // ── Scheduling policy metrics ──────────────────────────────────────────
     #[stat(desc = "Tasks classified as Interactive")]
@@ -168,11 +162,25 @@ impl Metrics {
     }
 
     pub fn format<W: Write>(&self, w: &mut W) -> Result<()> {
+        let days_total = self.elapsed_secs / 86_400;
+        let years = days_total / 365;
+        let days_after_years = days_total % 365;
+        let months = days_after_years / 30;
+        let days = days_after_years % 30;
+        let hours = (self.elapsed_secs % 86_400) / 3600;
+        let minutes = (self.elapsed_secs % 3600) / 60;
+        let seconds = self.elapsed_secs % 60;
+
         writeln!(
             w,
-            "[cognis v{}] elapsed: {:<22} | tldr: {:<55} | r:{:>3}/{:<3} q:{:<3}/{:<3} | pf:{:<4} | d→u:{:<6} k:{:<4} c:{:<4} b:{:<4} f:{:<4} ewma:{:<6} kb:{:<4} sched:{:<5}/{:<5}/{:<5} | cong:{:<4} |",
-            self.version,
-            self.elapsed,
+            "[cognis v{}] elapsed: {}y{}m{}d {:02}h:{:02}m:{:02}s | tldr: {:<55} | r:{:>3}/{:<3} q:{:<3}/{:<3} | pf:{:<4} | d→u:{:<6} k:{:<4} c:{:<4} b:{:<4} f:{:<4} sched:{:<5}/{:<5}/{:<5} | cong:{:<4} |",
+            env!("CARGO_PKG_VERSION"),
+            years,
+            months,
+            days,
+            hours,
+            minutes,
+            seconds,
             self.tldr(),
             self.nr_running,
             self.nr_cpus,
@@ -184,8 +192,6 @@ impl Metrics {
             self.nr_cancel_dispatches,
             self.nr_bounce_dispatches,
             self.nr_failed_dispatches,
-            self.nr_bpf_ewma_updates,
-            self.nr_kernel_boosts,
             self.sched_p50_us,
             self.sched_p95_us,
             self.sched_p99_us,
@@ -229,10 +235,6 @@ impl Metrics {
             nr_sched_congested: self
                 .nr_sched_congested
                 .saturating_sub(rhs.nr_sched_congested),
-            nr_bpf_ewma_updates: self
-                .nr_bpf_ewma_updates
-                .saturating_sub(rhs.nr_bpf_ewma_updates),
-            nr_kernel_boosts: self.nr_kernel_boosts.saturating_sub(rhs.nr_kernel_boosts),
             // Major page faults — per-interval delta so --monitor shows faults/sec.
             // (nr_page_faults is already baseline-subtracted in get_metrics(), but
             // delta() must subtract again so each --monitor line shows only the faults
@@ -245,7 +247,7 @@ impl Metrics {
             nr_iowait: self.nr_iowait.saturating_sub(rhs.nr_iowait),
             nr_realtime: self.nr_realtime.saturating_sub(rhs.nr_realtime),
             nr_unknown: self.nr_unknown.saturating_sub(rhs.nr_unknown),
-            ..self.clone()
+            ..*self
         }
     }
 }

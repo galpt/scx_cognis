@@ -165,7 +165,7 @@ struct Task {
 
 // ── Per-task lifetime tracking (for trust updates on exit) ─────────
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, Copy)]
 struct TaskLifetime {
     slice_assigned_ns: u64,
     slice_used_ns: u64,
@@ -1663,7 +1663,7 @@ impl<'a> Scheduler<'a> {
             // Snapshot the lifetime entry before evicting the slot.
             let lt = {
                 if let Some(s) = self.lifetime_find_slot(pid) {
-                    self.lifetime_table[s].clone()
+                    self.lifetime_table[s]
                 } else {
                     continue;
                 }
@@ -1707,26 +1707,11 @@ impl<'a> Scheduler<'a> {
         let p95_us = p95_ns / NSEC_PER_USEC;
         let p99_us = p99_ns / NSEC_PER_USEC;
 
-        // Compute human-readable elapsed uptime since scheduler start. Use
-        // an approximate mapping: 1 year = 365 days, 1 month = 30 days.
         let dur = Instant::now().duration_since(self.start_time);
         let secs_total = dur.as_secs();
-        let days_total = secs_total / 86_400;
-        let years = days_total / 365;
-        let days_after_years = days_total % 365;
-        let months = days_after_years / 30;
-        let days = days_after_years % 30;
-        let hours = (secs_total % 86_400) / 3600;
-        let minutes = (secs_total % 3600) / 60;
-        let seconds = secs_total % 60;
-        let elapsed = format!(
-            "{}y{}m{}d {:02}h:{:02}m:{:02}s",
-            years, months, days, hours, minutes, seconds
-        );
 
         Metrics {
-            version: env!("CARGO_PKG_VERSION").to_string(),
-            elapsed,
+            elapsed_secs: secs_total,
             nr_running: *self.bpf.nr_running_mut(),
             nr_cpus: *self.bpf.nr_online_cpus_mut(),
             nr_queued: *self.bpf.nr_queued_mut(),
@@ -1738,8 +1723,6 @@ impl<'a> Scheduler<'a> {
             nr_bounce_dispatches: *self.bpf.nr_bounce_dispatches_mut(),
             nr_failed_dispatches: *self.bpf.nr_failed_dispatches_mut(),
             nr_sched_congested: *self.bpf.nr_sched_congested_mut(),
-            nr_bpf_ewma_updates: *self.bpf.nr_bpf_ewma_updates_mut(),
-            nr_kernel_boosts: *self.bpf.nr_kernel_boosts_mut(),
             nr_interactive: self.label_counts[TaskLabel::Interactive as usize],
             nr_compute: self.label_counts[TaskLabel::Compute as usize],
             nr_iowait: self.label_counts[TaskLabel::IoWait as usize],
@@ -1853,7 +1836,7 @@ impl<'a> Scheduler<'a> {
         }
 
         if let Ok(mut s) = state.lock() {
-            s.metrics = metrics.clone();
+            s.metrics = *metrics;
             s.inference_us = avg_us;
             s.set_watchlist(&watchlist, n_actors);
         }
@@ -2236,7 +2219,6 @@ mod tests {
         assert_eq!(Scheduler::recent_sleep_gap_ns(10, 50), 40);
         assert_eq!(Scheduler::recent_sleep_gap_ns(80, 50), 0);
     }
-
 
     #[test]
     fn effective_slice_pressure_counts_queued_work() {

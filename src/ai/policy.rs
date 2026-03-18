@@ -42,7 +42,7 @@ pub struct SliceController {
     min_ns: u64,
     max_ns: u64,
     /// Lock-free ring buffer of recent scheduling pipeline latencies (ns).
-    lat_ring: Box<[AtomicU64]>,
+    lat_ring: [AtomicU64; LAT_RING_CAP],
     lat_idx: AtomicUsize,
     /// Last rollback threshold for p99 used by autopilot.
     last_p99_threshold: AtomicU64,
@@ -56,12 +56,6 @@ impl SliceController {
             TARGETED_LATENCY_NS
         }
         .clamp(AUTO_SLICE_MIN_NS, AUTO_SLICE_MAX_NS);
-        // Initialize the lock-free latency ring buffer with zeros.
-        let mut v = Vec::with_capacity(LAT_RING_CAP);
-        for _ in 0..LAT_RING_CAP {
-            v.push(AtomicU64::new(0));
-        }
-
         Self {
             current_slice_ns: initial_auto,
             base_slice_ns,
@@ -69,7 +63,7 @@ impl SliceController {
             raw_auto_base_ns: initial_auto,
             min_ns: AUTO_SLICE_MIN_NS,
             max_ns: AUTO_SLICE_MAX_NS,
-            lat_ring: v.into_boxed_slice(),
+            lat_ring: std::array::from_fn(|_| AtomicU64::new(0)),
             lat_idx: AtomicUsize::new(0),
             last_p99_threshold: AtomicU64::new(u64::MAX),
         }
@@ -160,22 +154,25 @@ impl SliceController {
     /// Compute simple percentiles (p50, p95, p99) from the ring buffer.
     /// This is intended to be called from background/monitor paths, not hot.
     pub fn compute_sched_percentiles(&self) -> (u64, u64, u64) {
-        // Collect non-zero samples.
-        let mut samples = Vec::with_capacity(LAT_RING_CAP);
+        // Copy non-zero samples into a fixed stack buffer so background
+        // telemetry remains allocation-free after scheduler init.
+        let mut samples = [0u64; LAT_RING_CAP];
+        let mut len = 0usize;
         for s in self.lat_ring.iter() {
             let v = s.load(Ordering::Relaxed);
             if v > 0 {
-                samples.push(v);
+                samples[len] = v;
+                len += 1;
             }
         }
-        if samples.is_empty() {
+        if len == 0 {
             return (0, 0, 0);
         }
+        let samples = &mut samples[..len];
         samples.sort_unstable();
-        let n = samples.len();
-        let p50 = samples[n / 2];
-        let p95 = samples[(n * 95) / 100];
-        let p99 = samples[(n * 99) / 100];
+        let p50 = samples[len / 2];
+        let p95 = samples[(len * 95) / 100];
+        let p99 = samples[(len * 99) / 100];
         (p50, p95, p99)
     }
 

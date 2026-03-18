@@ -271,7 +271,9 @@ impl TrustTable {
     ///
     /// Replaces `AntiCheatEngine::is_flagged()`.
     pub fn is_flagged(&self, pid: i32) -> bool {
-        self.find_slot(pid).map(|s| self.flagged[s]).unwrap_or(false)
+        self.find_slot(pid)
+            .map(|s| self.flagged[s])
+            .unwrap_or(false)
     }
 
     /// Update this PID's trust score based on its most recent exit observation.
