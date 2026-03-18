@@ -268,6 +268,27 @@ struct Scheduler<'a> {
     assigned_slice_ema_ns: u64,
 }
 
+fn alloc_zeroed_boxed_array<T, const N: usize>(label: &'static str) -> Result<Box<[T; N]>> {
+    let layout = std::alloc::Layout::array::<T>(N).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{label} layout overflow"),
+        )
+    })?;
+
+    unsafe {
+        let ptr = std::alloc::alloc_zeroed(layout) as *mut [T; N];
+        if ptr.is_null() {
+            return Err(io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                format!("{label} allocation failed"),
+            )
+            .into());
+        }
+        Ok(Box::from_raw(ptr))
+    }
+}
+
 impl<'a> Scheduler<'a> {
     fn init(
         opts: &'a Opts,
@@ -338,29 +359,10 @@ impl<'a> Scheduler<'a> {
             base_slice_ns,
             slice_ns_min,
             classifier: HeuristicClassifier::new(),
-            trust: TrustTable::new(),
+            trust: TrustTable::new().context("failed to allocate trust table")?,
             slice_controller,
-            lifetime_table: {
-                // SAFETY: TaskLifetime is a plain struct with u64/bool fields;
-                // all-zero bytes produce valid TaskLifetime::default() values.
-                unsafe {
-                    let layout = std::alloc::Layout::array::<TaskLifetime>(LIFETIME_TABLE_SIZE)
-                        .expect("lifetime_table layout");
-                    let ptr = std::alloc::alloc_zeroed(layout)
-                        as *mut [TaskLifetime; LIFETIME_TABLE_SIZE];
-                    assert!(!ptr.is_null(), "lifetime_table allocation failed");
-                    Box::from_raw(ptr)
-                }
-            },
-            lifetime_pids: {
-                unsafe {
-                    let layout = std::alloc::Layout::array::<i32>(LIFETIME_TABLE_SIZE)
-                        .expect("lifetime_pids layout");
-                    let ptr = std::alloc::alloc_zeroed(layout) as *mut [i32; LIFETIME_TABLE_SIZE];
-                    assert!(!ptr.is_null(), "lifetime_pids allocation failed");
-                    Box::from_raw(ptr)
-                }
-            },
+            lifetime_table: alloc_zeroed_boxed_array("lifetime_table")?,
+            lifetime_pids: alloc_zeroed_boxed_array("lifetime_pids")?,
             tui_state,
             tui_term,
             tui_quit: false,

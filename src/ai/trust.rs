@@ -161,16 +161,18 @@ impl TrustTable {
     /// Uses `alloc_zeroed` to ensure the full ~100 KB struct is placed on the
     /// heap in one operation at scheduler startup.  Zero bits are valid for all
     /// field types (f32 → 0.0, i32 → 0, bool → false, u8 → 0).
-    pub fn new() -> Box<Self> {
+    pub fn new() -> io::Result<Box<Self>> {
         // SAFETY: all-zero bytes are valid for every field type in this struct.
         unsafe {
             let layout = std::alloc::Layout::new::<Self>();
             let ptr = std::alloc::alloc_zeroed(layout) as *mut Self;
-            assert!(
-                !ptr.is_null(),
-                "TrustTable allocation failed — out of memory"
-            );
-            Box::from_raw(ptr)
+            if ptr.is_null() {
+                return Err(io::Error::new(
+                    io::ErrorKind::OutOfMemory,
+                    "TrustTable allocation failed",
+                ));
+            }
+            Ok(Box::from_raw(ptr))
         }
     }
 
@@ -461,7 +463,7 @@ mod tests {
 
     #[test]
     fn neutral_initial_score() {
-        let t = TrustTable::new();
+        let t = TrustTable::new().expect("trust table");
         assert_eq!(t.trust_score(1234), 0.0);
         assert!(!t.is_quarantined(1234));
         assert!(!t.is_flagged(1234));
@@ -469,7 +471,7 @@ mod tests {
 
     #[test]
     fn cooperative_exits_improve_trust() {
-        let mut t = TrustTable::new();
+        let mut t = TrustTable::new().expect("trust table");
         let obs = ExitObservation {
             slice_underrun: true,
             clean_exit: true,
@@ -486,7 +488,7 @@ mod tests {
 
     #[test]
     fn adversarial_exits_lower_trust_to_quarantine() {
-        let mut t = TrustTable::new();
+        let mut t = TrustTable::new().expect("trust table");
         let obs = ExitObservation {
             cheat_flagged: true,
             preempted: true,
@@ -507,7 +509,7 @@ mod tests {
 
     #[test]
     fn clean_exit_clears_cheat_flag() {
-        let mut t = TrustTable::new();
+        let mut t = TrustTable::new().expect("trust table");
         // First, trigger the flag.
         let bad = ExitObservation {
             cheat_flagged: true,
@@ -528,7 +530,7 @@ mod tests {
 
     #[test]
     fn evict_clears_slot() {
-        let mut t = TrustTable::new();
+        let mut t = TrustTable::new().expect("trust table");
         let obs = ExitObservation {
             cheat_flagged: true,
             ..Default::default()
@@ -544,7 +546,7 @@ mod tests {
 
     #[test]
     fn slice_factor_ranges() {
-        let mut t = TrustTable::new();
+        let mut t = TrustTable::new().expect("trust table");
         // Unknown PID → neutral score → no penalty.
         let f_neutral = t.slice_factor(9999);
         assert!(
@@ -583,7 +585,7 @@ mod tests {
 
     #[test]
     fn worst_actors_finds_low_trust_entries() {
-        let mut t = TrustTable::new();
+        let mut t = TrustTable::new().expect("trust table");
         let bad = ExitObservation {
             cheat_flagged: true,
             preempted: true,
@@ -614,7 +616,7 @@ mod tests {
 
     #[test]
     fn colliding_pids_keep_independent_trust() {
-        let mut t = TrustTable::new();
+        let mut t = TrustTable::new().expect("trust table");
         let good = ExitObservation {
             slice_underrun: true,
             clean_exit: true,
@@ -641,3 +643,4 @@ mod tests {
         assert_eq!(s, "this_is_a_very_");
     }
 }
+use std::io;

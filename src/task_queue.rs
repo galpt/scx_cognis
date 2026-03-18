@@ -113,10 +113,7 @@ impl<T> TaskQueue<T> {
     #[inline(always)]
     pub fn push_back(&mut self, value: T) -> Result<QueuePush, T> {
         if !self.primary.is_full() {
-            if self.primary.push_back(value).is_err() {
-                unreachable!("primary queue reported free space but rejected push")
-            }
-            return Ok(QueuePush::Primary);
+            return self.primary.push_back(value).map(|_| QueuePush::Primary);
         }
 
         if self.deferred.is_none() {
@@ -168,9 +165,10 @@ impl<T> TaskQueue<T> {
             return;
         }
 
-        let deferred = self.deferred.take().expect("deferred task exists");
-        if self.primary.push_back(deferred).is_err() {
-            unreachable!("primary queue gained one free slot but rejected deferred task")
+        if let Some(deferred) = self.deferred.take() {
+            if let Err(task) = self.primary.push_back(deferred) {
+                self.deferred = Some(task);
+            }
         }
     }
 }

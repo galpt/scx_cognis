@@ -3,7 +3,9 @@
 // This software may be used and distributed according to the terms of the
 // GNU General Public License version 2.
 
+use std::cell::RefCell;
 use std::mem::MaybeUninit;
+use std::rc::Rc;
 
 use crate::bpf_intf;
 use crate::bpf_intf::*;
@@ -17,6 +19,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use anyhow::bail;
+use anyhow::Context;
 use anyhow::Result;
 use log::warn;
 
@@ -138,52 +141,34 @@ impl AsMut<bpf_intf::dispatched_task_ctx> for bpf_intf::dispatched_task_ctx {
     }
 }
 
-// Message received from the dispatcher (see bpf_intf::queued_task_ctx for details).
-//
-// NOTE: eventually libbpf-rs will provide a better abstraction for this.
-struct EnqueuedMessage {
-    inner: bpf_intf::queued_task_ctx,
+fn decode_queued_task(data: &[u8]) -> Result<QueuedTask, i32> {
+    if data.len() != std::mem::size_of::<bpf_intf::queued_task_ctx>() {
+        return Err(-libc::EINVAL);
+    }
+
+    let inner = unsafe { std::ptr::read_unaligned(data.as_ptr() as *const bpf_intf::queued_task_ctx) };
+    Ok(QueuedTask {
+        pid: inner.pid,
+        cpu: inner.cpu,
+        nr_cpus_allowed: inner.nr_cpus_allowed,
+        flags: inner.flags,
+        start_ts: inner.start_ts,
+        stop_ts: inner.stop_ts,
+        exec_runtime: inner.exec_runtime,
+        weight: inner.weight,
+        vtime: inner.vtime,
+        enq_cnt: inner.enq_cnt,
+        comm: inner.comm,
+    })
 }
 
-impl EnqueuedMessage {
-    fn from_bytes(bytes: &[u8]) -> Self {
-        let queued_task_struct = unsafe { *(bytes.as_ptr() as *const bpf_intf::queued_task_ctx) };
-        EnqueuedMessage {
-            inner: queued_task_struct,
-        }
+fn decode_exited_pid(data: &[u8]) -> Result<i32, i32> {
+    if data.len() != std::mem::size_of::<u32>() {
+        return Err(-libc::EINVAL);
     }
 
-    fn to_queued_task(&self) -> QueuedTask {
-        QueuedTask {
-            pid: self.inner.pid,
-            cpu: self.inner.cpu,
-            nr_cpus_allowed: self.inner.nr_cpus_allowed,
-            flags: self.inner.flags,
-            start_ts: self.inner.start_ts,
-            stop_ts: self.inner.stop_ts,
-            exec_runtime: self.inner.exec_runtime,
-            weight: self.inner.weight,
-            vtime: self.inner.vtime,
-            enq_cnt: self.inner.enq_cnt,
-            comm: self.inner.comm,
-        }
-    }
-}
-
-// Exit pid published by ops.disable through the task_exits ring buffer.
-struct ExitedMessage {
-    inner: u32,
-}
-
-impl ExitedMessage {
-    fn from_bytes(bytes: &[u8]) -> Self {
-        let pid = unsafe { *(bytes.as_ptr() as *const u32) };
-        ExitedMessage { inner: pid }
-    }
-
-    fn to_pid(&self) -> i32 {
-        self.inner as i32
-    }
+    let pid = unsafe { std::ptr::read_unaligned(data.as_ptr() as *const u32) };
+    Ok(pid as i32)
 }
 
 pub struct BpfScheduler<'cb> {
@@ -192,26 +177,10 @@ pub struct BpfScheduler<'cb> {
     queued: libbpf_rs::RingBuffer<'cb>,    // Ring buffer of queued tasks
     task_exits: libbpf_rs::RingBuffer<'cb>, // Ring buffer of exiting task pids
     dispatched: libbpf_rs::UserRingBuffer, // User Ring buffer of dispatched tasks
+    queued_slot: Rc<RefCell<Option<QueuedTask>>>,
+    exited_pid_slot: Rc<RefCell<Option<i32>>>,
     struct_ops: Option<libbpf_rs::Link>,   // Low-level BPF methods
 }
-
-// Buffer to store a task read from the ring buffer.
-//
-// NOTE: make the buffer aligned to 64-bits to prevent misaligned dereferences when accessing the
-// buffer using a pointer.
-const BUFSIZE: usize = std::mem::size_of::<QueuedTask>();
-
-#[repr(align(8))]
-struct AlignedBuffer([u8; BUFSIZE]);
-
-static mut BUF: AlignedBuffer = AlignedBuffer([0; BUFSIZE]);
-
-const EXIT_BUFSIZE: usize = std::mem::size_of::<u32>();
-
-#[repr(align(8))]
-struct ExitAlignedBuffer([u8; EXIT_BUFSIZE]);
-
-static mut EXIT_BUF: ExitAlignedBuffer = ExitAlignedBuffer([0; EXIT_BUFSIZE]);
 
 impl<'cb> BpfScheduler<'cb> {
     /// Initialise the BPF scheduler.
@@ -239,49 +208,20 @@ impl<'cb> BpfScheduler<'cb> {
         skel_builder.obj_builder.debug(debug);
         let mut skel = scx_ops_open!(skel_builder, open_object, rustland, open_opts)?;
 
-        // Copy one item from the ring buffer.
-        //
-        // # Safety
-        //
-        // Each invocation of the callback will trigger the copy of exactly one QueuedTask item to
-        // BUF. The caller must be synchronize to ensure that multiple invocations of the callback
-        // are not happening at the same time, but this is implicitly guaranteed by the fact that
-        // the caller is a single-thread process (for now).
-        //
-        // Use of a `str` whose contents are not valid UTF-8 is undefined behavior.
-        fn callback(data: &[u8]) -> i32 {
-            #[allow(static_mut_refs)]
-            unsafe {
-                // SAFETY: copying from the BPF ring buffer to BUF is safe, since the size of BUF
-                // is exactly the size of QueuedTask and the callback operates in chunks of
-                // QueuedTask items. It also copies exactly one QueuedTask at a time, this is
-                // guaranteed by the error code returned by this callback (see below). From a
-                // thread-safety perspective this is also correct, assuming the caller is a
-                // single-thread process (as it is for now).
-                BUF.0.copy_from_slice(data);
-            }
-
-            // Return 0 to indicate successful completion of the copy.
-            0
-        }
-
-        fn exit_callback(data: &[u8]) -> i32 {
-            #[allow(static_mut_refs)]
-            unsafe {
-                EXIT_BUF.0.copy_from_slice(data);
-            }
-
-            0
-        }
+        let rodata = skel
+            .maps
+            .rodata_data
+            .as_mut()
+            .context("missing rodata_data map in BPF skeleton")?;
 
         // Check host topology to determine if we need to enable SMT capabilities.
         match Topology::new() {
             Ok(topo) => {
-                skel.maps.rodata_data.as_mut().unwrap().smt_enabled = topo.smt_enabled;
+                rodata.smt_enabled = topo.smt_enabled;
             }
             Err(err) => {
                 warn!("topology probe failed while initializing BPF state: {err}; disabling SMT-specific heuristics");
-                skel.maps.rodata_data.as_mut().unwrap().smt_enabled = false;
+                rodata.smt_enabled = false;
             }
         }
 
@@ -292,34 +232,68 @@ impl<'cb> BpfScheduler<'cb> {
             skel.struct_ops.rustland_mut().flags |= *compat::SCX_OPS_SWITCH_PARTIAL;
         }
         skel.struct_ops.rustland_mut().exit_dump_len = exit_dump_len;
-        skel.maps.rodata_data.as_mut().unwrap().usersched_pid = std::process::id();
-        skel.maps.rodata_data.as_mut().unwrap().builtin_idle = builtin_idle;
-        skel.maps.rodata_data.as_mut().unwrap().slice_ns = slice_ns;
-        skel.maps.rodata_data.as_mut().unwrap().debug = debug;
+        rodata.usersched_pid = std::process::id();
+        rodata.builtin_idle = builtin_idle;
+        rodata.slice_ns = slice_ns;
+        rodata.debug = debug;
         let _ = Self::set_scx_ops_name(&mut skel.struct_ops.rustland_mut().name, name);
 
         // Attach BPF scheduler.
         let mut skel = scx_ops_load!(skel, rustland, uei)?;
+        let _ = skel
+            .maps
+            .bss_data
+            .as_ref()
+            .context("missing bss_data map in BPF skeleton")?;
 
         let struct_ops = Some(scx_ops_attach!(skel, rustland)?);
+
+        let queued_slot = Rc::new(RefCell::new(None));
+        let exit_slot = Rc::new(RefCell::new(None));
 
         // Build the ring buffer of queued tasks.
         let maps = &skel.maps;
         let queued_ring_buffer = &maps.queued;
         let mut rbb = libbpf_rs::RingBufferBuilder::new();
-        rbb.add(queued_ring_buffer, callback)
-            .expect("failed to add ringbuf callback");
-        let queued = rbb.build().expect("failed to build ringbuf");
+        {
+            let queued_slot_cb = queued_slot.clone();
+            rbb.add(queued_ring_buffer, move |data| match decode_queued_task(data) {
+                Ok(task) => {
+                    *queued_slot_cb.borrow_mut() = Some(task);
+                    0
+                }
+                Err(err) => {
+                    warn!("dropping malformed queued task message from BPF ringbuf: len={}", data.len());
+                    err
+                }
+            })
+            .context("failed to add ringbuf callback")?;
+        }
+        let queued = rbb.build().context("failed to build ringbuf")?;
 
         let exit_ring_buffer = &maps.task_exits;
         let mut ebb = libbpf_rs::RingBufferBuilder::new();
-        ebb.add(exit_ring_buffer, exit_callback)
-            .expect("failed to add task_exits ringbuf callback");
-        let task_exits = ebb.build().expect("failed to build task_exits ringbuf");
+        {
+            let exit_slot_cb = exit_slot.clone();
+            ebb.add(exit_ring_buffer, move |data| match decode_exited_pid(data) {
+                Ok(pid) => {
+                    *exit_slot_cb.borrow_mut() = Some(pid);
+                    0
+                }
+                Err(err) => {
+                    warn!("dropping malformed task_exits message from BPF ringbuf: len={}", data.len());
+                    err
+                }
+            })
+            .context("failed to add task_exits ringbuf callback")?;
+        }
+        let task_exits = ebb
+            .build()
+            .context("failed to build task_exits ringbuf")?;
 
         // Build the user ring buffer of dispatched tasks.
         let dispatched = libbpf_rs::UserRingBuffer::new(&maps.dispatched)
-            .expect("failed to create user ringbuf");
+            .context("failed to create user ringbuf")?;
 
         // Lock all the memory to prevent page faults that could trigger potential deadlocks during
         // scheduling.
@@ -354,6 +328,8 @@ impl<'cb> BpfScheduler<'cb> {
             queued,
             task_exits,
             dispatched,
+            queued_slot,
+            exited_pid_slot: exit_slot,
             struct_ops,
         })
     }
@@ -533,15 +509,21 @@ impl<'cb> BpfScheduler<'cb> {
             }),
             ..Default::default()
         };
-        let out = prog.test_run(input).unwrap();
-
-        out.return_value as i32
+        match prog.test_run(input) {
+            Ok(out) => out.return_value as i32,
+            Err(err) => {
+                warn!("select_cpu BPF test_run failed for pid {pid}: {err}");
+                RL_CPU_ANY
+            }
+        }
     }
 
     // Receive a task to be scheduled from the BPF dispatcher.
-    #[allow(static_mut_refs)]
     pub fn dequeue_task(&mut self) -> Result<Option<QueuedTask>, i32> {
-        let bss_data = self.skel.maps.bss_data.as_mut().unwrap();
+        let Some(bss_data) = self.skel.maps.bss_data.as_mut() else {
+            return Err(-libc::EIO);
+        };
+        self.queued_slot.borrow_mut().take();
         
         // Try to consume the first task from the ring buffer.
         match self.queued.consume_raw_n(1) {
@@ -551,28 +533,39 @@ impl<'cb> BpfScheduler<'cb> {
                 Ok(None)
             }
             1 => {
-                // A valid task is received, convert data to a proper task struct.
-                let task = unsafe { EnqueuedMessage::from_bytes(&BUF.0).to_queued_task() };
+                let Some(task) = self.queued_slot.borrow_mut().take() else {
+                    warn!("queued ring buffer reported data without delivering a decoded task");
+                    return Err(-libc::EIO);
+                };
                 bss_data.nr_queued = bss_data.nr_queued.saturating_sub(1);
 
                 Ok(Some(task))
             }
             res if res < 0 => Err(res),
-            res => panic!("Unexpected return value from libbpf-rs::consume_raw(): {res}"),
+            res => {
+                warn!("unexpected queued ring buffer consume result: {res}");
+                Err(-libc::EPROTO)
+            }
         }
     }
 
     // Receive one exiting pid published by ops.disable.
-    #[allow(static_mut_refs)]
     pub fn dequeue_exited_pid(&mut self) -> Result<Option<i32>, i32> {
+        self.exited_pid_slot.borrow_mut().take();
         match self.task_exits.consume_raw_n(1) {
             0 => Ok(None),
             1 => {
-                let pid = unsafe { ExitedMessage::from_bytes(&EXIT_BUF.0).to_pid() };
+                let Some(pid) = self.exited_pid_slot.borrow_mut().take() else {
+                    warn!("task_exits ring buffer reported data without delivering a decoded pid");
+                    return Err(-libc::EIO);
+                };
                 Ok(Some(pid))
             }
             res if res < 0 => Err(res),
-            res => panic!("Unexpected return value from libbpf-rs::consume_raw() for task_exits: {res}"),
+            res => {
+                warn!("unexpected task_exits ring buffer consume result: {res}");
+                Err(-libc::EPROTO)
+            }
         }
     }
 
@@ -584,7 +577,7 @@ impl<'cb> BpfScheduler<'cb> {
             .reserve(std::mem::size_of::<bpf_intf::dispatched_task_ctx>())?;
         let bytes = urb_sample.as_mut();
         let dispatched_task = plain::from_mut_bytes::<bpf_intf::dispatched_task_ctx>(bytes)
-            .expect("failed to convert bytes");
+            .map_err(|_| libbpf_rs::Error::from_raw_os_error(libc::EINVAL))?;
 
         // Convert the dispatched task into the low-level dispatched task context.
         let bpf_intf::dispatched_task_ctx {
@@ -608,9 +601,7 @@ impl<'cb> BpfScheduler<'cb> {
         //
         // NOTE: submit() only updates the reserved slot in the user ring buffer, so it is not
         // expected to fail.
-        self.dispatched
-            .submit(urb_sample)
-            .expect("failed to submit task");
+        self.dispatched.submit(urb_sample)?;
 
         Ok(())
     }
