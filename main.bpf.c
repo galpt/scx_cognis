@@ -324,15 +324,32 @@ static bool usersched_has_pending_tasks(void)
 }
 
 /*
- * Return true when the system still has spare CPU capacity.
+ * Return true when the system still has spare CPU capacity and no meaningful
+ * user-space backlog has built up yet.
  *
- * In this state, letting wakeups bypass the shared queue and land directly on
- * an idle CPU tends to preserve cache locality and frame pacing better than
- * forcing every task through the user-space round-trip.
+ * This intentionally accounts both on-CPU work and tasks already queued for
+ * the Rust policy, so the BPF fast path only wins while the machine is truly
+ * lightly loaded.
  */
 static bool system_unsaturated(void)
 {
-	return nr_online_cpus && nr_running < nr_online_cpus;
+	const u64 SAT_MAX = ~0ULL;
+	u64 demand = nr_running;
+
+	demand = demand + nr_queued;
+	if (demand < nr_running)
+		demand = SAT_MAX;
+
+	if (demand != SAT_MAX) {
+		u64 next = demand + nr_scheduled;
+
+		if (next < demand)
+			demand = SAT_MAX;
+		else
+			demand = next;
+	}
+
+	return nr_online_cpus && demand < nr_online_cpus;
 }
 
 /*
@@ -573,6 +590,33 @@ static bool can_direct_dispatch(s32 cpu)
 	return !scx_bpf_dsq_nr_queued(SHARED_DSQ) || system_unsaturated();
 }
 
+/*
+ * BPF-side locality fast path used while the system is lightly loaded.
+ *
+ * This keeps the common desktop wakeup/re-enqueue case on the task's previous
+ * CPU instead of bouncing through userspace, which matches the shape used by
+ * the faster sched_ext schedulers and by in-kernel interactive schedulers.
+ */
+static bool try_local_fastpath(struct task_struct *p, s32 cpu, u64 enq_flags)
+{
+	if (cpu < 0)
+		return false;
+
+	if (!system_unsaturated())
+		return false;
+
+	if (scx_bpf_dsq_nr_queued(SHARED_DSQ))
+		return false;
+
+	if (!bpf_cpumask_test_cpu(cpu, p->cpus_ptr))
+		return false;
+
+	scx_bpf_dsq_insert_vtime(p, cpu_to_dsq(cpu),
+				 slice_ns, p->scx.dsq_vtime, enq_flags);
+	__sync_fetch_and_add(&nr_kernel_dispatches, 1);
+	return true;
+}
+
 s32 BPF_STRUCT_OPS(rustland_select_cpu, struct task_struct *p, s32 prev_cpu,
 		   u64 wake_flags)
 {
@@ -783,12 +827,15 @@ void BPF_STRUCT_OPS(rustland_enqueue, struct task_struct *p, u64 enq_flags)
 	}
 
 	/*
-	 * If @builtin_idle is enabled, give the task a chance to be
-	 * directly dispatched only on a wakeup and only if
-	 * ops.select_cpu() was skipped, otherwise the task is always
-	 * queued to the user-space scheduler.
+	 * Below saturation, keep the common case in BPF and preserve locality by
+	 * reusing the previous CPU whenever possible. Once runnable pressure or
+	 * userspace backlog builds up, fall back to the richer Rust policy.
 	 */
 	if (!(builtin_idle && is_wakeup)) {
+		if (try_local_fastpath(p, prev_cpu, enq_flags)) {
+			is_wakeup = !scx_bpf_task_running(p);
+			goto out_kick;
+		}
 		queue_task_to_userspace(p, prev_cpu, enq_flags);
 		goto out_kick;
 	}
@@ -799,6 +846,10 @@ void BPF_STRUCT_OPS(rustland_enqueue, struct task_struct *p, u64 enq_flags)
 	 */
 	cpu = pick_idle_cpu(p, prev_cpu, 0);
 	if (cpu < 0) {
+		if (try_local_fastpath(p, prev_cpu, enq_flags)) {
+			is_wakeup = !scx_bpf_task_running(p);
+			goto out_kick;
+		}
 		queue_task_to_userspace(p, prev_cpu, enq_flags);
 		goto out_kick;
 	}
@@ -816,6 +867,8 @@ void BPF_STRUCT_OPS(rustland_enqueue, struct task_struct *p, u64 enq_flags)
 	 * dispatch to the selected CPU.
 	 */
 	if (!can_direct_dispatch(cpu)) {
+		if (try_local_fastpath(p, cpu, enq_flags))
+			goto out_kick;
 		queue_task_to_userspace(p, prev_cpu, enq_flags);
 		goto out_kick;
 	}

@@ -7,10 +7,10 @@
 // heuristics and bounded statistical helpers in a multi-stage pipeline:
 //
 //   ┌─────────────────────────────────────────────────────────────────────┐
-//   │  ops.enqueue    → Heuristic classifier + trust lookup                │
+//   │  ops.enqueue    → BPF local fast path below saturation               │
+//   │               → Rust classifier + trust lookup under pressure        │
 //   │  ops.dispatch   → load-driven slice base + bounded wake urgency      │
-//   │               → local/idle fast path below saturation                │
-//   │               → SHARED_DSQ fallback under pressure                   │
+//   │               → SHARED_DSQ fallback for user-space managed work      │
 //   │  ops.select_cpu → kernel idle-CPU query (pick_idle_cpu, atomic)     │
 //   │  housekeeping   → trust flush + slice-base refresh outside dispatch  │
 //   └─────────────────────────────────────────────────────────────────────┘
@@ -81,9 +81,9 @@ const RAPID_FAILURE_LIMIT: u32 = 20;
 /// with fixed core weights plus bounded per-PID residual correction, a combined trust/anomaly
 /// table for reputation tracking, and a load-driven slice base with bounded per-task interactive
 /// renewal — all targeting sub-10µs per-event latency with zero
-/// hot-path heap allocations. Cognis prefers local/idle dispatch while the
-/// machine is unsaturated, then falls back to SHARED_DSQ (RL_CPU_ANY) under
-/// pressure so the old per-CPU DSQ stall cannot take the desktop down again.
+/// hot-path heap allocations. Cognis now keeps the common lightly-loaded path
+/// in BPF on the task's previous/idle CPU and only hands work to Rust once
+/// runnable pressure builds up enough to justify the extra policy cost.
 /// Kernel workers are still pinned to their affinity CPU.
 #[derive(Debug, Parser)]
 struct Opts {
@@ -436,32 +436,6 @@ impl<'a> Scheduler<'a> {
         nr_running
             .saturating_add(nr_queued)
             .saturating_add(nr_scheduled)
-    }
-
-    #[inline(always)]
-    fn system_unsaturated(nr_running: u64, nr_cpus: u64) -> bool {
-        nr_running < nr_cpus.max(1)
-    }
-
-    #[inline(always)]
-    fn should_prefer_locality(
-        label: TaskLabel,
-        latency_sensitive: bool,
-        nr_running: u64,
-        nr_cpus: u64,
-    ) -> bool {
-        Self::system_unsaturated(nr_running, nr_cpus)
-            && (latency_sensitive || !matches!(label, TaskLabel::Compute))
-    }
-
-    #[inline(always)]
-    fn current_cpu() -> i32 {
-        let cpu = unsafe { libc::sched_getcpu() };
-        if cpu >= 0 {
-            cpu
-        } else {
-            -1
-        }
     }
 
     #[inline(always)]
@@ -1517,78 +1491,19 @@ impl<'a> Scheduler<'a> {
                 .saturating_sub(self.wake_deadline_credit_ns(&task))
         };
 
-        // CPU selection keeps the old shared-queue safety net but no longer
-        // forces ordinary desktop work through it when the machine still has
-        // idle CPU capacity.
-        //
-        // The BPF ops.dispatch order is still:
-        //   1. SCHED_DSQ  (userspace scheduler process, if pending work exists)
-        //   2. cpu_to_dsq(current_cpu)  (per-CPU tasks)
-        //   3. SHARED_DSQ
-        //
-        // That means blindly targeting per-CPU DSQs can still starve work on
-        // the CPU currently hosting the scheduler. To avoid reintroducing the
-        // runnable-task stall bug, the locality fast path explicitly avoids
-        // dispatching ordinary user tasks to the scheduler's current CPU and
-        // falls back to SHARED_DSQ whenever the system is saturated.
-        //
-        // Below saturation we prefer:
-        //   1. an actually idle CPU chosen by BPF, then
-        //   2. the task's previous CPU for cache locality, then
-        //   3. SHARED_DSQ as the safe fallback.
-        //
-        // Kernel workers and --percpu-local tasks are still dispatched to
-        // their affined CPU: kthreads must stay on interrupt-affined CPUs;
-        // percpu_local is an explicit user request.
-        let nr_running = *self.bpf.nr_running_mut();
-        let nr_cpus = (*self.bpf.nr_online_cpus_mut()).max(1);
-        let scheduler_cpu = Self::current_cpu();
-        let prefer_locality =
-            Self::should_prefer_locality(task.label, task.latency_sensitive, nr_running, nr_cpus);
-
+        // Keep userspace-managed work on the shared DSQ unless the user
+        // explicitly requested per-CPU affinity or the task is a kernel worker.
+        // Ordinary locality preservation now happens on the BPF enqueue fast
+        // path before tasks ever cross into Rust.
         dispatched.cpu = if self.opts.percpu_local || task.is_kernel_worker {
             task.qtask.cpu
         } else {
-            let mut target_cpu = RL_CPU_ANY;
-            let try_idle_cpu = task.latency_sensitive || prefer_locality;
-
-            if try_idle_cpu {
-                let idle_cpu =
-                    self.bpf
-                        .select_cpu(task.qtask.pid, task.qtask.cpu, task.qtask.flags);
-                let keep_same_llc = task.latency_sensitive;
-
-                if idle_cpu >= 0
-                    && idle_cpu != scheduler_cpu
-                    && self.cpu_selector.accepts_idle_cpu(
-                        idle_cpu,
-                        task.qtask.cpu,
-                        task.label,
-                        _quarantined,
-                        task.perf_cri,
-                        keep_same_llc,
-                    )
-                {
-                    target_cpu = idle_cpu;
-                }
-            }
-
-            if target_cpu == RL_CPU_ANY && prefer_locality {
-                let prev_cpu = task.qtask.cpu;
-                if prev_cpu >= 0 && prev_cpu != scheduler_cpu {
-                    target_cpu = prev_cpu;
-                }
-            }
-
-            target_cpu
+            RL_CPU_ANY
         };
 
         if self.bpf.dispatch_task(&dispatched).is_err() {
             self.push_task(task);
             return false;
-        }
-        if dispatched.cpu != RL_CPU_ANY {
-            self.cpu_selector.mark_busy(dispatched.cpu);
         }
         true
     }
@@ -1788,11 +1703,6 @@ impl<'a> Scheduler<'a> {
         // Measure the scheduling pipeline latency for autopilot overhead checks.
         let sched_t0 = Self::now_ns();
 
-        // Reserve explicit idle-CPU placements within this scheduling window so
-        // a burst of latency-sensitive tasks can't all target the same CPU
-        // before the kernel has had a chance to consume earlier dispatches.
-        self.cpu_selector.reset_idle();
-
         // 1. Drain queued tasks in a bounded batch.
         //
         // Bound the batch so each schedule() call reaches the dispatch phase
@@ -1822,8 +1732,8 @@ impl<'a> Scheduler<'a> {
         //   kworkers normally.
         //
         // Dispatch order is maintained by pop_highest_priority_task() (RT
-        // first). Each task may take either the locality-preserving per-CPU
-        // path or the shared fallback selected by dispatch_task().
+        // first). User-space managed tasks fall back to SHARED_DSQ unless
+        // they are explicitly per-CPU or kernel workers.
         while !self.tasks_empty() {
             if !self.dispatch_task() {
                 break;
@@ -2274,37 +2184,5 @@ mod tests {
             Scheduler::effective_slice_pressure(u64::MAX, 1, 1),
             u64::MAX
         );
-    }
-
-    #[test]
-    fn locality_is_preferred_for_interactive_work_below_saturation() {
-        assert!(Scheduler::should_prefer_locality(
-            crate::ai::TaskLabel::Interactive,
-            false,
-            7,
-            8
-        ));
-        assert!(Scheduler::should_prefer_locality(
-            crate::ai::TaskLabel::Compute,
-            true,
-            7,
-            8
-        ));
-    }
-
-    #[test]
-    fn locality_is_disabled_for_compute_at_saturation() {
-        assert!(!Scheduler::should_prefer_locality(
-            crate::ai::TaskLabel::Compute,
-            false,
-            8,
-            8
-        ));
-        assert!(!Scheduler::should_prefer_locality(
-            crate::ai::TaskLabel::Interactive,
-            false,
-            8,
-            8
-        ));
     }
 }
