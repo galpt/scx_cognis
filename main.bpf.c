@@ -1,28 +1,17 @@
 /* Copyright (c) Andrea Righi <andrea.righi@linux.dev> */
 /*
- * scx_rustland_core: BPF backend for schedulers running in user-space.
+ * Cognis v2 — BPF-owned sched_ext policy with a minimal Rust companion.
  *
- * This BPF backend implements the low level sched-ext functionalities for a
- * user-space counterpart, that implements the actual scheduling policy.
+ * Scheduling decisions are made in BPF. The Rust process remains responsible
+ * for loading the scheduler, exporting stats, handling restart/reporting, and
+ * keeping a dormant compatibility path for legacy user-space dispatch.
  *
- * The BPF part collects total cputime and weight from the tasks that need to
- * run, then it sends all details to the user-space scheduler that decides the
- * best order of execution of the tasks (based on the collected metrics).
- *
- * The user-space scheduler then returns to the BPF component the list of tasks
- * to be dispatched in the proper order.
- *
- * Messages between the BPF component and the user-space scheduler are passed
- * using BPF_MAP_TYPE_RINGBUF / BPF_MAP_TYPE_USER_RINGBUF maps: @queued for
- * the messages sent by the BPF dispatcher to the user-space scheduler and
- * @dispatched for the messages sent by the user-space scheduler to the BPF
- * dispatcher.
- *
- * The BPF dispatcher is completely agnostic of the particular scheduling
- * policy implemented in user-space. For this reason developers that are
- * willing to use this scheduler to experiment scheduling policies should be
- * able to simply modify the Rust component, without having to deal with any
- * internal kernel / BPF details.
+ * The hot policy is intentionally simple and research-driven:
+ *   - per-CPU local DSQs for locality
+ *   - a shared overflow DSQ when balancing is preferred
+ *   - EEVDF-like virtual deadlines
+ *   - bounded wakeup credit for frequently sleeping tasks
+ *   - desktop/server profiles that tune slice, lag, and overflow behavior
  *
  * This software may be used and distributed according to the terms of the
  * GNU General Public License version 2.
@@ -40,6 +29,14 @@
 char _license[] SEC("license") = "GPL";
 
 UEI_DEFINE(uei);
+
+#ifndef NSEC_PER_USEC
+#define NSEC_PER_USEC 1000ULL
+#endif
+
+#ifndef NSEC_PER_MSEC
+#define NSEC_PER_MSEC 1000000ULL
+#endif
 
 /*
  * Introduce a custom DSQ shared across all the CPUs, where we can dispatch
@@ -68,9 +65,19 @@ u64 usersched_last_run_at; /* Timestamp of the last user-space scheduler executi
 static u64 nr_cpu_ids; /* Maximum possible CPU number */
 
 /*
- * Default task time slice.
+ * Maximum task slice for the active profile.
  */
 const volatile u64 slice_ns;
+
+/*
+ * Minimum task slice for the active profile.
+ */
+const volatile u64 slice_min_ns;
+
+/*
+ * Maximum bounded wakeup credit for the active profile.
+ */
+const volatile u64 slice_lag_ns;
 
 /*
  * Number of tasks that are queued for scheduling.
@@ -107,6 +114,15 @@ const volatile bool debug;
 /* Rely on the in-kernel idle CPU selection policy */
 const volatile bool builtin_idle;
 
+/* Reduce wake-sync affinity and favor broader balancing. */
+const volatile bool no_wake_sync;
+
+/* Keep very short-burst tasks on the same CPU to reduce queue churn. */
+const volatile bool sticky_tasks;
+
+/* Server profile prefers shared overflow; desktop keeps overflow local. */
+const volatile bool server_mode;
+
 /* Allow to use bpf_printk() only when @debug is set */
 #define dbg_msg(_fmt, ...) do {						\
 	if (debug)							\
@@ -119,11 +135,9 @@ const volatile bool builtin_idle;
 const volatile bool smt_enabled = true;
 
 /*
- * Maximum amount of tasks queued between kernel and user-space at a certain
- * time.
- *
- * The @queued and @dispatched lists are used in a producer/consumer fashion
- * between the BPF part and the user-space part.
+ * Legacy compatibility buffers between kernel and the dormant user-space
+ * fallback path. In Cognis v2 the default desktop/server profiles do not
+ * normally enqueue tasks here.
  */
 #define MAX_ENQUEUED_TASKS 4096
 
@@ -180,6 +194,31 @@ struct task_ctx {
 	 * Task generation counter to detect duplicate enqueues.
 	 */
 	u64 enq_cnt;
+
+	/*
+	 * Virtual service accumulated since the last sleep event.
+	 */
+	u64 awake_vtime;
+
+	/*
+	 * Timestamp when the task most recently started executing.
+	 */
+	u64 last_run_at;
+
+	/*
+	 * Smoothed wakeup frequency used to bound wakeup credit.
+	 */
+	u64 wakeup_freq;
+
+	/*
+	 * Timestamp of the last wakeup.
+	 */
+	u64 last_woke_at;
+
+	/*
+	 * Smoothed runtime per scheduling cycle used for sticky-task detection.
+	 */
+	u64 avg_runtime;
 };
 
 /*
@@ -203,6 +242,16 @@ struct {
 	__type(key, int);
 	__type(value, struct task_ctx);
 } task_ctx_stor SEC(".maps");
+
+/*
+ * Current global virtual-time front.
+ */
+static u64 vtime_now;
+
+/*
+ * Wakeup-frequency cap evaluated over 100ms windows.
+ */
+#define MAX_WAKEUP_FREQ 64ULL
 
 /*
  * Return a local task context from a generic task or NULL if the context
@@ -266,6 +315,17 @@ static bool is_queued(const struct task_struct *p)
 	return p->scx.flags & SCX_TASK_QUEUED;
 }
 
+static inline bool is_deadline_min(const struct task_struct *p1,
+				       const struct task_struct *p2)
+{
+	if (!p1)
+		return false;
+	if (!p2)
+		return true;
+
+	return p1->scx.dsq_vtime < p2->scx.dsq_vtime;
+}
+
 /*
  * Flag used to wake-up the user-space scheduler.
  */
@@ -321,35 +381,6 @@ static bool usersched_has_pending_tasks(void)
 		return true;
 
 	return bpf_ringbuf_query(&queued, BPF_RB_AVAIL_DATA) > 0;
-}
-
-/*
- * Return true when the system still has spare CPU capacity and no meaningful
- * user-space backlog has built up yet.
- *
- * This intentionally accounts both on-CPU work and tasks already queued for
- * the Rust policy, so the BPF fast path only wins while the machine is truly
- * lightly loaded.
- */
-static bool system_unsaturated(void)
-{
-	const u64 SAT_MAX = ~0ULL;
-	u64 demand = nr_running;
-
-	demand = demand + nr_queued;
-	if (demand < nr_running)
-		demand = SAT_MAX;
-
-	if (demand != SAT_MAX) {
-		u64 next = demand + nr_scheduled;
-
-		if (next < demand)
-			demand = SAT_MAX;
-		else
-			demand = next;
-	}
-
-	return nr_online_cpus && demand < nr_online_cpus;
 }
 
 /*
@@ -414,6 +445,64 @@ static inline bool is_wakeup(u64 wake_flags)
 	return wake_flags & SCX_WAKE_TTWU;
 }
 
+static u64 calc_avg(u64 old_val, u64 new_val)
+{
+	return (old_val - (old_val >> 2)) + (new_val >> 2);
+}
+
+static u64 update_freq(u64 freq, u64 interval)
+{
+	u64 new_freq;
+
+	new_freq = (100 * NSEC_PER_MSEC) / interval;
+	return calc_avg(freq, new_freq);
+}
+
+static bool is_task_sticky(const struct task_ctx *tctx)
+{
+	return sticky_tasks && tctx->avg_runtime < 10 * NSEC_PER_USEC;
+}
+
+static bool task_should_migrate(struct task_struct *p, u64 enq_flags)
+{
+	return !__COMPAT_is_enq_cpu_selected(enq_flags) &&
+	       (!sticky_tasks || !scx_bpf_task_running(p));
+}
+
+static u64 task_slice(const struct task_struct *p, s32 cpu)
+{
+	u64 nr_wait = scx_bpf_dsq_nr_queued(cpu_to_dsq(cpu)) +
+		      scx_bpf_dsq_nr_queued(SHARED_DSQ);
+	u64 slice = scale_by_task_weight(p, slice_ns) / MAX(nr_wait, 1);
+
+	return MAX(slice, slice_min_ns);
+}
+
+static u64 task_dl(struct task_struct *p, s32 cpu, struct task_ctx *tctx)
+{
+	const u64 STARVATION_NS = 500ULL * NSEC_PER_MSEC;
+	const u64 q_thresh = MAX(STARVATION_NS / MAX(slice_ns, 1), 1);
+	u64 nr_wait = scx_bpf_dsq_nr_queued(cpu_to_dsq(cpu)) +
+		      scx_bpf_dsq_nr_queued(SHARED_DSQ);
+	u64 lag_scale = MAX(tctx->wakeup_freq, 1);
+	u64 awake_max = scale_by_task_weight_inverse(p, slice_lag_ns);
+	u64 vtime_min;
+
+	if (nr_wait * slice_ns >= STARVATION_NS)
+		lag_scale = 1;
+	else
+		lag_scale = MAX(lag_scale * q_thresh / (q_thresh + nr_wait), 1);
+
+	vtime_min = vtime_now - scale_by_task_weight(p, slice_lag_ns * lag_scale);
+	if (time_before(p->scx.dsq_vtime, vtime_min))
+		p->scx.dsq_vtime = vtime_min;
+
+	if (time_after(tctx->awake_vtime, awake_max))
+		tctx->awake_vtime = awake_max;
+
+	return p->scx.dsq_vtime + tctx->awake_vtime;
+}
+
 /*
  * Find an idle CPU in the system for the task.
  *
@@ -427,6 +516,9 @@ static s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu, u64 wake_flags)
 {
 	s32 cpu, this_cpu = bpf_get_smp_processor_id();
 	bool is_this_cpu_allowed = bpf_cpumask_test_cpu(this_cpu, p->cpus_ptr);
+
+	if (no_wake_sync)
+		wake_flags &= ~SCX_WAKE_SYNC;
 
 	/*
 	 * For tasks that can run only on a single CPU, we can simply verify if
@@ -579,49 +671,12 @@ out_release:
 	bpf_task_release(p);
 }
 
-/*
- * Return true it's safe to dispatch directly on @cpu, false otherwise.
- */
-static bool can_direct_dispatch(s32 cpu)
-{
-	if (scx_bpf_dsq_nr_queued(cpu_to_dsq(cpu)))
-		return false;
-
-	return !scx_bpf_dsq_nr_queued(SHARED_DSQ) || system_unsaturated();
-}
-
-/*
- * BPF-side locality fast path used while the system is lightly loaded.
- *
- * This keeps the common desktop wakeup/re-enqueue case on the task's previous
- * CPU instead of bouncing through userspace, which matches the shape used by
- * the faster sched_ext schedulers and by in-kernel interactive schedulers.
- */
-static bool try_local_fastpath(struct task_struct *p, s32 cpu, u64 enq_flags)
-{
-	if (cpu < 0)
-		return false;
-
-	if (!system_unsaturated())
-		return false;
-
-	if (scx_bpf_dsq_nr_queued(SHARED_DSQ))
-		return false;
-
-	if (!bpf_cpumask_test_cpu(cpu, p->cpus_ptr))
-		return false;
-
-	scx_bpf_dsq_insert_vtime(p, cpu_to_dsq(cpu),
-				 slice_ns, p->scx.dsq_vtime, enq_flags);
-	__sync_fetch_and_add(&nr_kernel_dispatches, 1);
-	return true;
-}
-
 s32 BPF_STRUCT_OPS(rustland_select_cpu, struct task_struct *p, s32 prev_cpu,
 		   u64 wake_flags)
 {
 	s32 cpu, this_cpu = bpf_get_smp_processor_id();
 	bool is_this_cpu_allowed = bpf_cpumask_test_cpu(this_cpu, p->cpus_ptr);
+	struct task_ctx *tctx;
 
 	/*
 	 * Make sure @prev_cpu is usable, otherwise try to move close to
@@ -639,23 +694,22 @@ s32 BPF_STRUCT_OPS(rustland_select_cpu, struct task_struct *p, s32 prev_cpu,
 		return prev_cpu;
 
 	/*
-	 * If built-in idle CPU policy is not enabled, completely delegate
-	 * the idle selection policy to user-space and keep reusing the
-	 * same CPU here.
+	 * If built-in idle CPU policy is disabled, keep reusing the same CPU.
 	 */
 	if (!builtin_idle)
 		return prev_cpu;
 
 	/*
-	 * Pick the idle CPU closest to @prev_cpu usable by the task.
+	 * Pick the idle CPU closest to @prev_cpu usable by the task and
+	 * dispatch directly with a BPF-owned virtual deadline.
 	 */
 	cpu = pick_idle_cpu(p, prev_cpu, wake_flags);
 	if (cpu >= 0) {
-		if (can_direct_dispatch(cpu)) {
+		tctx = try_lookup_task_ctx(p);
+		if (tctx)
 			scx_bpf_dsq_insert_vtime(p, cpu_to_dsq(cpu),
-						 slice_ns, p->scx.dsq_vtime, 0);
-			__sync_fetch_and_add(&nr_kernel_dispatches, 1);
-		}
+						 task_slice(p, cpu), task_dl(p, cpu, tctx), 0);
+		__sync_fetch_and_add(&nr_kernel_dispatches, 1);
 		return cpu;
 	}
 
@@ -706,81 +760,12 @@ int rs_select_cpu(struct task_cpu_arg *input)
 }
 
 /*
- * Fill @task with all the information that need to be sent to the user-space
- * scheduler.
- */
-static void get_task_info(struct queued_task_ctx *task,
-			  const struct task_struct *p,
-			  struct task_ctx *tctx, u64 enq_flags, s32 prev_cpu)
-{
-	task->pid = p->pid;
-	task->cpu = prev_cpu;
-	task->nr_cpus_allowed = p->nr_cpus_allowed;
-	task->flags = enq_flags;
-	task->start_ts = tctx->start_ts;
-	task->stop_ts = tctx->stop_ts;
-	task->exec_runtime = tctx->exec_runtime;
-	task->weight = p->scx.weight;
-	task->vtime = p->scx.dsq_vtime;
-	task->enq_cnt = ++tctx->enq_cnt;
-
-	bpf_core_read(&task->comm, sizeof(task->comm), &p->comm);
-}
-
-/*
- * User-space scheduler is congested: log that and increment congested counter.
- */
-static void sched_congested(struct task_struct *p)
-{
-	dbg_msg("congested: pid=%d (%s)", p->pid, p->comm);
-	__sync_fetch_and_add(&nr_sched_congested, 1);
-}
-
-/*
  * Return true if a task has been enqueued as a remote wakeup, false
  * otherwise.
  */
 static bool is_queued_wakeup(const struct task_struct *p, u64 enq_flags)
 {
 	return !__COMPAT_is_enq_cpu_selected(enq_flags) && !scx_bpf_task_running(p);
-}
-
-/*
- * Queue a task to the user-space scheduler.
- */
-static void queue_task_to_userspace(struct task_struct *p, s32 prev_cpu, u64 enq_flags)
-{
-	struct queued_task_ctx *task;
-	struct task_ctx *tctx;
-
-	tctx = try_lookup_task_ctx(p);
-	if (!tctx)
-		return;
-
-	/*
-	 * Allocate a new entry in the ring buffer.
-	 *
-	 * If ring buffer is full, the user-space scheduler is congested,
-	 * so dispatch the task directly using the shared DSQ (the task
-	 * will be consumed by the first CPU available).
-	 */
-	task = bpf_ringbuf_reserve(&queued, sizeof(*task), 0);
-	if (!task) {
-		sched_congested(p);
-		scx_bpf_dsq_insert_vtime(p, SHARED_DSQ,
-					 slice_ns, p->scx.dsq_vtime, enq_flags);
-		__sync_fetch_and_add(&nr_kernel_dispatches, 1);
-		return;
-	}
-
-	/*
-	 * Collect task information and store them in the ring buffer that
-	 * will be consumed by the user-space scheduler.
-	 */
-	dbg_msg("enqueue: pid=%d (%s)", p->pid, p->comm);
-	get_task_info(task, p, tctx, enq_flags, prev_cpu);
-	bpf_ringbuf_submit(task, 0);
-	__sync_fetch_and_add(&nr_queued, 1);
 }
 
 /*
@@ -791,7 +776,12 @@ static void queue_task_to_userspace(struct task_struct *p, s32 prev_cpu, u64 enq
 void BPF_STRUCT_OPS(rustland_enqueue, struct task_struct *p, u64 enq_flags)
 {
 	s32 prev_cpu = scx_bpf_task_cpu(p), cpu;
-	bool is_wakeup = is_queued_wakeup(p, enq_flags);
+	bool should_kick = is_queued_wakeup(p, enq_flags);
+	struct task_ctx *tctx;
+
+	tctx = try_lookup_task_ctx(p);
+	if (!tctx)
+		return;
 
 	/*
 	 * Insert the user-space scheduler to its dedicated DSQ, it will be
@@ -800,7 +790,7 @@ void BPF_STRUCT_OPS(rustland_enqueue, struct task_struct *p, u64 enq_flags)
 	 */
 	if (is_usersched_task(p)) {
 		scx_bpf_dsq_insert(p, SCHED_DSQ, slice_ns, enq_flags);
-		goto out_kick;
+		goto out;
 	}
 
 	/*
@@ -821,80 +811,52 @@ void BPF_STRUCT_OPS(rustland_enqueue, struct task_struct *p, u64 enq_flags)
 	 */
 	if (is_kthread(p)) {
 		scx_bpf_dsq_insert_vtime(p, cpu_to_dsq(prev_cpu),
-					 slice_ns, p->scx.dsq_vtime, enq_flags);
+					 task_slice(p, prev_cpu), p->scx.dsq_vtime, enq_flags);
 		__sync_fetch_and_add(&nr_kernel_dispatches, 1);
-		goto out_kick;
+		goto out;
 	}
 
 	/*
-	 * Below saturation, keep the common case in BPF and preserve locality by
-	 * reusing the previous CPU whenever possible. Once runnable pressure or
-	 * userspace backlog builds up, fall back to the richer Rust policy.
+	 * Keep very short-burst tasks on the same CPU to reduce queue churn and
+	 * preserve cache locality.
 	 */
-	if (!(builtin_idle && is_wakeup)) {
-		if (try_local_fastpath(p, prev_cpu, enq_flags)) {
-			is_wakeup = !scx_bpf_task_running(p);
-			goto out_kick;
+	if (is_task_sticky(tctx)) {
+		scx_bpf_dsq_insert_vtime(p, cpu_to_dsq(prev_cpu),
+					 task_slice(p, prev_cpu), task_dl(p, prev_cpu, tctx), enq_flags);
+		__sync_fetch_and_add(&nr_kernel_dispatches, 1);
+		goto out;
+	}
+
+	/*
+	 * Attempt to move the task directly to an idle CPU when migration is
+	 * still worth the cost.
+	 */
+	if (task_should_migrate(p, enq_flags)) {
+		cpu = pick_idle_cpu(p, prev_cpu, 0);
+		if (cpu >= 0) {
+			scx_bpf_dsq_insert_vtime(p, cpu_to_dsq(cpu),
+						 task_slice(p, cpu), task_dl(p, cpu, tctx), enq_flags);
+			__sync_fetch_and_add(&nr_kernel_dispatches, 1);
+			if (prev_cpu != cpu || !scx_bpf_task_running(p))
+				scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
+			return;
 		}
-		queue_task_to_userspace(p, prev_cpu, enq_flags);
-		goto out_kick;
 	}
 
 	/*
-	 * Try to find an idle CPU in the system, if all CPUs are busy
-	 * queue the task to the user-space scheduler.
+	 * No idle CPU was available. Desktop mode keeps overflow local to
+	 * preserve cache warmth; server mode uses the shared DSQ to balance
+	 * throughput across CPUs.
 	 */
-	cpu = pick_idle_cpu(p, prev_cpu, 0);
-	if (cpu < 0) {
-		if (try_local_fastpath(p, prev_cpu, enq_flags)) {
-			is_wakeup = !scx_bpf_task_running(p);
-			goto out_kick;
-		}
-		queue_task_to_userspace(p, prev_cpu, enq_flags);
-		goto out_kick;
-	}
-
-	/*
-	 * Always force a CPU wakeup, so that the allocated CPU can be
-	 * released and go back idle even if the task isn't directly
-	 * dispatched.
-	 */
-	prev_cpu = cpu;
-	is_wakeup = true;
-
-	/*
-	 * Bounce the task to the user-space scheduler if we can't directly
-	 * dispatch to the selected CPU.
-	 */
-	if (!can_direct_dispatch(cpu)) {
-		if (try_local_fastpath(p, cpu, enq_flags))
-			goto out_kick;
-		queue_task_to_userspace(p, prev_cpu, enq_flags);
-		goto out_kick;
-	}
-
-	/*
-	 * We can race with a dequeue here and the selected idle CPU might
-	 * be not valid anymore, if the task affinity has changed.
-	 *
-	 * In this case just wakeup the picked CPU and ignore the enqueue,
-	 * another enqueue event for the same task will be received later.
-	 */
-	if (!bpf_cpumask_test_cpu(cpu, p->cpus_ptr))
-		goto out_kick;
-
-	/*
-	 * Directly dispatch the task to selected idle CPU (queued wakeup).
-	 */
-	scx_bpf_dsq_insert_vtime(p, cpu_to_dsq(cpu),
-				 slice_ns, p->scx.dsq_vtime, enq_flags);
+	scx_bpf_dsq_insert_vtime(p, server_mode ? SHARED_DSQ : cpu_to_dsq(prev_cpu),
+				 task_slice(p, prev_cpu), task_dl(p, prev_cpu, tctx), enq_flags);
 	__sync_fetch_and_add(&nr_kernel_dispatches, 1);
 
-out_kick:
+out:
 	/*
 	 * Wakeup the task's CPU if needed.
 	 */
-	if (is_wakeup)
+	if (should_kick)
 		scx_bpf_kick_cpu(prev_cpu, SCX_KICK_IDLE);
 }
 
@@ -927,6 +889,8 @@ static long handle_dispatched_task(struct bpf_dynptr *dynptr, void *context)
  */
 void BPF_STRUCT_OPS(rustland_dispatch, s32 cpu, struct task_struct *prev)
 {
+	struct task_struct *local, *shared;
+
 	/*
 	 * Consume all tasks from the @dispatched list and immediately
 	 * dispatch them on the target CPU decided by the user-space
@@ -946,16 +910,22 @@ void BPF_STRUCT_OPS(rustland_dispatch, s32 cpu, struct task_struct *prev)
 		return;
 
 	/*
-	 * Consume a task from the per-CPU DSQ.
+	 * Pick the earliest deadline between the local DSQ and the shared
+	 * overflow DSQ.
 	 */
-	if (scx_bpf_dsq_move_to_local(cpu_to_dsq(cpu)))
-		return;
-
-	/*
-	 * Consume a task from the shared DSQ.
-	 */
-	if (scx_bpf_dsq_move_to_local(SHARED_DSQ))
-		return;
+	local = __COMPAT_scx_bpf_dsq_peek(cpu_to_dsq(cpu));
+	shared = __COMPAT_scx_bpf_dsq_peek(SHARED_DSQ);
+	if (!is_deadline_min(shared, local)) {
+		if (local && scx_bpf_dsq_move_to_local(cpu_to_dsq(cpu)))
+			return;
+		if (shared && scx_bpf_dsq_move_to_local(SHARED_DSQ))
+			return;
+	} else {
+		if (shared && scx_bpf_dsq_move_to_local(SHARED_DSQ))
+			return;
+		if (local && scx_bpf_dsq_move_to_local(cpu_to_dsq(cpu)))
+			return;
+	}
 
 	/*
 	 * If the current task expired its time slice and no other task
@@ -967,11 +937,12 @@ void BPF_STRUCT_OPS(rustland_dispatch, s32 cpu, struct task_struct *prev)
 	 */
 	if (prev && is_queued(prev) &&
 	    (!is_usersched_task(prev) || usersched_has_pending_tasks()))
-		prev->scx.slice = slice_ns;
+		prev->scx.slice = task_slice(prev, cpu);
 }
 
 void BPF_STRUCT_OPS(rustland_runnable, struct task_struct *p, u64 enq_flags)
 {
+	u64 now = bpf_ktime_get_ns(), delta_t;
 	struct task_ctx *tctx;
 
 	if (is_usersched_task(p))
@@ -982,6 +953,11 @@ void BPF_STRUCT_OPS(rustland_runnable, struct task_struct *p, u64 enq_flags)
 		return;
 
 	tctx->exec_runtime = 0;
+	tctx->awake_vtime = 0;
+	delta_t = now > tctx->last_woke_at ? now - tctx->last_woke_at : 1;
+	tctx->wakeup_freq = update_freq(tctx->wakeup_freq, delta_t);
+	tctx->wakeup_freq = MIN(tctx->wakeup_freq, MAX_WAKEUP_FREQ);
+	tctx->last_woke_at = now;
 }
 
 /*
@@ -989,8 +965,8 @@ void BPF_STRUCT_OPS(rustland_runnable, struct task_struct *p, u64 enq_flags)
  */
 void BPF_STRUCT_OPS(rustland_running, struct task_struct *p)
 {
-	s32 cpu = scx_bpf_task_cpu(p);
 	struct task_ctx *tctx;
+	s32 cpu = scx_bpf_task_cpu(p);
 
 	if (is_usersched_task(p)) {
 		usersched_last_run_at = scx_bpf_now();
@@ -1009,6 +985,10 @@ void BPF_STRUCT_OPS(rustland_running, struct task_struct *p)
 	if (!tctx)
 		return;
 	tctx->start_ts = scx_bpf_now();
+	tctx->last_run_at = bpf_ktime_get_ns();
+
+	if (time_before(vtime_now, p->scx.dsq_vtime))
+		vtime_now = p->scx.dsq_vtime;
 }
 
 /*
@@ -1017,13 +997,13 @@ void BPF_STRUCT_OPS(rustland_running, struct task_struct *p)
 void BPF_STRUCT_OPS(rustland_stopping, struct task_struct *p, bool runnable)
 {
 	u64 now = scx_bpf_now();
-	s32 cpu = scx_bpf_task_cpu(p);
+	u64 slice, delta_vtime;
 	struct task_ctx *tctx;
 
 	if (is_usersched_task(p))
 		return;
 
-	dbg_msg("stop: pid=%d (%s) cpu=%ld", p->pid, p->comm, cpu);
+	dbg_msg("stop: pid=%d (%s) cpu=%ld", p->pid, p->comm, scx_bpf_task_cpu(p));
 
 	__sync_fetch_and_sub(&nr_running, 1);
 
@@ -1035,7 +1015,13 @@ void BPF_STRUCT_OPS(rustland_stopping, struct task_struct *p, bool runnable)
 	/*
 	 * Update the partial execution time since last sleep.
 	 */
+	slice = now - tctx->last_run_at;
 	tctx->exec_runtime += now - tctx->start_ts;
+	tctx->avg_runtime = calc_avg(tctx->avg_runtime, slice);
+
+	delta_vtime = scale_by_task_weight_inverse(p, slice);
+	p->scx.dsq_vtime += delta_vtime;
+	tctx->awake_vtime += delta_vtime;
 
 	/* Production path: keep ops.stopping minimal. */
 }
@@ -1045,8 +1031,8 @@ void BPF_STRUCT_OPS(rustland_stopping, struct task_struct *p, bool runnable)
  */
 void BPF_STRUCT_OPS(rustland_enable, struct task_struct *p)
 {
-	p->scx.dsq_vtime = 0;
-	p->scx.slice = slice_ns;
+	p->scx.dsq_vtime = vtime_now;
+	p->scx.slice = MAX(slice_ns, slice_min_ns);
 }
 
 /*

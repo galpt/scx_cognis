@@ -10,6 +10,7 @@ use std::rc::Rc;
 use crate::bpf_intf;
 use crate::bpf_intf::*;
 use crate::bpf_skel::*;
+use crate::BpfProfile;
 
 use std::ffi::c_int;
 use std::ffi::c_ulong;
@@ -60,8 +61,10 @@ pub const RL_CPU_ANY: i32 = bpf_intf::RL_CPU_ANY as i32;
 /// Overview
 /// ========
 ///
-/// The main BPF interface is provided by the BpfScheduler() struct. When this object is
-/// initialized it will take care of registering and initializing the BPF component.
+/// The main BPF interface is provided by the `BpfScheduler` struct. When this object is
+/// initialized it registers the BPF component, wires profile knobs into rodata,
+/// and keeps the legacy userspace queue/dispatch rings available for the
+/// narrow compatibility path.
 ///
 /// The scheduler then can use BpfScheduler() instance to receive tasks (in the form of QueuedTask
 /// objects) and dispatch tasks (in the form of DispatchedTask objects), using respectively the
@@ -199,7 +202,7 @@ impl<'cb> BpfScheduler<'cb> {
         partial: bool,
         debug: bool,
         builtin_idle: bool,
-        slice_ns: u64,
+        profile: &BpfProfile,
         name: &str,
     ) -> Result<Self> {
 
@@ -234,7 +237,12 @@ impl<'cb> BpfScheduler<'cb> {
         skel.struct_ops.rustland_mut().exit_dump_len = exit_dump_len;
         rodata.usersched_pid = std::process::id();
         rodata.builtin_idle = builtin_idle;
-        rodata.slice_ns = slice_ns;
+        rodata.slice_ns = profile.slice_ns;
+        rodata.slice_min_ns = profile.slice_min_ns;
+        rodata.slice_lag_ns = profile.slice_lag_ns;
+        rodata.no_wake_sync = profile.no_wake_sync;
+        rodata.sticky_tasks = profile.sticky_tasks;
+        rodata.server_mode = profile.is_server();
         rodata.debug = debug;
         let _ = Self::set_scx_ops_name(&mut skel.struct_ops.rustland_mut().name, name);
 
@@ -382,7 +390,9 @@ impl<'cb> BpfScheduler<'cb> {
     // busy loop, causing unnecessary high CPU consumption.
     pub fn notify_complete(&mut self, nr_pending: u64) {
         self.skel.maps.bss_data.as_mut().unwrap().nr_scheduled = nr_pending;
-        std::thread::yield_now();
+        if nr_pending > 0 {
+            std::thread::yield_now();
+        }
     }
 
     // Counter of the online CPUs.

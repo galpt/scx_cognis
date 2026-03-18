@@ -3,8 +3,9 @@
 //
 // scx_cognis — BPF-first CPU Scheduler
 //
-// Built on scx_rustland_core (sched_ext), this scheduler keeps the common case
-// in BPF and uses a deliberately small userspace fallback when backlog builds:
+// Cognis v2 keeps the scheduling policy in BPF and uses Rust as the control
+// plane for loading, stats, restart handling, and a narrow compatibility
+// fallback when work intentionally crosses into userspace:
 //
 //   ┌─────────────────────────────────────────────────────────────────────┐
 //   │  ops.enqueue    → BPF local fast path below saturation               │
@@ -15,11 +16,13 @@
 //   │  housekeeping   → slice-base refresh + observability cleanup         │
 //   └─────────────────────────────────────────────────────────────────────┘
 //
-// All hot-path data structures are fixed-size and allocated once at startup:
-// no HashMap, BTreeSet, or per-event heap allocations on the scheduling path.
+// All scheduler-owned data structures are fixed-size and allocated once at
+// startup: no HashMap, BTreeSet, or per-event heap allocations on the
+// scheduling path.
 //
-// The BPF dispatcher (provided by scx_rustland_core) is completely agnostic
-// of this scheduling policy; only this Rust file implements the logic.
+// The current implementation still uses scx_rustland_core as the userspace
+// scaffold around sched_ext, but the policy shape is intentionally closer to
+// bpfland/lavd: BPF owns placement and deadline ordering for the common case.
 
 mod bpf_skel;
 pub use bpf_skel::*;
@@ -45,7 +48,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Context;
 use anyhow::Result;
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use libbpf_rs::OpenObject;
 use log::{debug, info, warn};
 use procfs::process::Process;
@@ -66,34 +69,64 @@ use tui::SharedState;
 const SCHEDULER_NAME: &str = "Cognis";
 const NSEC_PER_USEC: u64 = 1_000;
 const NSEC_PER_SEC: u64 = 1_000_000_000;
+const DEFAULT_DESKTOP_SLICE_NS: u64 = 6_000_000;
+const DEFAULT_SERVER_SLICE_NS: u64 = 8_000_000;
+const DEFAULT_DESKTOP_SLICE_MIN_NS: u64 = 500_000;
+const DEFAULT_SERVER_SLICE_MIN_NS: u64 = 1_000_000;
+const DEFAULT_DESKTOP_SLICE_LAG_NS: u64 = 4_000_000;
+const DEFAULT_SERVER_SLICE_LAG_NS: u64 = 1_500_000;
+const IDLE_BACKOFF: Duration = Duration::from_micros(250);
 const RESTART_BACKOFF: Duration = Duration::from_millis(250);
 const RAPID_FAILURE_WINDOW: Duration = Duration::from_secs(30);
 const RAPID_FAILURE_LIMIT: u32 = 20;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum SchedulerMode {
+    Desktop,
+    Server,
+}
+
+impl SchedulerMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            SchedulerMode::Desktop => "desktop",
+            SchedulerMode::Server => "server",
+        }
+    }
+}
 
 // ── CLI Options ────────────────────────────────────────────────────────────
 
 /// scx_cognis: a BPF-first CPU scheduler with a minimal userspace fallback.
 ///
-/// Scheduling pipeline: a BPF local fast path for lightly loaded wakeups,
-/// then a small userspace scheduler which assigns a load-driven slice,
-/// preserves weighted virtual fairness, and grants a bounded wakeup credit to
-/// recent sleepers. Kernel workers stay pinned to their affinity CPU.
+/// Scheduling pipeline: a BPF local/shared DSQ policy owns normal dispatch,
+/// while Rust stays available for stats, restart handling, and a narrow
+/// compatibility fallback path.
 #[derive(Debug, Parser)]
 struct Opts {
-    /// Base scheduling slice duration in microseconds.
+    /// Maximum scheduling slice duration in microseconds.
     ///
-    /// Set to 0 (default) to let the scheduler auto-compute the slice ceiling
-    /// from system load: `targeted_latency (6 ms) / nr_runnable_tasks_per_cpu`.
-    /// This is the recommended mode — no manual tuning required.
+    /// Set to 0 (default) to use the active profile default:
+    /// desktop = 6000 µs, server = 8000 µs.
     ///
-    /// Set to a non-zero value to pin the maximum slice to that value, overriding
-    /// the auto-computed ceiling.  Useful for tuning latency budgets on specific hardware.
+    /// This acts as the BPF-side slice ceiling and the userspace fallback
+    /// slice reference.
     #[clap(short = 's', long, default_value = "0")]
     slice_us: u64,
 
     /// Minimum scheduling slice duration in microseconds.
-    #[clap(short = 'S', long, default_value = "1000")]
+    ///
+    /// Set to 0 (default) to use the active profile default:
+    /// desktop = 500 µs, server = 1000 µs.
+    #[clap(short = 'S', long, default_value = "0")]
     slice_us_min: u64,
+
+    /// Scheduling profile.
+    ///
+    /// `desktop` favors wake responsiveness, locality, and sticky short bursts.
+    /// `server` favors shared overflow and steadier throughput under saturation.
+    #[clap(long, value_enum, default_value = "desktop")]
+    mode: SchedulerMode,
 
     /// If set, per-CPU tasks are dispatched directly to their only eligible CPU.
     #[clap(short = 'l', long, action = clap::ArgAction::SetTrue)]
@@ -135,13 +168,70 @@ struct Opts {
     pub libbpf: LibbpfOpts,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct BpfProfile {
+    mode: SchedulerMode,
+    slice_ns: u64,
+    slice_min_ns: u64,
+    slice_lag_ns: u64,
+    no_wake_sync: bool,
+    sticky_tasks: bool,
+}
+
+impl BpfProfile {
+    fn from_opts(opts: &Opts) -> Self {
+        let (default_slice_ns, default_min_ns, default_lag_ns, no_wake_sync, sticky_tasks) =
+            match opts.mode {
+                SchedulerMode::Desktop => (
+                    DEFAULT_DESKTOP_SLICE_NS,
+                    DEFAULT_DESKTOP_SLICE_MIN_NS,
+                    DEFAULT_DESKTOP_SLICE_LAG_NS,
+                    false,
+                    true,
+                ),
+                SchedulerMode::Server => (
+                    DEFAULT_SERVER_SLICE_NS,
+                    DEFAULT_SERVER_SLICE_MIN_NS,
+                    DEFAULT_SERVER_SLICE_LAG_NS,
+                    true,
+                    false,
+                ),
+            };
+
+        let slice_ns = if opts.slice_us > 0 {
+            opts.slice_us.saturating_mul(NSEC_PER_USEC)
+        } else {
+            default_slice_ns
+        };
+        let slice_min_ns = if opts.slice_us_min > 0 {
+            opts.slice_us_min.saturating_mul(NSEC_PER_USEC)
+        } else {
+            default_min_ns
+        };
+
+        Self {
+            mode: opts.mode,
+            slice_ns: slice_ns.max(slice_min_ns),
+            slice_min_ns,
+            slice_lag_ns: default_lag_ns,
+            no_wake_sync,
+            sticky_tasks,
+        }
+    }
+
+    fn is_server(self) -> bool {
+        matches!(self.mode, SchedulerMode::Server)
+    }
+}
+
 // ── Task record ────────────────────────────────────────────────────────────
 
 /// A task in the user-space scheduler queues.
 ///
-/// Tasks are partitioned into per-label FIFO rings. `deadline` is retained for
-/// dispatch-time vtime handoff to BPF, while queue ordering stays O(1):
-/// RealTime > Interactive > IoWait > Unknown > Compute, FIFO within each band.
+/// The compatibility fallback keeps only three effective lanes:
+/// RT, wake-boosted, and general fair. `label` is retained for fallback
+/// observability and minor wake-sensitive decisions, while `deadline` is used
+/// for dispatch-time vtime handoff back into BPF.
 #[derive(Debug, PartialEq, Clone)]
 struct Task {
     qtask: QueuedTask,
@@ -210,6 +300,7 @@ const FIB32_MAIN: u32 = 2_654_435_769;
 struct Scheduler<'a> {
     bpf: BpfScheduler<'a>,
     opts: &'a Opts,
+    profile: BpfProfile,
     stats_server: StatsServer<(), Metrics>,
 
     // Userspace fallback lanes:
@@ -296,15 +387,10 @@ impl<'a> Scheduler<'a> {
         shutdown: Arc<AtomicBool>,
     ) -> Result<Self> {
         let stats_server = StatsServer::new(stats::server_data()).launch()?;
+        let profile = BpfProfile::from_opts(opts);
 
-        // When --slice-us is 0 (the default), auto mode derives the slice from
-        // current runnable load and the targeted latency budget.
-        //
-        // When --slice-us > 0, the user has chosen an explicit ceiling; we use
-        // it as the reference for vruntime fairness and as an upper bound on
-        // the load-derived slice.
-        let base_slice_ns = opts.slice_us * NSEC_PER_USEC; // 0 when auto mode
-        let slice_ns_min = opts.slice_us_min * NSEC_PER_USEC;
+        let base_slice_ns = profile.slice_ns;
+        let slice_ns_min = profile.slice_min_ns;
 
         let slice_controller = SliceController::new(base_slice_ns);
         let initial_assigned_slice_ns = slice_controller.read_slice_ns();
@@ -317,7 +403,7 @@ impl<'a> Scheduler<'a> {
             opts.partial,
             opts.verbose,
             true,
-            slice_ns_min,
+            &profile,
             "cognis",
         )?;
 
@@ -341,15 +427,17 @@ impl<'a> Scheduler<'a> {
         };
 
         debug!(
-            "{} version {} — scx_rustland_core {}",
+            "{} version {} — mode={} — scx_rustland_core {}",
             SCHEDULER_NAME,
             build_id::full_version(env!("CARGO_PKG_VERSION")),
+            profile.mode.as_str(),
             scx_rustland_core::VERSION
         );
 
         Ok(Self {
             bpf,
             opts,
+            profile,
             stats_server,
             boosted_interactive_queue: TaskQueue::with_capacity(QUEUE_DEPTH),
             rt_queue: TaskQueue::with_capacity(QUEUE_DEPTH),
@@ -836,30 +924,13 @@ impl<'a> Scheduler<'a> {
         // denominator for cpu_intensity (= burst_ns / prev_slice_ns).
         //
         // On the very first event for a new PID there is no lifetime entry yet.
-        // Fallback selection:
-        //   • manual mode (base_slice_ns > 0): use the user-configured ceiling.
-        //   • auto mode   (base_slice_ns == 0): use the policy's current auto
-        //     slice (at least 1 ms).  Using 0 as denominator makes
-        //     cpu_intensity = clamp(burst_ns / 1, 0, 1) ≈ 1.0 for every
-        //     long-running process on its first event, causing the classifier
-        //     to label them all as Compute (cpu_intensity > 0.85, exec_ratio
-        //     driven low by accumulated exec_runtime).  kwin_wayland, browsers,
-        //     and other high-value interactive tasks then start life in the
-        //     lowest-priority bucket, compounding any existing per-CPU DSQ lag.
+        // Fall back to the configured profile slice ceiling, clamped to at
+        // least 1 ms so cpu_intensity remains meaningful on fresh tasks.
         let prev_slice_ns = self
             .lifetime_get(task.pid)
             .filter(|lt| lt.last_slice_ns > 0)
             .map(|lt| lt.last_slice_ns)
-            .unwrap_or_else(|| {
-                if self.base_slice_ns > 0 {
-                    self.base_slice_ns
-                } else {
-                    // auto mode: clamp to at least 1 ms so cpu_intensity is meaningful.
-                    self.slice_controller
-                        .auto_base_ns
-                        .max(NSEC_PER_USEC * 1_000)
-                }
-            });
+            .unwrap_or_else(|| self.base_slice_ns.max(NSEC_PER_USEC * 1_000));
         let recent_sleep_ns = self
             .lifetime_get(task.pid)
             .map(|lt| Self::recent_sleep_gap_ns(lt.last_stop_ts, task.start_ts))
@@ -888,11 +959,7 @@ impl<'a> Scheduler<'a> {
 
         // Load-adjusted deterministic base slice.
         let ai_slice = self.slice_controller.read_slice_ns();
-        let ref_base = if self.base_slice_ns > 0 {
-            self.base_slice_ns
-        } else {
-            self.slice_controller.auto_base_ns
-        };
+        let ref_base = self.base_slice_ns;
 
         // Research-driven userspace fallback:
         //   - one pressure-based base slice
@@ -1240,10 +1307,10 @@ impl<'a> Scheduler<'a> {
             nr_unknown: self.label_counts[TaskLabel::Unknown as usize],
             nr_quarantined: quarantined_count,
             nr_flagged: self.trust.flagged_count(),
-            base_slice_us: self.slice_controller.read_slice_ns() / NSEC_PER_USEC,
+            base_slice_us: self.profile.slice_ns / NSEC_PER_USEC,
             assigned_slice_us: self.assigned_slice_ema_ns / NSEC_PER_USEC,
-            slice_min_us: self.slice_controller.read_min() / NSEC_PER_USEC,
-            slice_max_us: self.slice_controller.read_max() / NSEC_PER_USEC,
+            slice_min_us: self.profile.slice_min_ns / NSEC_PER_USEC,
+            slice_max_us: self.profile.slice_ns / NSEC_PER_USEC,
             inference_us: avg_inference_us as u64,
             sched_p50_us: p50_us,
             sched_p95_us: p95_us,
@@ -1353,9 +1420,16 @@ impl<'a> Scheduler<'a> {
         let mut last_housekeeping = Instant::now();
 
         while !self.bpf.exited() {
-            // Core dispatch: classify tasks, fill BPF dispatch ring, notify.
-            // Must never stall — sched_ext watchdog fires if too slow.
-            self.schedule();
+            let has_userspace_work = !self.tasks_empty()
+                || *self.bpf.nr_queued_mut() > 0
+                || *self.bpf.nr_scheduled_mut() > 0;
+
+            // Only run the compatibility fallback loop when work actually
+            // crossed into userspace. Otherwise stay out of the way and let
+            // the BPF-owned policy run without a busy Rust spin loop.
+            if has_userspace_work {
+                self.schedule();
+            }
             self.drain_exited_tasks(128);
 
             // Stats: non-blocking try_recv so a disconnected client can't
@@ -1408,6 +1482,10 @@ impl<'a> Scheduler<'a> {
             }
             if self.tui_quit {
                 break;
+            }
+
+            if !has_userspace_work {
+                std::thread::sleep(IDLE_BACKOFF);
             }
         }
 

@@ -3,7 +3,7 @@ name = "scx_cognis"
 version = "1.6.0"
 authors = ["scx_cognis contributors"]
 edition = "2021"
-description = "Adaptive, sched_ext-based, user-space Linux CPU scheduler for desktop responsiveness"
+description = "BPF-first sched_ext CPU scheduler for desktops, workstations, and servers"
 license = "GPL-2.0-only"
 repository = "https://github.com/galpt/scx_cognis"
 

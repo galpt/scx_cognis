@@ -26,6 +26,11 @@ jobs:
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
 
+      - name: shell syntax check
+        run: |
+          sh -n install.sh
+          sh -n uninstall.sh
+
   # ──────────────────────────────────────────────────────────────────────────
   # Test: run all unit tests (no kernel or root required)
   # ──────────────────────────────────────────────────────────────────────────

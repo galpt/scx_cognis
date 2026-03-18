@@ -24,15 +24,15 @@ pub struct Metrics {
     pub nr_cpus: u64,
     #[stat(desc = "Tasks currently running")]
     pub nr_running: u64,
-    #[stat(desc = "Tasks queued to user-space scheduler")]
+    #[stat(desc = "Tasks queued to the userspace compatibility fallback")]
     pub nr_queued: u64,
-    #[stat(desc = "Tasks waiting in user-space to be dispatched")]
+    #[stat(desc = "Tasks still waiting inside the userspace compatibility fallback")]
     pub nr_scheduled: u64,
     #[stat(desc = "Major page faults in the scheduler process (non-zero = swap pressure)")]
     pub nr_page_faults: u64,
-    #[stat(desc = "Tasks dispatched by user-space scheduler")]
+    #[stat(desc = "Tasks dispatched by the userspace compatibility fallback")]
     pub nr_user_dispatches: u64,
-    #[stat(desc = "Tasks dispatched directly by the kernel")]
+    #[stat(desc = "Tasks dispatched directly by the BPF scheduler")]
     pub nr_kernel_dispatches: u64,
     #[stat(desc = "Cancelled dispatches")]
     pub nr_cancel_dispatches: u64,
@@ -44,37 +44,37 @@ pub struct Metrics {
     pub nr_sched_congested: u64,
 
     // ── Scheduling policy metrics ──────────────────────────────────────────
-    #[stat(desc = "Tasks classified as Interactive")]
+    #[stat(desc = "Fallback events labeled Interactive")]
     pub nr_interactive: u64,
-    #[stat(desc = "Tasks classified as Compute")]
+    #[stat(desc = "Fallback events labeled Compute")]
     pub nr_compute: u64,
-    #[stat(desc = "Tasks classified as I/O Wait")]
+    #[stat(desc = "Fallback events labeled I/O Wait")]
     pub nr_iowait: u64,
-    #[stat(desc = "Tasks classified as RealTime")]
+    #[stat(desc = "Fallback events labeled RealTime")]
     pub nr_realtime: u64,
     #[stat(
         desc = "Tasks classified as Unknown (reserved bucket; normally zero with the current heuristic)"
     )]
     pub nr_unknown: u64,
-    #[stat(desc = "PIDs currently quarantined by the trust engine")]
+    #[stat(desc = "PIDs currently below the observability trust threshold")]
     pub nr_quarantined: u64,
-    #[stat(desc = "PIDs flagged by the anomaly detection system")]
+    #[stat(desc = "PIDs with repeated adverse exit observations")]
     pub nr_flagged: u64,
-    #[stat(desc = "Current global slice-base from the load-driven controller (µs)")]
+    #[stat(desc = "Configured BPF profile slice ceiling (µs)")]
     pub base_slice_us: u64,
-    #[stat(desc = "Recent EMA of final per-task assigned slices after adjustments (µs)")]
+    #[stat(desc = "Recent EMA of fallback-assigned per-task slices (µs)")]
     pub assigned_slice_us: u64,
-    #[stat(desc = "Current minimum slice clamp (µs)")]
+    #[stat(desc = "Configured BPF profile minimum slice (µs)")]
     pub slice_min_us: u64,
-    #[stat(desc = "Current maximum slice clamp (µs)")]
+    #[stat(desc = "Configured BPF profile maximum slice (µs)")]
     pub slice_max_us: u64,
-    #[stat(desc = "Average per-event scheduling pipeline latency (µs)")]
+    #[stat(desc = "Average userspace fallback scheduling latency (µs)")]
     pub inference_us: u64,
-    #[stat(desc = "Scheduling pipeline latency p50 (µs)")]
+    #[stat(desc = "Userspace fallback scheduling latency p50 (µs)")]
     pub sched_p50_us: u64,
-    #[stat(desc = "Scheduling pipeline latency p95 (µs)")]
+    #[stat(desc = "Userspace fallback scheduling latency p95 (µs)")]
     pub sched_p95_us: u64,
-    #[stat(desc = "Scheduling pipeline latency p99 (µs)")]
+    #[stat(desc = "Userspace fallback scheduling latency p99 (µs)")]
     pub sched_p99_us: u64,
 }
 
@@ -89,76 +89,49 @@ impl Metrics {
         let compute_heavy = classified > 0 && self.nr_compute > classified / 2;
         let interactive_heavy = classified > 0 && self.nr_interactive > classified / 2;
 
-        // ── Worst ──────────────────────────────────────────────────────────
-        // Scheduler itself is being paged out — immediate latency spike.
         if self.nr_page_faults > 0 {
-            return "I'm being swapped out! Latency will spike — check available RAM!";
+            return "Scheduler hit major page faults; check memory pressure.";
         }
-        // Any dispatch failure means a kernel/BPF-level error.
         if self.nr_failed_dispatches > 0 {
-            return "Dispatch failures detected! Something unexpected went wrong — check dmesg.";
+            return "Dispatch failures detected; inspect dmesg.";
         }
-        // Many rule-breakers caught simultaneously.
-        if self.nr_flagged > 5 && self.nr_quarantined > 5 {
-            return "Under siege! Multiple rule-breakers caught and caged — enforcing order.";
+        if self.nr_queued > 0 || self.nr_scheduled > 0 {
+            return "Userspace fallback is active; BPF fast path is not covering this load.";
         }
-        // Anti-cheat engine fired.
-        if self.nr_flagged > 0 {
-            return "Suspicious behaviour detected! Isolating troublemakers — your system is protected.";
-        }
-        // Multiple greedy tasks throttled by reputation engine.
-        if self.nr_quarantined > 3 {
-            return "Several greedy tasks are throttled — keeping them from hogging your CPU.";
-        }
-        // At least one greedy task quarantined.
-        if self.nr_quarantined > 0 {
-            return "Caught a greedy task! Putting it on a leash so other tasks can breathe.";
-        }
-        // Heavy congestion in the scheduler queue.
-        if self.nr_sched_congested > 10 {
-            return "Oh boy! Things are getting really busy. Tightening the reins...";
-        }
-        // Mild congestion.
         if self.nr_sched_congested > 0 {
-            return "Getting a little crowded in here, but I've got it handled.";
+            return "Compatibility fallback is congested; BPF-side dispatch needs attention.";
         }
-        // ── Middle ground ──────────────────────────────────────────────────
-        // High load, compute-dominated.
+        if self.nr_flagged > 0 || self.nr_quarantined > 0 {
+            return "Observability watchlist has active PIDs; review repeated adverse exits.";
+        }
+        if load >= 0.90 && self.nr_kernel_dispatches > 0 {
+            return "System saturated; BPF local/shared queues are carrying the load.";
+        }
         if load >= 0.85 && compute_heavy {
-            return "Your CPU is at full throttle! Giving compute tasks the runway they need.";
+            return "Heavy compute load detected; watch fallback activity and tail latency.";
         }
-        // High load, interactive-dominated.
         if load >= 0.85 && interactive_heavy {
-            return "Busy but responsive! Juggling lots of interactive tasks like a pro.";
+            return "Interactive-heavy load is running hot; check frame pacing and wake behavior.";
         }
-        // High overall load, mixed workload.
         if load >= 0.85 {
-            return "Running hot! Balancing a heavy mixed workload across all cores.";
+            return "Heavy mixed load; BPF fast path is still the primary scheduler.";
         }
-        // Moderate-high load.
         if load >= 0.65 {
-            return "A solid workload — distributing tasks evenly and keeping things smooth.";
+            return "Moderate load; locality and overflow balancing look nominal.";
         }
-
-        // ── Best ───────────────────────────────────────────────────────────
-        // Mostly interactive, low-to-moderate load.
         if interactive_heavy && load < 0.5 {
-            return "Rest assured! I'm keeping your system responsive.";
+            return "Mostly interactive load; BPF wakeup path is staying responsive.";
         }
-        // Compute in progress but not overloaded.
         if compute_heavy && load < 0.65 {
-            return "Compute tasks are in full swing — prioritising steady progress while preserving responsiveness where possible.";
+            return "Compute work is present without saturation.";
         }
-        // Balanced mix under control.
-        if load < 0.5 {
-            return "Balancing work steadily — nothing to worry about.";
-        }
-        // System mostly idle (cold start or light desktop).
         if load < 0.1 {
-            return "System is mostly idle. Just here waiting to help!";
+            return "System mostly idle.";
         }
-        // Default: nominal operation.
-        "Keeping an eye on things — all nominal."
+        if load < 0.5 {
+            return "Balanced light load; BPF fast path is in control.";
+        }
+        "Scheduler healthy."
     }
 
     pub fn format<W: Write>(&self, w: &mut W) -> Result<()> {
@@ -200,7 +173,7 @@ impl Metrics {
 
         writeln!(
             w,
-            "             🧠 Interactive:{:<4} Compute:{:<4} IOwait:{:<4} RT:{:<4} Unknown:{:<4} | quarantine:{} flagged:{} | slice(base/assigned):{}/{}µs",
+            "             fallback labels(I/C/IO/RT/U): {}/{}/{}/{}/{} | watchlist:{}/{} | slice(base/assigned):{}/{}µs",
             self.nr_interactive,
             self.nr_compute,
             self.nr_iowait,

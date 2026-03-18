@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 pub struct SliceController {
     /// Current slice recommendation (nanoseconds).
     current_slice_ns: u64,
-    /// User-configured base slice ceiling (0 = auto mode only).
+    /// Profile or CLI-configured slice ceiling used as the fallback cap.
     base_slice_ns: u64,
     /// Auto-computed slice ceiling derived from runnable load.
     pub auto_base_ns: u64,
@@ -85,16 +85,6 @@ impl SliceController {
 
     pub fn read_slice_ns(&self) -> u64 {
         self.current_slice_ns
-    }
-
-    /// Read adaptive min cap (ns).
-    pub fn read_min(&self) -> u64 {
-        self.min_ns
-    }
-
-    /// Read adaptive max cap (ns).
-    pub fn read_max(&self) -> u64 {
-        self.max_ns
     }
 
     /// Record a scheduling pipeline latency sample (ns). This is designed to be

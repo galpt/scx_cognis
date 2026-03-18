@@ -41,3 +41,8 @@ jobs:
           restore-keys: cachyos-cargo-check-
       - name: cargo check
         run: cargo check --locked --all
+
+      - name: shell syntax check
+        run: |
+          sh -n install.sh
+          sh -n uninstall.sh

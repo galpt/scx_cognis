@@ -13,7 +13,7 @@
 #   --dry-run             Print every action that would be taken; make no changes
 #   --force               Skip all confirmation prompts
 #   --flags "..."         Custom scheduler flags written to /etc/default/scx
-#                         (default: empty — scheduler uses its own defaults)
+#                         (default: --mode desktop)
 #   --help, -h            Print this help text and exit
 
 set -e
@@ -26,12 +26,13 @@ SCX_DEFAULTS="/etc/default/scx"
 SYSTEMD_SERVICE="/etc/systemd/system/${SERVICE_NAME}.service"
 REPO_URL="https://github.com/galpt/scx_cognis"
 TARBALL_NAME="${BINARY_NAME}-linux-x86_64.tar.gz"
+DEFAULT_SCX_FLAGS="--mode desktop"
 
 VERSION="latest"
 BUILD_FROM_SOURCE=""
 DRY_RUN=""
 FORCE=""
-SCX_FLAGS="${SCX_FLAGS:-}"
+SCX_FLAGS="${SCX_FLAGS:-$DEFAULT_SCX_FLAGS}"
 
 # ─── CLI parsing ───────────────────────────────────────────────────────────────
 while [ "$#" -gt 0 ]; do
@@ -306,7 +307,7 @@ SVCEOF
 
 # ─── /etc/default/scx configuration ─────────────────────────────────────────
 configure_scx_defaults() {
-    _flags="${SCX_FLAGS:-}"
+    _flags="${SCX_FLAGS:-$DEFAULT_SCX_FLAGS}"
     log_info "Configuring ${SCX_DEFAULTS} ..."
 
     # Already configured by us — just refresh the flags line in-place, no backup.
@@ -482,6 +483,7 @@ main() {
     echo ""
     log_info "Binary        : ${BINARY_PATH}"
     log_info "Defaults      : ${SCX_DEFAULTS}"
+    log_info "Default flags : ${SCX_FLAGS:-$DEFAULT_SCX_FLAGS}"
     echo ""
     log_info "── Verify it is running ──────────────────────────────────────"
     log_info "  Service status : systemctl status scx"

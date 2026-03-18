@@ -6,10 +6,10 @@
 // Renders six panels:
 //   1. Header (scheduler name, live CPU/queued/base-slice counts).
 //   2. System overview (running/queued tasks, CPUs, dispatch/congestion stats).
-//   3. Task classification breakdown (interactive/compute/io/rt gauges).
-//   4. Slice control state (base slice, recent assigned slice, inference latency).
-//   5. Inference latency chart (rolling 120-sample line chart).
-//   6. Trust watchlist — flagged/quarantined processes.
+//   3. Userspace fallback event mix (interactive/compute/io/rt gauges).
+//   4. Profile and fallback slice state.
+//   5. Fallback latency chart (rolling 120-sample line chart).
+//   6. PID watchlist from exit-observation tracking.
 //
 // All history buffers use HistoryRing — a fixed-size circular array that
 // never reallocates after init (zero-alloc after DashboardState creation).
@@ -217,7 +217,7 @@ pub fn draw(frame: &mut Frame, state: &DashboardState) {
         .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
         .split(root[1]);
 
-    // Left column: overview + classification + slice control.
+    // Left column: overview + fallback event mix + slice state.
     let left = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -231,7 +231,7 @@ pub fn draw(frame: &mut Frame, state: &DashboardState) {
     draw_classification(frame, left[1], &state.metrics);
     draw_slice_control(frame, left[2], state);
 
-    // Right column: inference latency chart + trust watchlist.
+    // Right column: fallback latency chart + PID watchlist.
     let right = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
@@ -330,12 +330,12 @@ fn draw_classification(f: &mut Frame, area: Rect, m: &Metrics) {
         gauge_line("I/O Wait   ", m.nr_iowait, total, Color::Blue),
         gauge_line("RealTime   ", m.nr_realtime, total, Color::Magenta),
         Line::from(format!(
-            "  Quarantined PIDs:   {}   │  Flagged PIDs:  {}",
+            "  Watchlist: below-threshold={} adverse-exit={}",
             m.nr_quarantined, m.nr_flagged
         )),
     ];
     let block = Block::default().borders(Borders::ALL).title(Span::styled(
-        " Task Classification (Heuristic) ",
+        " Fallback Event Mix ",
         Style::default()
             .fg(Color::Yellow)
             .add_modifier(Modifier::BOLD),
@@ -373,9 +373,9 @@ fn draw_slice_control(f: &mut Frame, area: Rect, state: &DashboardState) {
             Span::raw("  Latency Budget:   "),
             Span::styled(
                 if state.inference_us < 10.0 {
-                    "✓ < 10µs  OK"
+                    "under 10us"
                 } else {
-                    "✗ OVER BUDGET"
+                    "over 10us"
                 },
                 Style::default().fg(if state.inference_us < 10.0 {
                     Color::Green
@@ -417,7 +417,7 @@ fn draw_latency_chart(f: &mut Frame, area: Rect, state: &DashboardState) {
     let chart = Chart::new(datasets)
         .block(
             Block::default().borders(Borders::ALL).title(Span::styled(
-                " Inference Latency (µs) ",
+                " Fallback Latency (µs) ",
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
@@ -444,7 +444,7 @@ fn draw_latency_chart(f: &mut Frame, area: Rect, state: &DashboardState) {
 
 fn draw_watchlist(f: &mut Frame, area: Rect, entries: &[WallEntry]) {
     let header = ListItem::new(Line::from(vec![Span::styled(
-        " PID     COMM                TRUST   FLAG",
+        " PID     COMM                TRUST   NOTE",
         Style::default()
             .fg(Color::White)
             .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
@@ -452,11 +452,7 @@ fn draw_watchlist(f: &mut Frame, area: Rect, entries: &[WallEntry]) {
 
     let items =
         std::iter::once(header).chain(entries.iter().take(area.height as usize - 4).map(|e| {
-            let flag = if e.is_flagged {
-                " ⚠ CHEAT"
-            } else {
-                "        "
-            };
+            let flag = if e.is_flagged { " adverse" } else { "" };
             let color = if e.trust < 0.2 {
                 Color::Red
             } else {
@@ -469,7 +465,7 @@ fn draw_watchlist(f: &mut Frame, area: Rect, entries: &[WallEntry]) {
         }));
 
     let list = List::new(items).block(Block::default().borders(Borders::ALL).title(Span::styled(
-        " Trust Watchlist ",
+        " PID Watchlist ",
         Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
     )));
     f.render_widget(list, area);

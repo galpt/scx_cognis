@@ -74,6 +74,11 @@ jobs:
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
 
+      - name: shell syntax check
+        run: |
+          sh -n install.sh
+          sh -n uninstall.sh
+
       - name: cargo test
         run: cargo test --locked --all -- --nocapture
 

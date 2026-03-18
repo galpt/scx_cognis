@@ -13,21 +13,21 @@
 //
 //   Cooperative events (yield within slice, clean exit, low fork rate)
 //     → move score toward +1.0   (positive delta, EMA update)
-//   Adversarial events (full-slice burn, cheat flag, excessive forking)
+//   Adversarial events (full-slice burn, adverse exit flag, excessive forking)
 //     → move score toward -1.0   (negative delta, EMA update)
 //
 // EMA update:  score ← clamp(score × α + delta, -1.0, +1.0)
 //
-// Quarantine threshold: score < TRUST_THRESHOLD (-0.35)
-//   → task is reported as quarantined/flagged in observability surfaces.
+// Watchlist threshold: score < TRUST_THRESHOLD (-0.35)
+//   → task is reported in observability surfaces as below-threshold.
 //
 // ── Anomaly flag design ──────────────────────────────────────────────────
 //
 // The anomaly flag is set behaviorally:
 //
-//   After 2 consecutive adversarial exits (cheat_flagged == true):
+//   After 2 consecutive adversarial exits (`cheat_flagged == true`):
 //     → `flagged[slot]` is set to true.
-//   After one clean exit (cheat_flagged == false):
+//   After one clean exit (`cheat_flagged == false`):
 //     → `cheat_streak` resets to 0, flag is cleared.
 //
 // This keeps the watchlist logic simple and transparent.
@@ -53,7 +53,7 @@ pub const TRUST_TABLE_SIZE: usize = 4096;
 const PID_EMPTY: i32 = 0;
 const PID_TOMBSTONE: i32 = -1;
 
-/// Trust score below which a PID is quarantined to restricted cores.
+/// Trust score below which a PID is reported as below-threshold in observability.
 pub const TRUST_THRESHOLD: f32 = -0.35;
 
 /// Maximum number of entries returned by `worst_actors()`.
@@ -106,7 +106,7 @@ pub struct ExitObservation {
     pub preempted: bool,
     /// Task exited cleanly with no adverse conditions.
     pub clean_exit: bool,
-    /// Task was flagged by the anomaly detection system during its lifetime.
+    /// Task lifetime ended with an adverse exit flag.
     pub cheat_flagged: bool,
     /// Number of child forks spawned during this lifetime window.
     pub fork_count: u64,
@@ -258,16 +258,12 @@ impl TrustTable {
         self.find_slot(pid).map(|s| self.scores[s]).unwrap_or(0.0)
     }
 
-    /// Whether this PID should currently be quarantined to restricted cores.
-    ///
-    /// Quarantine threshold: `trust_score < TRUST_THRESHOLD` (-0.35).
+    /// Whether this PID is currently below the observability trust threshold.
     pub fn is_quarantined(&self, pid: i32) -> bool {
         self.trust_score(pid) < TRUST_THRESHOLD
     }
 
-    /// Whether this PID has been anomaly-flagged (repeated adversarial exits).
-    ///
-    /// Replaces `AntiCheatEngine::is_flagged()`.
+    /// Whether this PID has been watchlist-flagged after repeated adverse exits.
     pub fn is_flagged(&self, pid: i32) -> bool {
         self.find_slot(pid)
             .map(|s| self.flagged[s])
@@ -275,10 +271,6 @@ impl TrustTable {
     }
 
     /// Update this PID's trust score based on its most recent exit observation.
-    ///
-    /// Combines the logic of:
-    ///   - `ReputationEngine::update_on_exit()` (trust EMA update)
-    ///   - `AntiCheatEngine` anomaly flag (cheat streak → flag)
     ///
     /// Called from `flush_trust_updates()` (once per second, staleness-based).
     pub fn update_on_exit(&mut self, pid: i32, tgid: i32, obs: &ExitObservation, comm: &str) {
@@ -304,12 +296,12 @@ impl TrustTable {
         if obs.preempted {
             self.scores[s] = (self.scores[s] * 0.93 - 0.07_f32).max(-1.0);
         }
-        // Cheat flag: strongest adversarial signal.
+        // Adverse exit flag: strongest adversarial signal.
         if obs.cheat_flagged {
             self.scores[s] = (self.scores[s] * 0.90 - 0.30_f32).max(-1.0);
             self.cheat_streak[s] = self.cheat_streak[s].saturating_add(1);
         } else {
-            // Any non-cheat exit resets the streak and clears the flag.
+            // Any clean exit resets the streak and clears the watchlist flag.
             self.cheat_streak[s] = 0;
             self.flagged[s] = false;
         }
@@ -323,7 +315,7 @@ impl TrustTable {
             self.scores[s] = (self.scores[s] - 0.08_f32).max(-1.0);
         }
 
-        // ── Watchlist flag: set after 2 consecutive cheat-flagged exits ────
+        // ── Watchlist flag: set after 2 consecutive adverse exits ──────────
         // Keep the criterion direct and predictable.
         if self.cheat_streak[s] >= 2 {
             self.flagged[s] = true;
@@ -358,9 +350,7 @@ impl TrustTable {
         }
     }
 
-    /// Evict a PID's slot (called when a process fully exits the system).
-    ///
-    /// Replaces `ReputationEngine::evict()` and `AntiCheatEngine::evict()`.
+    /// Evict a PID's slot when a process fully exits the system.
     pub fn evict(&mut self, pid: i32) {
         if let Some(s) = self.find_slot(pid) {
             self.pids[s] = PID_TOMBSTONE;
@@ -381,9 +371,6 @@ impl TrustTable {
     /// Runs in O(TRUST_TABLE_SIZE = 4096) — called only from `update_tui()`
     /// every 50 ms, never from the hot scheduling dispatch path.
     ///
-    /// Replaces:
-    ///   - `ReputationEngine::wall_of_shame(limit)` → Vec<(i32, f64, &str)>
-    ///   - `AntiCheatEngine::wall_of_shame()`       → &HashMap<i32, u64>
     pub fn worst_actors(&self) -> ([ShameEntry; SHAME_MAX], usize) {
         let mut out = [ShameEntry::ZERO; SHAME_MAX];
         let mut n = 0usize;
@@ -418,7 +405,7 @@ impl TrustTable {
 
     // ── Metric counters ───────────────────────────────────────────────────────
 
-    /// Count of PIDs currently below the quarantine trust threshold.
+    /// Count of PIDs currently below the trust threshold.
     ///
     /// O(TRUST_TABLE_SIZE) — called only from `get_metrics()` (every 50 ms).
     pub fn quarantined_count(&self) -> u64 {
