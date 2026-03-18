@@ -9,6 +9,7 @@ Cognis v2 keeps the normal scheduling path in BPF. Rust remains in the process f
 - [Status](#status)
 - [Design](#design)
 - [Profiles](#profiles)
+- [Safety Model](#safety-model)
 - [Build and Run](#build-and-run)
 - [Install and Remove](#install-and-remove)
 - [Observability](#observability)
@@ -20,14 +21,14 @@ Cognis v2 keeps the normal scheduling path in BPF. Rust remains in the process f
 ## Status
 
 - Runtime model: BPF-first `sched_ext` scheduler with a Rust control plane
-- Current scaffold: still loaded through `scx_rustland_core`, but the policy shape is closer to `bpfland`/`lavd` than to an always-userspace scheduler
+- Common path: per-CPU local DSQs, per-LLC overflow DSQs, then a global shared DSQ as the last saturated spill path
 - Default install profile: `desktop`
 - Optional profile: `server`
-- Userspace fallback exists, but it is intended to be the exception rather than the normal path
-- Local verification on this branch: `cargo fmt --all -- --check`, `cargo check --locked`, `cargo test --locked`, `sh -n install.sh`, and `sh -n uninstall.sh`
+- Userspace fallback still exists for compatibility, but it is intended to be exceptional rather than the normal path
+- Local verification on this branch includes `cargo fmt --all -- --check`, `cargo check --locked`, `cargo test --locked`, `sh -n install.sh`, and `sh -n uninstall.sh`
 - CI covers Ubuntu format/test/build plus Arch and CachyOS compile checks
 
-This repository is still experimental scheduler work. Build health and unit tests are good signals, but they are not a substitute for repeated real-machine testing on the target kernel, desktop stack, and workload mix.
+This repository is still experimental scheduler work. Passing builds and unit tests are necessary, but they do not prove compositor stability, gaming smoothness, watchdog safety, or long-session behavior on your exact machine.
 
 ## Design
 
@@ -36,28 +37,30 @@ The kernel-facing policy lives in [main.bpf.c](main.bpf.c). The Rust control pla
 At a high level, Cognis v2 works like this:
 
 1. `ops.select_cpu` and `ops.enqueue` try to keep ordinary work in BPF.
-2. The BPF side uses per-CPU local DSQs plus a shared overflow DSQ.
+2. The BPF side uses a queue hierarchy:
+   `CPU local DSQ -> LLC DSQ -> shared DSQ`.
 3. Dispatch ordering is deadline-based and bounded by profile slice and wake-credit knobs.
-4. Short-burst locality can stay sticky in `desktop` mode.
-5. `server` mode prefers broader balancing and shared overflow sooner.
+4. When the local CPU queue is empty, Cognis first tries the local LLC queue and only then uses the global shared spill path.
+5. If the local LLC queue is empty, Cognis can steal from another LLC queue before falling back to the current-task refill behavior.
 6. Rust stays available for restart control, stats, TUI, and the compatibility fallback path.
 
 Important implementation details:
 
 - The common case is meant to avoid a Rust round-trip.
-- `nr_queued`, `nr_scheduled`, and `nr_user_dispatches` are compatibility-fallback signals. If they keep rising under a workload, that means work is escaping the intended BPF fast path.
+- `nr_queued`, `nr_scheduled`, and `nr_user_dispatches` are compatibility-fallback signals. If they keep rising under a workload, work is escaping the intended BPF fast path.
+- `nr_local_dispatches`, `nr_llc_dispatches`, `nr_shared_dispatches`, and `nr_xllc_steals` describe how saturated work is moving through the BPF hierarchy.
 - The Rust loop is no longer meant to spin continuously when BPF is handling the workload.
-- Scheduler-owned structures are fixed-capacity and allocated once at startup.
+- Rust-side scheduler tables are fixed-capacity and allocated once at startup, while the BPF side uses bounded DSQs plus per-task local storage.
 - The TUI and monitor are observability tools, not the scheduling engine itself.
 
 ## Profiles
 
-Cognis currently exposes two profiles:
+Cognis exposes two profiles. Both use the same BPF hierarchy; `desktop` is tuned for faster wake responsiveness and longer LLC-local retention, while `server` spills to the global queue sooner and uses broader balancing under pressure.
 
-| Profile | Default slice ceiling | Default min slice | Wake behavior | Overflow behavior |
+| Profile | Default slice ceiling | Default min slice | Wake behavior | Saturated-path bias |
 |:--|:--|:--|:--|:--|
-| `desktop` | `1000 µs` | `250 µs` | stronger wake responsiveness | keeps the first overflow local, then spills saturated queues to shared |
-| `server` | `8000 µs` | `1000 µs` | less wake-sync bias | prefers shared overflow sooner |
+| `desktop` | `1000 µs` | `250 µs` | stronger wake responsiveness | favors local and LLC spill first |
+| `server` | `8000 µs` | `1000 µs` | less wake-sync bias | uses the same hierarchy but reaches shared spill sooner |
 
 The active profile is selected with:
 
@@ -67,6 +70,25 @@ scx_cognis --mode server
 ```
 
 `install.sh` writes `--mode desktop` by default unless you override it with `--flags`.
+
+## Safety Model
+
+Cognis is written to be safe for long-running use, but this README deliberately avoids claiming a formal 24/7 guarantee that has not been proven with external verification.
+
+What the current code does:
+
+- Keeps the hot scheduling policy in BPF with fixed-size per-task storage and bounded queue domains
+- Keeps scheduler-owned Rust tables fixed-capacity and allocated during startup instead of growing on demand on the hot path
+- Avoids shared mutable global scratch buffers in the BPF bridge
+- Treats malformed ring-buffer messages and topology-probe failures as recoverable conditions with safe fallbacks
+- Keeps `desktop` as the install default while preserving a real `server` mode instead of a neglected side path
+
+What still requires real-machine validation:
+
+- compositor stability
+- browser benchmark frame pacing
+- long-session thermal and power behavior
+- watchdog behavior across kernel versions
 
 ## Build and Run
 
@@ -186,12 +208,18 @@ Available surfaces:
 
 What the main counters mean:
 
-- `nr_kernel_dispatches`: tasks handled directly by the BPF scheduler
+- `nr_kernel_dispatches`: total tasks handled directly by the BPF scheduler
+- `nr_local_dispatches`: BPF routes that stayed on a CPU-local DSQ
+- `nr_llc_dispatches`: BPF routes that spilled into an LLC DSQ
+- `nr_shared_dispatches`: BPF routes that spilled into the global shared DSQ
+- `nr_xllc_steals`: dispatch steals from a non-local LLC queue
 - `nr_user_dispatches`: tasks that crossed into the userspace compatibility fallback
 - `nr_queued` / `nr_scheduled`: current compatibility-fallback backlog
 - `sched_p50/p95/p99`: userspace fallback latency percentiles, not full-system frame-time metrics
 
 If `nr_user_dispatches`, `nr_queued`, or `nr_scheduled` stay elevated during a workload that should fit the BPF fast path, that is a signal to investigate the BPF policy rather than a sign that the userspace path is “working as intended.”
+
+If `nr_shared_dispatches` dominates `nr_llc_dispatches` during a saturated workload, that is a hint that the workload is spilling past local cache domains and may benefit from more tuning on the saturated path.
 
 ## Benchmark Helper
 

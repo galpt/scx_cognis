@@ -5,7 +5,7 @@
 //
 // Renders six panels:
 //   1. Header (scheduler name, live CPU/queued/base-slice counts).
-//   2. System overview (running/queued tasks, CPUs, dispatch/congestion stats).
+//   2. System overview (running/queued tasks, hierarchy routing, congestion stats).
 //   3. Userspace fallback event mix (interactive/compute/io/rt gauges).
 //   4. Profile and fallback slice state.
 //   5. Fallback latency chart (rolling 120-sample line chart).
@@ -298,12 +298,16 @@ fn draw_overview(f: &mut Frame, area: Rect, m: &Metrics) {
             m.nr_user_dispatches, m.nr_kernel_dispatches, m.nr_failed_dispatches
         )),
         Line::from(format!(
-            "  Bounced / Cancelled:            {} / {}",
-            m.nr_bounce_dispatches, m.nr_cancel_dispatches
+            "  BPF Route (local/llc/shared):   {} / {} / {}",
+            m.nr_local_dispatches, m.nr_llc_dispatches, m.nr_shared_dispatches
         )),
         Line::from(format!(
-            "  Congestion Events:              {}",
-            m.nr_sched_congested
+            "  Remote LLC Steals / Bounce:     {} / {}",
+            m.nr_xllc_steals, m.nr_bounce_dispatches
+        )),
+        Line::from(format!(
+            "  Cancelled / Congestion:         {} / {}",
+            m.nr_cancel_dispatches, m.nr_sched_congested
         )),
         Line::from(format!(
             "  Page Faults (scheduler):        {}",

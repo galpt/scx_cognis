@@ -4,6 +4,7 @@
 // GNU General Public License version 2.
 
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::mem::MaybeUninit;
 use std::rc::Rc;
 
@@ -49,12 +50,88 @@ use scx_rustland_core::ALLOCATOR;
 // Defined in UAPI
 const SCHED_EXT: i32 = 7;
 const TASK_COMM_LEN: usize = 16;
+const MAX_TOPO_CPUS: usize = bpf_intf::MAX_CPUS as usize;
+const MAX_LLCS: usize = 64;
 
 // Allow to dispatch the task on any CPU.
 //
 // The task will be dispatched to the global shared DSQ and it will run on the first CPU available.
 #[allow(dead_code)]
 pub const RL_CPU_ANY: i32 = bpf_intf::RL_CPU_ANY as i32;
+
+#[derive(Debug, Clone)]
+struct TopologyExport {
+    smt_enabled: bool,
+    nr_llcs: u32,
+    cpu_llc_idx_map: [u16; MAX_TOPO_CPUS],
+}
+
+impl Default for TopologyExport {
+    fn default() -> Self {
+        Self {
+            smt_enabled: false,
+            nr_llcs: 1,
+            cpu_llc_idx_map: [0; MAX_TOPO_CPUS],
+        }
+    }
+}
+
+impl TopologyExport {
+    fn detect() -> Self {
+        let mut export = Self::default();
+
+        match Topology::new() {
+            Ok(topo) => {
+                export.smt_enabled = topo.smt_enabled;
+
+                if topo.all_llcs.is_empty() {
+                    warn!("topology probe returned no LLC domains; falling back to a single logical LLC");
+                    return export;
+                }
+
+                if topo.all_llcs.len() > MAX_LLCS {
+                    warn!(
+                        "host exposes {} LLC domains but Cognis supports at most {MAX_LLCS}; falling back to a single shared LLC domain",
+                        topo.all_llcs.len()
+                    );
+                    return export;
+                }
+
+                let mut llc_remap = BTreeMap::<usize, u16>::new();
+                let mut next_llc = 0u16;
+
+                for (&cpu_id, cpu) in &topo.all_cpus {
+                    if cpu_id >= MAX_TOPO_CPUS {
+                        warn!(
+                            "ignoring CPU {} while exporting topology to BPF (max supported CPUs: {MAX_TOPO_CPUS})",
+                            cpu_id
+                        );
+                        continue;
+                    }
+
+                    let llc_idx = if let Some(&idx) = llc_remap.get(&cpu.llc_id) {
+                        idx
+                    } else {
+                        let idx = next_llc;
+                        llc_remap.insert(cpu.llc_id, idx);
+                        next_llc = next_llc.saturating_add(1);
+                        idx
+                    };
+                    export.cpu_llc_idx_map[cpu_id] = llc_idx;
+                }
+
+                export.nr_llcs = u32::from(next_llc).max(1);
+            }
+            Err(err) => {
+                warn!(
+                    "topology probe failed while initializing BPF state: {err}; falling back to a single logical LLC and disabling SMT-specific heuristics"
+                );
+            }
+        }
+
+        export
+    }
+}
 
 /// High-level Rust abstraction to interact with a generic sched-ext BPF component.
 ///
@@ -217,16 +294,10 @@ impl<'cb> BpfScheduler<'cb> {
             .as_mut()
             .context("missing rodata_data map in BPF skeleton")?;
 
-        // Check host topology to determine if we need to enable SMT capabilities.
-        match Topology::new() {
-            Ok(topo) => {
-                rodata.smt_enabled = topo.smt_enabled;
-            }
-            Err(err) => {
-                warn!("topology probe failed while initializing BPF state: {err}; disabling SMT-specific heuristics");
-                rodata.smt_enabled = false;
-            }
-        }
+        let topo = TopologyExport::detect();
+        rodata.smt_enabled = topo.smt_enabled;
+        rodata.nr_llcs = topo.nr_llcs;
+        rodata.cpu_llc_idx_map.copy_from_slice(&topo.cpu_llc_idx_map);
 
         // Enable scheduler flags.
         skel.struct_ops.rustland_mut().flags =
@@ -435,6 +506,30 @@ impl<'cb> BpfScheduler<'cb> {
             .as_mut()
             .unwrap()
             .nr_kernel_dispatches
+    }
+
+    // Counter of BPF routes that stayed on a CPU-local DSQ.
+    #[allow(dead_code)]
+    pub fn nr_local_dispatches_mut(&mut self) -> &mut u64 {
+        &mut self.skel.maps.bss_data.as_mut().unwrap().nr_local_dispatches
+    }
+
+    // Counter of BPF routes that spilled into an LLC DSQ.
+    #[allow(dead_code)]
+    pub fn nr_llc_dispatches_mut(&mut self) -> &mut u64 {
+        &mut self.skel.maps.bss_data.as_mut().unwrap().nr_llc_dispatches
+    }
+
+    // Counter of BPF routes that spilled into the global shared DSQ.
+    #[allow(dead_code)]
+    pub fn nr_shared_dispatches_mut(&mut self) -> &mut u64 {
+        &mut self.skel.maps.bss_data.as_mut().unwrap().nr_shared_dispatches
+    }
+
+    // Counter of remote LLC steals performed after local queues drained.
+    #[allow(dead_code)]
+    pub fn nr_xllc_steals_mut(&mut self) -> &mut u64 {
+        &mut self.skel.maps.bss_data.as_mut().unwrap().nr_xllc_steals
     }
 
     // Counter of cancel dispatch events.

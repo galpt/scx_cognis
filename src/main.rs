@@ -8,17 +8,17 @@
 // fallback when work intentionally crosses into userspace:
 //
 //   ┌─────────────────────────────────────────────────────────────────────┐
-//   │  ops.enqueue    → BPF local fast path below saturation               │
-//   │               → Rust virtual-deadline fallback under pressure        │
+//   │  ops.enqueue    → BPF local CPU / LLC / shared hierarchy             │
 //   │  ops.dispatch   → bounded wake credit + virtual deadline handoff     │
-//   │               → SHARED_DSQ fallback for user-space managed work      │
+//   │  fallback path  → dormant userspace compatibility path               │
 //   │  ops.select_cpu → kernel idle-CPU query (pick_idle_cpu, atomic)     │
 //   │  housekeeping   → slice-base refresh + observability cleanup         │
 //   └─────────────────────────────────────────────────────────────────────┘
 //
-// All scheduler-owned data structures are fixed-size and allocated once at
-// startup: no HashMap, BTreeSet, or per-event heap allocations on the
-// scheduling path.
+// Rust-side scheduler tables are fixed-size and allocated once at startup:
+// no HashMap, BTreeSet, or per-event heap allocations on the scheduling path.
+// The BPF side uses bounded DSQs and per-task local storage that is created
+// when a task joins sched_ext, not on every dispatch event.
 //
 // The current implementation still uses scx_rustland_core as the userspace
 // scaffold around sched_ext, but the policy shape is intentionally closer to
@@ -99,9 +99,9 @@ impl SchedulerMode {
 
 /// scx_cognis: a BPF-first CPU scheduler with a minimal userspace fallback.
 ///
-/// Scheduling pipeline: a BPF local/shared DSQ policy owns normal dispatch,
-/// while Rust stays available for stats, restart handling, and a narrow
-/// compatibility fallback path.
+/// Scheduling pipeline: a BPF local CPU / LLC / shared hierarchy owns normal
+/// dispatch, while Rust stays available for stats, restart handling, and a
+/// narrow compatibility fallback path.
 #[derive(Debug, Parser)]
 struct Opts {
     /// Maximum scheduling slice duration in microseconds.
@@ -1296,6 +1296,10 @@ impl<'a> Scheduler<'a> {
             nr_page_faults: page_faults.saturating_sub(self.init_page_faults),
             nr_user_dispatches: *self.bpf.nr_user_dispatches_mut(),
             nr_kernel_dispatches: *self.bpf.nr_kernel_dispatches_mut(),
+            nr_local_dispatches: *self.bpf.nr_local_dispatches_mut(),
+            nr_llc_dispatches: *self.bpf.nr_llc_dispatches_mut(),
+            nr_shared_dispatches: *self.bpf.nr_shared_dispatches_mut(),
+            nr_xllc_steals: *self.bpf.nr_xllc_steals_mut(),
             nr_cancel_dispatches: *self.bpf.nr_cancel_dispatches_mut(),
             nr_bounce_dispatches: *self.bpf.nr_bounce_dispatches_mut(),
             nr_failed_dispatches: *self.bpf.nr_failed_dispatches_mut(),
@@ -1759,7 +1763,12 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::Scheduler;
+    use super::{
+        BpfProfile, Opts, Scheduler, DEFAULT_DESKTOP_SLICE_LAG_NS, DEFAULT_DESKTOP_SLICE_MIN_NS,
+        DEFAULT_DESKTOP_SLICE_NS, DEFAULT_SERVER_SLICE_LAG_NS, DEFAULT_SERVER_SLICE_MIN_NS,
+        DEFAULT_SERVER_SLICE_NS,
+    };
+    use clap::Parser;
 
     #[test]
     fn wake_boost_requires_latency_sensitive_task() {
@@ -1816,5 +1825,29 @@ mod tests {
             Scheduler::effective_slice_pressure(u64::MAX, 1, 1),
             u64::MAX
         );
+    }
+
+    #[test]
+    fn desktop_profile_defaults_match_cli_mode() {
+        let opts = Opts::parse_from(["scx_cognis"]);
+        let profile = BpfProfile::from_opts(&opts);
+
+        assert_eq!(profile.slice_ns, DEFAULT_DESKTOP_SLICE_NS);
+        assert_eq!(profile.slice_min_ns, DEFAULT_DESKTOP_SLICE_MIN_NS);
+        assert_eq!(profile.slice_lag_ns, DEFAULT_DESKTOP_SLICE_LAG_NS);
+        assert!(profile.sticky_tasks);
+        assert!(!profile.no_wake_sync);
+    }
+
+    #[test]
+    fn server_profile_defaults_match_cli_mode() {
+        let opts = Opts::parse_from(["scx_cognis", "--mode", "server"]);
+        let profile = BpfProfile::from_opts(&opts);
+
+        assert_eq!(profile.slice_ns, DEFAULT_SERVER_SLICE_NS);
+        assert_eq!(profile.slice_min_ns, DEFAULT_SERVER_SLICE_MIN_NS);
+        assert_eq!(profile.slice_lag_ns, DEFAULT_SERVER_SLICE_LAG_NS);
+        assert!(!profile.sticky_tasks);
+        assert!(profile.no_wake_sync);
     }
 }

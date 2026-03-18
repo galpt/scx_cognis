@@ -34,6 +34,14 @@ pub struct Metrics {
     pub nr_user_dispatches: u64,
     #[stat(desc = "Tasks dispatched directly by the BPF scheduler")]
     pub nr_kernel_dispatches: u64,
+    #[stat(desc = "BPF routes that stayed on a CPU-local DSQ")]
+    pub nr_local_dispatches: u64,
+    #[stat(desc = "BPF routes that spilled into an LLC DSQ")]
+    pub nr_llc_dispatches: u64,
+    #[stat(desc = "BPF routes that spilled into the global shared DSQ")]
+    pub nr_shared_dispatches: u64,
+    #[stat(desc = "Cross-LLC steals after the local LLC queue ran empty")]
+    pub nr_xllc_steals: u64,
     #[stat(desc = "Cancelled dispatches")]
     pub nr_cancel_dispatches: u64,
     #[stat(desc = "Dispatches bounced to another DSQ")]
@@ -104,8 +112,14 @@ impl Metrics {
         if self.nr_flagged > 0 || self.nr_quarantined > 0 {
             return "Observability watchlist has active PIDs; review repeated adverse exits.";
         }
+        if load >= 0.90
+            && self.nr_shared_dispatches > self.nr_llc_dispatches.saturating_mul(2)
+            && self.nr_shared_dispatches > 0
+        {
+            return "System saturated; shared spill dominates, check LLC balance.";
+        }
         if load >= 0.90 && self.nr_kernel_dispatches > 0 {
-            return "System saturated; BPF local/shared queues are carrying the load.";
+            return "System saturated; BPF local/LLC/shared hierarchy is carrying the load.";
         }
         if load >= 0.85 && compute_heavy {
             return "Heavy compute load detected; watch fallback activity and tail latency.";
@@ -117,7 +131,7 @@ impl Metrics {
             return "Heavy mixed load; BPF fast path is still the primary scheduler.";
         }
         if load >= 0.65 {
-            return "Moderate load; locality and overflow balancing look nominal.";
+            return "Moderate load; locality and LLC spill behavior look nominal.";
         }
         if interactive_heavy && load < 0.5 {
             return "Mostly interactive load; BPF wakeup path is staying responsive.";
@@ -173,7 +187,18 @@ impl Metrics {
 
         writeln!(
             w,
-            "             fallback labels(I/C/IO/RT/U): {}/{}/{}/{}/{} | watchlist:{}/{} | slice(base/assigned):{}/{}µs",
+            "             route(local/llc/shared/xllc): {}/{}/{}/{} | slice(base/assigned):{}/{}µs",
+            self.nr_local_dispatches,
+            self.nr_llc_dispatches,
+            self.nr_shared_dispatches,
+            self.nr_xllc_steals,
+            self.base_slice_us,
+            self.assigned_slice_us,
+        )?;
+
+        writeln!(
+            w,
+            "             fallback labels(I/C/IO/RT/U): {}/{}/{}/{}/{} | watchlist:{}/{}",
             self.nr_interactive,
             self.nr_compute,
             self.nr_iowait,
@@ -181,8 +206,6 @@ impl Metrics {
             self.nr_unknown,
             self.nr_quarantined,
             self.nr_flagged,
-            self.base_slice_us,
-            self.assigned_slice_us,
         )?;
         Ok(())
     }
@@ -196,6 +219,14 @@ impl Metrics {
             nr_kernel_dispatches: self
                 .nr_kernel_dispatches
                 .saturating_sub(rhs.nr_kernel_dispatches),
+            nr_local_dispatches: self
+                .nr_local_dispatches
+                .saturating_sub(rhs.nr_local_dispatches),
+            nr_llc_dispatches: self.nr_llc_dispatches.saturating_sub(rhs.nr_llc_dispatches),
+            nr_shared_dispatches: self
+                .nr_shared_dispatches
+                .saturating_sub(rhs.nr_shared_dispatches),
+            nr_xllc_steals: self.nr_xllc_steals.saturating_sub(rhs.nr_xllc_steals),
             nr_cancel_dispatches: self
                 .nr_cancel_dispatches
                 .saturating_sub(rhs.nr_cancel_dispatches),

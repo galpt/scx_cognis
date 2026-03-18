@@ -105,6 +105,11 @@ jobs:
       - name: cargo check
         run: cargo check --locked --all
 
+      - name: shell syntax check
+        run: |
+          sh -n install.sh
+          sh -n uninstall.sh
+
   # ────────────────────────────────────────────────────────────────────────
   # CI: compile-check on CachyOS
   # ──────────────────────────────────────────────────────────────────────────
@@ -127,6 +132,11 @@ jobs:
 
       - name: cargo check
         run: cargo check --locked --all
+
+      - name: shell syntax check
+        run: |
+          sh -n install.sh
+          sh -n uninstall.sh
 
   # ────────────────────────────────────────────────────────────────────────
   # Release: build, tag, and publish (only if all CI jobs pass)
