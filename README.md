@@ -9,6 +9,7 @@ Cognis v2 keeps the normal scheduling path in BPF. Rust remains in the process f
 - [Status](#status)
 - [Design](#design)
 - [Profiles](#profiles)
+- [Production Ready?](#production-ready)
 - [Safety Model](#safety-model)
 - [Build and Run](#build-and-run)
 - [Install and Remove](#install-and-remove)
@@ -70,6 +71,17 @@ scx_cognis --mode server
 ```
 
 `install.sh` writes `--mode desktop` by default unless you override it with `--flags`.
+
+## Production Ready?
+
+Conditionally.
+
+For a tested desktop or workstation setup, Cognis v2.0.2 is intended to be usable as a production scheduler: the normal scheduling path stays in BPF, the install default is the `desktop` profile, and the current tree has passed repeated local benchmark and regression testing before release.
+
+However, this project does not yet claim a blanket "production ready on every machine" guarantee across all kernels, topologies, desktop stacks, and server environments. The honest bar is:
+
+- `desktop` mode: production-ready when you have validated it on the target machine and workload mix
+- `server` mode: maintained as a first-class profile, but still needs the same workload-specific validation before calling it production-ready for a server deployment
 
 ## Safety Model
 
