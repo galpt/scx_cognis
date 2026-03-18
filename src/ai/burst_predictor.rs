@@ -33,6 +33,8 @@
 
 /// Number of PID slots in the predictor table.  Must be a power of 2.
 pub const PRED_TABLE_SIZE: usize = 4096;
+const PID_EMPTY: i32 = 0;
+const PID_TOMBSTONE: i32 = -1;
 
 /// Fibonacci multiplier for 32-bit integer hashing.
 const FIB32: u32 = 2_654_435_769;
@@ -138,13 +140,52 @@ impl BurstPredictor {
     }
 
     #[inline(always)]
-    fn get_or_evict(&mut self, pid: i32) -> usize {
-        let s = Self::slot(pid);
-        if self.state_pids[s] != pid {
-            self.state_pids[s] = pid;
-            self.state_table[s] = RnnState::default();
+    fn find_slot(&self, pid: i32) -> Option<usize> {
+        let start = Self::slot(pid);
+
+        for step in 0..PRED_TABLE_SIZE {
+            let s = (start + step) & (PRED_TABLE_SIZE - 1);
+            let cur = self.state_pids[s];
+
+            if cur == pid {
+                return Some(s);
+            }
+            if cur == PID_EMPTY {
+                return None;
+            }
         }
-        s
+
+        None
+    }
+
+    #[inline(always)]
+    fn get_or_insert_slot(&mut self, pid: i32) -> usize {
+        let start = Self::slot(pid);
+        let mut first_tombstone = None;
+
+        for step in 0..PRED_TABLE_SIZE {
+            let s = (start + step) & (PRED_TABLE_SIZE - 1);
+            let cur = self.state_pids[s];
+
+            if cur == pid {
+                return s;
+            }
+            if cur == PID_TOMBSTONE && first_tombstone.is_none() {
+                first_tombstone = Some(s);
+                continue;
+            }
+            if cur == PID_EMPTY {
+                let dst = first_tombstone.unwrap_or(s);
+                self.state_pids[dst] = pid;
+                self.state_table[dst] = RnnState::default();
+                return dst;
+            }
+        }
+
+        let dst = first_tombstone.unwrap_or(start);
+        self.state_pids[dst] = pid;
+        self.state_table[dst] = RnnState::default();
+        dst
     }
 
     /// Feed an observation and return the EMA-smoothed predicted next burst (ns).
@@ -155,7 +196,7 @@ impl BurstPredictor {
         exec_ratio: f32,
         cpu_intensity: f32,
     ) -> u64 {
-        let s = self.get_or_evict(pid);
+        let s = self.get_or_insert_slot(pid);
         let state = &mut self.state_table[s];
 
         let burst_norm = (burst_ns as f64 / BURST_MAX_NS).min(1.0) as f32;
@@ -205,30 +246,25 @@ impl BurstPredictor {
     /// Latest EMA-smoothed prediction for a PID without updating the model.
     /// Returns 0 if the PID has no recorded state.
     pub fn prediction_for(&self, pid: i32) -> u64 {
-        let s = Self::slot(pid);
-        if self.state_pids[s] == pid {
-            self.state_table[s].ema_burst_ns as u64
-        } else {
-            0
-        }
+        self.find_slot(pid)
+            .map(|s| self.state_table[s].ema_burst_ns as u64)
+            .unwrap_or(0)
     }
 
     /// Prediction error EMA (ns) for a PID — useful for TUI dashboard display.
     pub fn error_ema_for(&self, pid: i32) -> f64 {
-        let s = Self::slot(pid);
-        if self.state_pids[s] == pid {
-            let st = &self.state_table[s];
-            (st.ema_burst_ns - st.ema_actual_ns).abs()
-        } else {
-            0.0
-        }
+        self.find_slot(pid)
+            .map(|s| {
+                let st = &self.state_table[s];
+                (st.ema_burst_ns - st.ema_actual_ns).abs()
+            })
+            .unwrap_or(0.0)
     }
 
     /// Evict the RNN state for a PID that has exited the system.
     pub fn evict(&mut self, pid: i32) {
-        let s = Self::slot(pid);
-        if self.state_pids[s] == pid {
-            self.state_pids[s] = 0;
+        if let Some(s) = self.find_slot(pid) {
+            self.state_pids[s] = PID_TOMBSTONE;
             self.state_table[s] = RnnState::default();
         }
     }
@@ -286,6 +322,21 @@ mod tests {
             p20_before,
             "evicting PID 10 should not affect PID 20"
         );
+    }
+
+    #[test]
+    fn colliding_pids_do_not_evict_each_other() {
+        let mut pred = BurstPredictor::new();
+        let pid_a = 2;
+        let pid_b = 2586;
+
+        for _ in 0..20 {
+            pred.observe_and_predict(pid_a, 2_000_000, 0.2, 0.2);
+            pred.observe_and_predict(pid_b, 9_000_000, 0.8, 0.8);
+        }
+
+        assert!(pred.prediction_for(pid_a) > 0);
+        assert!(pred.prediction_for(pid_b) > 0);
     }
 
     #[test]

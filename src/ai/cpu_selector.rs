@@ -288,6 +288,11 @@ impl CpuSelector {
         perf_cri: f32,
         prefer_same_llc: bool,
     ) -> bool {
+        let bit = cpu_bit(cpu);
+        if bit == 0 || (self.idle_mask & bit) == 0 {
+            return false;
+        }
+
         if !self.prefers_cpu(cpu, label, quarantine, perf_cri) {
             return false;
         }
@@ -483,5 +488,19 @@ mod tests {
 
         assert!(!sel.accepts_idle_cpu(1, 0, TaskLabel::Interactive, false, 0.9, true));
         assert!(sel.accepts_idle_cpu(0, 0, TaskLabel::Interactive, false, 0.9, true));
+    }
+
+    #[test]
+    fn marked_busy_cpu_is_not_reused_until_reset() {
+        let mut sel = CpuSelector::new();
+        sel.update_cpu(make_cpu(0, CoreType::Performance, false));
+        sel.update_cpu(make_cpu(1, CoreType::Performance, false));
+
+        assert!(sel.accepts_idle_cpu(0, 0, TaskLabel::Interactive, false, 0.9, false));
+        sel.mark_busy(0);
+        assert!(!sel.accepts_idle_cpu(0, 0, TaskLabel::Interactive, false, 0.9, false));
+
+        sel.reset_idle();
+        assert!(sel.accepts_idle_cpu(0, 0, TaskLabel::Interactive, false, 0.9, false));
     }
 }

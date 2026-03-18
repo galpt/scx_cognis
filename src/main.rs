@@ -189,6 +189,10 @@ struct TaskLifetime {
     /// trust eviction only fires for tasks that have actually
     /// left, not for still-active tasks on every scheduling loop.
     last_seen_ns: u64,
+    /// Monotonic BPF timestamp of the last time this PID released the CPU.
+    /// The next enqueue uses this together with the new `start_ts` to measure
+    /// the task's actual sleep gap instead of userspace queueing delay.
+    last_stop_ts: u64,
 }
 
 // ── Main Scheduler Struct ──────────────────────────────────────────────────
@@ -203,6 +207,8 @@ const QUEUE_DEPTH: usize = 16_384;
 /// Lifetime table size — must be a power of 2.  Sized to hold all concurrent
 /// PIDs on even the largest NUMA servers with comfortable headroom.
 const LIFETIME_TABLE_SIZE: usize = 4096;
+const PID_SLOT_EMPTY: i32 = 0;
+const PID_SLOT_TOMBSTONE: i32 = -1;
 
 /// Fibonacci multiplier for i32 → table-slot hashing.
 const FIB32_MAIN: u32 = 2_654_435_769;
@@ -430,6 +436,15 @@ impl<'a> Scheduler<'a> {
             .saturating_add(nr_scheduled)
     }
 
+    #[inline(always)]
+    fn recent_sleep_gap_ns(prev_stop_ts: u64, current_start_ts: u64) -> u64 {
+        if prev_stop_ts == 0 {
+            0
+        } else {
+            current_start_ts.saturating_sub(prev_stop_ts)
+        }
+    }
+
     fn get_page_faults() -> Result<u64, io::Error> {
         let me = Process::myself().map_err(io::Error::other)?;
         let st = me.stat().map_err(io::Error::other)?;
@@ -569,35 +584,94 @@ impl<'a> Scheduler<'a> {
         ((pid as u32).wrapping_mul(FIB32_MAIN) >> 20) as usize
     }
 
+    #[inline(always)]
+    fn lifetime_find_slot(&self, pid: i32) -> Option<usize> {
+        let start = Self::lifetime_slot(pid);
+
+        for step in 0..LIFETIME_TABLE_SIZE {
+            let s = (start + step) & (LIFETIME_TABLE_SIZE - 1);
+            let cur = self.lifetime_pids[s];
+
+            if cur == pid {
+                return Some(s);
+            }
+            if cur == PID_SLOT_EMPTY {
+                return None;
+            }
+        }
+
+        None
+    }
+
+    #[inline(always)]
+    fn lifetime_find_or_insert_slot(&mut self, pid: i32) -> usize {
+        let start = Self::lifetime_slot(pid);
+        let mut first_tombstone = None;
+
+        for step in 0..LIFETIME_TABLE_SIZE {
+            let s = (start + step) & (LIFETIME_TABLE_SIZE - 1);
+            let cur = self.lifetime_pids[s];
+
+            if cur == pid {
+                return s;
+            }
+            if cur == PID_SLOT_TOMBSTONE && first_tombstone.is_none() {
+                first_tombstone = Some(s);
+                continue;
+            }
+            if cur == PID_SLOT_EMPTY {
+                let dst = first_tombstone.unwrap_or(s);
+                self.lifetime_pids[dst] = pid;
+                self.lifetime_table[dst] = TaskLifetime::default();
+                return dst;
+            }
+        }
+
+        let dst = first_tombstone.unwrap_or(start);
+        self.lifetime_pids[dst] = pid;
+        self.lifetime_table[dst] = TaskLifetime::default();
+        dst
+    }
+
     /// Return shared reference to lifetime entry if this PID owns the slot.
     #[inline(always)]
     fn lifetime_get(&self, pid: i32) -> Option<&TaskLifetime> {
-        let s = Self::lifetime_slot(pid);
-        if self.lifetime_pids[s] == pid && pid != 0 {
-            Some(&self.lifetime_table[s])
-        } else {
-            None
-        }
+        self.lifetime_find_slot(pid)
+            .filter(|_| pid > 0)
+            .map(|s| &self.lifetime_table[s])
     }
 
     /// Return mutable reference to lifetime entry, evicting stale PID if needed.
     #[inline(always)]
     fn lifetime_get_mut_or_default(&mut self, pid: i32) -> &mut TaskLifetime {
-        let s = Self::lifetime_slot(pid);
-        if self.lifetime_pids[s] != pid {
-            self.lifetime_pids[s] = pid;
-            self.lifetime_table[s] = TaskLifetime::default();
-        }
+        let s = self.lifetime_find_or_insert_slot(pid);
         &mut self.lifetime_table[s]
     }
 
     /// Evict the lifetime entry for a PID.
     #[inline(always)]
     fn lifetime_evict(&mut self, pid: i32) {
-        let s = Self::lifetime_slot(pid);
-        if self.lifetime_pids[s] == pid {
-            self.lifetime_pids[s] = 0;
+        if let Some(s) = self.lifetime_find_slot(pid) {
+            self.lifetime_pids[s] = PID_SLOT_TOMBSTONE;
             self.lifetime_table[s] = TaskLifetime::default();
+        }
+    }
+
+    fn drain_exited_tasks(&mut self, max_batch: usize) {
+        for _ in 0..max_batch {
+            match self.bpf.dequeue_exited_pid() {
+                Ok(Some(pid)) if pid > 0 => {
+                    self.lifetime_evict(pid);
+                    self.trust.evict(pid);
+                    self.burst_pred.evict(pid);
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(err) => {
+                    warn!("dequeue_exited_pid error: {err}");
+                    break;
+                }
+            }
         }
     }
 
@@ -1098,7 +1172,7 @@ impl<'a> Scheduler<'a> {
             });
         let recent_sleep_ns = self
             .lifetime_get(task.pid)
-            .map(|lt| Self::now_ns().saturating_sub(lt.last_seen_ns))
+            .map(|lt| Self::recent_sleep_gap_ns(lt.last_stop_ts, task.start_ts))
             .unwrap_or(0);
         let prev_interactive_credit_ns = self
             .lifetime_get(task.pid)
@@ -1351,6 +1425,7 @@ impl<'a> Scheduler<'a> {
                     e.interactive_slice_bias_ns = renewed_slice_bias_ns;
                     e.interactive_slice_credit_ns = renewed_slice_credit_ns;
                     e.last_seen_ns = Self::now_ns();
+                    e.last_stop_ts = task.stop_ts;
 
                     // Update burst predictor — reuse the features already
                     // computed during classification to avoid a redundant second
@@ -1471,6 +1546,9 @@ impl<'a> Scheduler<'a> {
             self.push_task(task);
             return false;
         }
+        if dispatched.cpu != RL_CPU_ANY {
+            self.cpu_selector.mark_busy(dispatched.cpu);
+        }
         true
     }
 
@@ -1556,9 +1634,9 @@ impl<'a> Scheduler<'a> {
         }
         self.last_trust_flush = Instant::now();
 
-        // Staleness-based exit detection: any PID not seen for > 2 seconds
-        // is assumed to have exited.  Robust across all kernel versions —
-        // no custom BPF ring buffer required.
+        // Staleness-based exit detection remains as a fallback if the explicit
+        // task-exit ring buffer overflows or the kernel misses an ops.disable
+        // transition for a task.
         let now = Self::now_ns();
         const STALE_THRESHOLD_NS: u64 = 2 * NSEC_PER_SEC;
 
@@ -1568,7 +1646,7 @@ impl<'a> Scheduler<'a> {
 
         for s in 0..LIFETIME_TABLE_SIZE {
             let pid = self.lifetime_pids[s];
-            if pid == 0 {
+            if pid <= 0 {
                 continue;
             }
             let lt = &self.lifetime_table[s];
@@ -1584,8 +1662,7 @@ impl<'a> Scheduler<'a> {
         for &pid in &stale[..stale_n] {
             // Snapshot the lifetime entry before evicting the slot.
             let lt = {
-                let s = Self::lifetime_slot(pid);
-                if self.lifetime_pids[s] == pid {
+                if let Some(s) = self.lifetime_find_slot(pid) {
                     self.lifetime_table[s].clone()
                 } else {
                     continue;
@@ -1687,6 +1764,11 @@ impl<'a> Scheduler<'a> {
         // Measure the scheduling pipeline latency for autopilot overhead checks.
         let sched_t0 = Self::now_ns();
 
+        // Reserve explicit idle-CPU placements within this scheduling window so
+        // a burst of latency-sensitive tasks can't all target the same CPU
+        // before the kernel has had a chance to consume earlier dispatches.
+        self.cpu_selector.reset_idle();
+
         // 1. Drain queued tasks in a bounded batch.
         //
         // Bound the batch so each schedule() call reaches the dispatch phase
@@ -1785,6 +1867,7 @@ impl<'a> Scheduler<'a> {
             // Core dispatch: classify tasks, fill BPF dispatch ring, notify.
             // Must never stall — sched_ext watchdog fires if too slow.
             self.schedule();
+            self.drain_exited_tasks(128);
 
             // Stats: non-blocking try_recv so a disconnected client can't
             // block or crash the scheduler.
@@ -2146,6 +2229,14 @@ mod tests {
             true, true, 2_000_000, 1_500_000
         ));
     }
+
+    #[test]
+    fn recent_sleep_gap_uses_previous_stop_timestamp() {
+        assert_eq!(Scheduler::recent_sleep_gap_ns(0, 50), 0);
+        assert_eq!(Scheduler::recent_sleep_gap_ns(10, 50), 40);
+        assert_eq!(Scheduler::recent_sleep_gap_ns(80, 50), 0);
+    }
+
 
     #[test]
     fn effective_slice_pressure_counts_queued_work() {

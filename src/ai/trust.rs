@@ -54,6 +54,8 @@
 /// Number of slots in the trust table.  Power of 2 so the hash shift is exact.
 /// 4096 slots can track up to 4096 simultaneous PIDs before collision eviction.
 pub const TRUST_TABLE_SIZE: usize = 4096;
+const PID_EMPTY: i32 = 0;
+const PID_TOMBSTONE: i32 = -1;
 
 /// Trust score below which a PID is quarantined to restricted cores.
 pub const TRUST_THRESHOLD: f32 = -0.35;
@@ -186,25 +188,68 @@ impl TrustTable {
         ((pid as u32).wrapping_mul(FIB32) >> 20) as usize
     }
 
+    #[inline(always)]
+    fn find_slot(&self, pid: i32) -> Option<usize> {
+        let start = Self::slot(pid);
+
+        for step in 0..TRUST_TABLE_SIZE {
+            let s = (start + step) & (TRUST_TABLE_SIZE - 1);
+            let cur = self.pids[s];
+
+            if cur == pid {
+                return Some(s);
+            }
+            if cur == PID_EMPTY {
+                return None;
+            }
+        }
+
+        None
+    }
+
     /// Return the slot for `pid`, evicting a stale occupant if the slot is
     /// occupied by a different PID.
     ///
     /// Eviction resets the slot to neutral for the incoming PID.
     /// On a collision (slot taken by a different PID), the old trust data is
-    /// lost: the evicted PID starts neutral the next time it appears.
-    /// Collision frequency is low for typical workloads (≪ 4096 concurrent PIDs).
+    /// lost only when the table is truly full and no empty/tombstone slot can
+    /// be found.
     #[inline(always)]
-    fn get_or_evict(&mut self, pid: i32) -> usize {
-        let s = Self::slot(pid);
-        if self.pids[s] != pid {
-            // Collision with a different PID → evict and reset.
-            self.pids[s] = pid;
-            self.scores[s] = 0.0;
-            self.comms[s] = [0u8; 16];
-            self.flagged[s] = false;
-            self.cheat_streak[s] = 0;
+    fn get_or_insert_slot(&mut self, pid: i32) -> usize {
+        let start = Self::slot(pid);
+        let mut first_tombstone = None;
+
+        for step in 0..TRUST_TABLE_SIZE {
+            let s = (start + step) & (TRUST_TABLE_SIZE - 1);
+            let cur = self.pids[s];
+
+            if cur == pid {
+                return s;
+            }
+            if cur == PID_TOMBSTONE && first_tombstone.is_none() {
+                first_tombstone = Some(s);
+                continue;
+            }
+            if cur == PID_EMPTY {
+                let dst = first_tombstone.unwrap_or(s);
+                self.pids[dst] = pid;
+                self.scores[dst] = 0.0;
+                self.comms[dst] = [0u8; 16];
+                self.flagged[dst] = false;
+                self.cheat_streak[dst] = 0;
+                self.tgid_scores[dst] = 0.0;
+                return dst;
+            }
         }
-        s
+
+        let dst = first_tombstone.unwrap_or(start);
+        self.pids[dst] = pid;
+        self.scores[dst] = 0.0;
+        self.comms[dst] = [0u8; 16];
+        self.flagged[dst] = false;
+        self.cheat_streak[dst] = 0;
+        self.tgid_scores[dst] = 0.0;
+        dst
     }
 
     // ── Trust score API (replacing ReputationEngine) ─────────────────────────
@@ -212,12 +257,7 @@ impl TrustTable {
     /// Trust score for a PID ∈ [-1.0, +1.0].
     /// Returns 0.0 (neutral) for unknown PIDs (slot not owned by this PID).
     pub fn trust_score(&self, pid: i32) -> f32 {
-        let s = Self::slot(pid);
-        if self.pids[s] == pid {
-            self.scores[s]
-        } else {
-            0.0
-        }
+        self.find_slot(pid).map(|s| self.scores[s]).unwrap_or(0.0)
     }
 
     /// Whether this PID should currently be quarantined to restricted cores.
@@ -231,8 +271,7 @@ impl TrustTable {
     ///
     /// Replaces `AntiCheatEngine::is_flagged()`.
     pub fn is_flagged(&self, pid: i32) -> bool {
-        let s = Self::slot(pid);
-        self.pids[s] == pid && self.flagged[s]
+        self.find_slot(pid).map(|s| self.flagged[s]).unwrap_or(false)
     }
 
     /// Update this PID's trust score based on its most recent exit observation.
@@ -243,7 +282,7 @@ impl TrustTable {
     ///
     /// Called from `flush_trust_updates()` (once per second, staleness-based).
     pub fn update_on_exit(&mut self, pid: i32, tgid: i32, obs: &ExitObservation, comm: &str) {
-        let s = self.get_or_evict(pid);
+        let s = self.get_or_insert_slot(pid);
 
         // Store the comm name for TUI display.
         if !comm.is_empty() {
@@ -324,11 +363,13 @@ impl TrustTable {
     ///
     /// Replaces `ReputationEngine::evict()` and `AntiCheatEngine::evict()`.
     pub fn evict(&mut self, pid: i32) {
-        let s = Self::slot(pid);
-        if self.pids[s] == pid {
-            // Reset to empty — next PID hashing to this slot starts neutral.
-            self.pids[s] = 0;
+        if let Some(s) = self.find_slot(pid) {
+            self.pids[s] = PID_TOMBSTONE;
             self.scores[s] = 0.0;
+            self.comms[s] = [0u8; 16];
+            self.flagged[s] = false;
+            self.cheat_streak[s] = 0;
+            self.tgid_scores[s] = 0.0;
         }
     }
 
@@ -350,7 +391,7 @@ impl TrustTable {
 
         for slot in 0..TRUST_TABLE_SIZE {
             let pid = self.pids[slot];
-            if pid == 0 {
+            if pid <= 0 {
                 continue;
             }
             let score = self.scores[slot];
@@ -386,6 +427,7 @@ impl TrustTable {
             .iter()
             .zip(self.scores.iter())
             .filter(|(&pid, &score)| pid != 0 && score < TRUST_THRESHOLD)
+            .filter(|(&pid, _)| pid > 0)
             .count() as u64
     }
 
@@ -397,6 +439,7 @@ impl TrustTable {
             .iter()
             .zip(self.flagged.iter())
             .filter(|(&pid, &f)| pid != 0 && f)
+            .filter(|(&pid, _)| pid > 0)
             .count() as u64
     }
 
@@ -575,6 +618,27 @@ mod tests {
             !entries[..n].iter().any(|e| e.pid == 2),
             "PID 2 (good actor) should NOT appear in worst_actors"
         );
+    }
+
+    #[test]
+    fn colliding_pids_keep_independent_trust() {
+        let mut t = TrustTable::new();
+        let good = ExitObservation {
+            slice_underrun: true,
+            clean_exit: true,
+            ..Default::default()
+        };
+        let bad = ExitObservation {
+            cheat_flagged: true,
+            preempted: true,
+            ..Default::default()
+        };
+
+        t.update_on_exit(2, 2, &good, "good");
+        t.update_on_exit(2586, 2586, &bad, "bad");
+
+        assert!(t.trust_score(2) > 0.0);
+        assert!(t.trust_score(2586) < 0.0);
     }
 
     #[test]

@@ -1027,28 +1027,12 @@ void BPF_STRUCT_OPS(rustland_stopping, struct task_struct *p, bool runnable)
 	tctx->exec_runtime += now - tctx->start_ts;
 
 	/*
-	 * PoC: update a lightweight per-pid EWMA of the last exec runtime (ns)
-	 * stored as Q16.16 fixed-point in `kernel_ewma` LRU hash map.
+	 * Production path: keep ops.stopping minimal.
+	 *
+	 * The per-pid kernel_ewma PoC is not consumed by the userspace policy, so
+	 * updating an LRU hash here only adds scheduler-path overhead. Leave the map
+	 * and counter in place for debug compatibility, but skip the hot-path update.
 	 */
-	{
-		u32 key = (u32)p->pid;
-		u64 sample_q = (tctx->exec_runtime) << 16; /* Q16.16 */
-		u64 *old_q = bpf_map_lookup_elem(&kernel_ewma, &key);
-		u64 new_q;
-
-		if (!old_q) {
-			/* initialize with the current sample */
-			new_q = sample_q;
-			bpf_map_update_elem(&kernel_ewma, &key, &new_q, BPF_ANY);
-		} else {
-			/* diff-based EWMA: new = old + ((sample - old) * alpha) */
-			long diff = (long)sample_q - (long)*old_q;
-			long delta = (diff * (long)EWMA_ALPHA_Q) >> 16;
-			new_q = (u64)((long)*old_q + delta);
-			bpf_map_update_elem(&kernel_ewma, &key, &new_q, BPF_ANY);
-		}
-		__sync_fetch_and_add(&nr_bpf_ewma_updates, 1);
-	}
 }
 
 /*

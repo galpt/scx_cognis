@@ -18,6 +18,7 @@ use std::sync::Arc;
 
 use anyhow::bail;
 use anyhow::Result;
+use log::warn;
 
 use plain::Plain;
 
@@ -171,10 +172,27 @@ impl EnqueuedMessage {
     }
 }
 
+// Exit pid published by ops.disable through the task_exits ring buffer.
+struct ExitedMessage {
+    inner: u32,
+}
+
+impl ExitedMessage {
+    fn from_bytes(bytes: &[u8]) -> Self {
+        let pid = unsafe { *(bytes.as_ptr() as *const u32) };
+        ExitedMessage { inner: pid }
+    }
+
+    fn to_pid(&self) -> i32 {
+        self.inner as i32
+    }
+}
+
 pub struct BpfScheduler<'cb> {
     pub skel: BpfSkel<'cb>,                // Low-level BPF connector
     shutdown: Arc<AtomicBool>,             // Determine scheduler shutdown
     queued: libbpf_rs::RingBuffer<'cb>,    // Ring buffer of queued tasks
+    task_exits: libbpf_rs::RingBuffer<'cb>, // Ring buffer of exiting task pids
     dispatched: libbpf_rs::UserRingBuffer, // User Ring buffer of dispatched tasks
     struct_ops: Option<libbpf_rs::Link>,   // Low-level BPF methods
 }
@@ -189,6 +207,13 @@ const BUFSIZE: usize = std::mem::size_of::<QueuedTask>();
 struct AlignedBuffer([u8; BUFSIZE]);
 
 static mut BUF: AlignedBuffer = AlignedBuffer([0; BUFSIZE]);
+
+const EXIT_BUFSIZE: usize = std::mem::size_of::<u32>();
+
+#[repr(align(8))]
+struct ExitAlignedBuffer([u8; EXIT_BUFSIZE]);
+
+static mut EXIT_BUF: ExitAlignedBuffer = ExitAlignedBuffer([0; EXIT_BUFSIZE]);
 
 impl<'cb> BpfScheduler<'cb> {
     /// Initialise the BPF scheduler.
@@ -242,9 +267,25 @@ impl<'cb> BpfScheduler<'cb> {
             0
         }
 
+        fn exit_callback(data: &[u8]) -> i32 {
+            #[allow(static_mut_refs)]
+            unsafe {
+                EXIT_BUF.0.copy_from_slice(data);
+            }
+
+            0
+        }
+
         // Check host topology to determine if we need to enable SMT capabilities.
-        let topo = Topology::new().unwrap();
-        skel.maps.rodata_data.as_mut().unwrap().smt_enabled = topo.smt_enabled;
+        match Topology::new() {
+            Ok(topo) => {
+                skel.maps.rodata_data.as_mut().unwrap().smt_enabled = topo.smt_enabled;
+            }
+            Err(err) => {
+                warn!("topology probe failed while initializing BPF state: {err}; disabling SMT-specific heuristics");
+                skel.maps.rodata_data.as_mut().unwrap().smt_enabled = false;
+            }
+        }
 
         // Enable scheduler flags.
         skel.struct_ops.rustland_mut().flags =
@@ -271,6 +312,12 @@ impl<'cb> BpfScheduler<'cb> {
         rbb.add(queued_ring_buffer, callback)
             .expect("failed to add ringbuf callback");
         let queued = rbb.build().expect("failed to build ringbuf");
+
+        let exit_ring_buffer = &maps.task_exits;
+        let mut ebb = libbpf_rs::RingBufferBuilder::new();
+        ebb.add(exit_ring_buffer, exit_callback)
+            .expect("failed to add task_exits ringbuf callback");
+        let task_exits = ebb.build().expect("failed to build task_exits ringbuf");
 
         // Build the user ring buffer of dispatched tasks.
         let dispatched = libbpf_rs::UserRingBuffer::new(&maps.dispatched)
@@ -307,6 +354,7 @@ impl<'cb> BpfScheduler<'cb> {
             skel,
             shutdown,
             queued,
+            task_exits,
             dispatched,
             struct_ops,
         };
@@ -571,6 +619,20 @@ impl<'cb> BpfScheduler<'cb> {
             }
             res if res < 0 => Err(res),
             res => panic!("Unexpected return value from libbpf-rs::consume_raw(): {res}"),
+        }
+    }
+
+    // Receive one exiting pid published by ops.disable.
+    #[allow(static_mut_refs)]
+    pub fn dequeue_exited_pid(&mut self) -> Result<Option<i32>, i32> {
+        match self.task_exits.consume_raw_n(1) {
+            0 => Ok(None),
+            1 => {
+                let pid = unsafe { ExitedMessage::from_bytes(&EXIT_BUF.0).to_pid() };
+                Ok(Some(pid))
+            }
+            res if res < 0 => Err(res),
+            res => panic!("Unexpected return value from libbpf-rs::consume_raw() for task_exits: {res}"),
         }
     }
 
