@@ -18,7 +18,6 @@ The project focuses on keeping scheduler policy inspectable and bounded: fixed-c
 
 ## Status
 
-- Current package version: `1.5.7`
 - Runtime model: Rust 2021 userspace scheduler on top of `sched_ext`
 - Core scheduler backend: `scx_rustland_core = 2.4.10`
 - Local verification on this branch: `cargo check` and `cargo test` pass
