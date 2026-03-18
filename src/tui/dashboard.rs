@@ -261,7 +261,7 @@ fn draw_header(f: &mut Frame, area: Rect, m: &Metrics) {
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::raw("│ Adaptive CPU Scheduler │ "),
+        Span::raw("│ BPF-first CPU Scheduler │ "),
         Span::styled(
             format!(
                 "CPUs: {}  Running: {}  Queued: {}  Base: {}µs  Assigned≈{}µs  sched:{}:{}:{}",
@@ -365,8 +365,8 @@ fn draw_slice_control(f: &mut Frame, area: Rect, state: &DashboardState) {
             state.metrics.assigned_slice_us
         )),
         Line::from(format!(
-            "  Autopilot:        {}µs min/{}µs max",
-            state.metrics.autopilot_min_us, state.metrics.autopilot_max_us
+            "  Slice Bounds:     {}µs min/{}µs max",
+            state.metrics.slice_min_us, state.metrics.slice_max_us
         )),
         Line::from(format!("  Inference:        {:.2}µs", state.inference_us)),
         Line::from(vec![

@@ -57,7 +57,7 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-test-
 
       - name: cargo test
-        run: cargo test --all -- --nocapture
+        run: cargo test --locked --all -- --nocapture
 
   # ──────────────────────────────────────────────────────────────────────────
   # Build: compile-check release binary (no artifact upload)
@@ -90,4 +90,4 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-release-
 
       - name: cargo build --release
-        run: cargo build --release
+        run: cargo build --locked --release

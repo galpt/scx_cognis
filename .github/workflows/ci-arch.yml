@@ -40,4 +40,4 @@ jobs:
           restore-keys: arch-cargo-check-
 
       - name: cargo check
-        run: cargo check --all
+        run: cargo check --locked --all

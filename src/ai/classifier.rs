@@ -32,38 +32,6 @@ pub enum TaskLabel {
 }
 
 impl TaskLabel {
-    /// Returns the time-slice multiplier hint for this label (relative to base slice).
-    ///
-    /// Values < 1.0 mean shorter slices (better for interactive).
-    /// Values = 1.0 are neutral (throughput parity).
-    ///
-    /// CPU-bound (Compute) tasks are intentionally kept at 1.0 — NOT given a
-    /// longer slice.  Giving Compute tasks a 2× slice was the single biggest
-    /// interactivity regression: 16 stress-ng workers × 2× slice = no CPU
-    /// left for the browser.  These tasks are already deprioritised by their
-    /// label_priority=0 position at the back of the BTreeSet; doubling their
-    /// slice on top of that compounds the starvation.
-    ///
-    /// Interactive tasks keep the full base slice so wakeup-heavy render,
-    /// browser, compositor, and input threads can finish a frame-stage worth
-    /// of CPU work before the next vblank. Background compute gets a shorter
-    /// runway instead, following the same general principle as BORE and other
-    /// latency-oriented schedulers: long uninterrupted bursts should lose
-    /// privilege, not gain it.
-    ///
-    /// Production schedulers (scx_rustland, scx_flash) do not apply per-label
-    /// slice multipliers for CPU-bound tasks.  They rely on vruntime fairness
-    /// and deadline ordering, which we already have.
-    pub fn slice_multiplier(self) -> f64 {
-        match self {
-            TaskLabel::Interactive => 1.0,
-            TaskLabel::RealTime => 0.75,
-            TaskLabel::IoWait => 0.90,
-            TaskLabel::Compute => 0.50,
-            TaskLabel::Unknown => 0.75,
-        }
-    }
-
     #[allow(dead_code)]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -100,9 +68,9 @@ pub struct TaskFeatures {
 /// Deterministic, stateless heuristic task classifier.
 ///
 /// Classifies each scheduling event in O(1) using only the `cpu_intensity`
-/// feature (plus a `weight_norm` guard for real-time tasks).  There is no
-/// sliding window, no voting, and no per-PID state — this eliminates the
-/// feedback-loop misclassification that plagued the previous KNN design.
+/// feature (plus a `weight_norm` guard for real-time tasks). There is no
+/// sliding window, no voting, and no per-PID state, which keeps the fallback
+/// path predictable and easy to reason about.
 pub struct HeuristicClassifier;
 
 impl HeuristicClassifier {

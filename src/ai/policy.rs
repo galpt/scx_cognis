@@ -21,7 +21,6 @@ const AUTO_SLICE_MAX_NS: u64 = 8_000_000; // 8 ms
 const LAT_RING_CAP: usize = 2048;
 const LAT_RING_MASK: usize = LAT_RING_CAP - 1;
 
-use log::debug;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 /// Load-driven slice-base controller.
@@ -32,20 +31,13 @@ pub struct SliceController {
     base_slice_ns: u64,
     /// Auto-computed slice ceiling derived from runnable load.
     pub auto_base_ns: u64,
-    /// Raw (unclamped) auto base computed from the load. Used when the
-    /// autopilot requests a temporary relaxation of the lower clamp so the
-    /// controller can experiment with sub-250µs bases safely.
-    raw_auto_base_ns: u64,
-    /// Current adaptive minimum and maximum caps (ns). These may be adjusted
-    /// by the autopilot logic at runtime. Stored as plain u64 because the
-    /// controller is owned by the scheduler main thread.
+    /// Current adaptive minimum and maximum caps (ns). Stored as plain u64
+    /// because the controller is owned by the scheduler main thread.
     min_ns: u64,
     max_ns: u64,
     /// Lock-free ring buffer of recent scheduling pipeline latencies (ns).
     lat_ring: [AtomicU64; LAT_RING_CAP],
     lat_idx: AtomicUsize,
-    /// Last rollback threshold for p99 used by autopilot.
-    last_p99_threshold: AtomicU64,
 }
 
 impl SliceController {
@@ -60,12 +52,10 @@ impl SliceController {
             current_slice_ns: initial_auto,
             base_slice_ns,
             auto_base_ns: initial_auto,
-            raw_auto_base_ns: initial_auto,
             min_ns: AUTO_SLICE_MIN_NS,
             max_ns: AUTO_SLICE_MAX_NS,
             lat_ring: std::array::from_fn(|_| AtomicU64::new(0)),
             lat_idx: AtomicUsize::new(0),
-            last_p99_threshold: AtomicU64::new(u64::MAX),
         }
     }
 
@@ -77,25 +67,9 @@ impl SliceController {
 
         let tasks_per_cpu = (nr_runnable as f64 / nr_cpus as f64).max(1.0);
         let computed = (TARGETED_LATENCY_NS as f64 / tasks_per_cpu) as u64;
-        // Keep the canonical clamped auto base for external readers but
-        // remember the raw computed base for potential autopilot experimentation.
-        self.raw_auto_base_ns = computed;
         self.auto_base_ns = computed.clamp(AUTO_SLICE_MIN_NS, AUTO_SLICE_MAX_NS);
 
-        // Recompute current base and respect runtime min/max bounds. If the
-        // autopilot has deliberately lowered `min_ns` below the hard lower
-        // clamp, allow the controller to use the raw computed base so the
-        // effective slice can move below `AUTO_SLICE_MIN_NS` during safe
-        // experiments. Otherwise, use the normal clamped auto base.
-        let base = if self.min_ns < AUTO_SLICE_MIN_NS {
-            if self.base_slice_ns > 0 {
-                self.raw_auto_base_ns.min(self.base_slice_ns)
-            } else {
-                self.raw_auto_base_ns
-            }
-        } else {
-            self.effective_base_ns()
-        };
+        let base = self.effective_base_ns();
 
         self.current_slice_ns = base.clamp(self.min_ns, self.max_ns);
         self.current_slice_ns
@@ -121,26 +95,6 @@ impl SliceController {
     /// Read adaptive max cap (ns).
     pub fn read_max(&self) -> u64 {
         self.max_ns
-    }
-
-    /// Atomically write both adaptive min and max caps (ns) in a safe way.
-    ///
-    /// If the caller supplies `min > max` the values are adjusted so that
-    /// `min <= max` to avoid `clamp()` panics. A debug message is emitted when
-    /// an adjustment is required.
-    pub fn write_min_max(&mut self, v_min: u64, v_max: u64) {
-        let min = v_min.max(1);
-        let mut max = v_max.max(1);
-        if min > max {
-            debug!(
-                "SliceController::write_min_max: requested min > max (min={} ns, max={} ns); adjusting max = min",
-                min, max
-            );
-            max = min;
-        }
-        self.min_ns = min;
-        self.max_ns = max;
-        self.current_slice_ns = self.current_slice_ns.clamp(self.min_ns, self.max_ns);
     }
 
     /// Record a scheduling pipeline latency sample (ns). This is designed to be
@@ -174,17 +128,6 @@ impl SliceController {
         let p95 = samples[(len * 95) / 100];
         let p99 = samples[(len * 99) / 100];
         (p50, p95, p99)
-    }
-
-    pub fn read_auto_base_ns(&self) -> u64 {
-        self.auto_base_ns
-    }
-    pub fn read_last_p99_threshold(&self) -> u64 {
-        self.last_p99_threshold.load(Ordering::Relaxed)
-    }
-
-    pub fn update_last_p99_threshold(&self, v: u64) {
-        self.last_p99_threshold.store(v, Ordering::Relaxed);
     }
 }
 

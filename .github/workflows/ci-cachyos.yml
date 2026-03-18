@@ -39,8 +39,5 @@ jobs:
             ~/.cargo/git
           key: cachyos-cargo-check-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: cachyos-cargo-check-
-
-
-
       - name: cargo check
-        run: cargo check --all
+        run: cargo check --locked --all

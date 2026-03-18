@@ -1,11 +1,10 @@
 // Copyright (c) scx_cognis contributors
 // SPDX-License-Identifier: GPL-2.0-only
 //
-// AI Module: TrustTable — O(1) Fixed-Size Trust and Anomaly Tracking
-//
-// Replaces BOTH the Bayesian Reputation Engine (`reputation.rs`) and the
-// Isolation Forest Anti-Cheat Engine (`anomaly.rs`) with a single fixed-size
-// open-addressing table.
+// TrustTable — fixed-size trust/watchlist tracking for observability and exit
+// cleanup. This is no longer the main basis for slice or placement decisions;
+// it is retained to surface repeatedly bad actors in stats/TUI and to keep
+// per-PID exit accounting bounded and allocation-free.
 //
 // ── Trust score design ────────────────────────────────────────────────────
 //
@@ -20,21 +19,18 @@
 // EMA update:  score ← clamp(score × α + delta, -1.0, +1.0)
 //
 // Quarantine threshold: score < TRUST_THRESHOLD (-0.35)
-//   → task is quarantined to restricted cores, slice factor reduced.
+//   → task is reported as quarantined/flagged in observability surfaces.
 //
 // ── Anomaly flag design ──────────────────────────────────────────────────
 //
-// Instead of an Isolation Forest that required periodic retraining and was
-// never actually fed live data in the previous implementation, the anomaly
-// flag is set behaviorally:
+// The anomaly flag is set behaviorally:
 //
 //   After 2 consecutive adversarial exits (cheat_flagged == true):
 //     → `flagged[slot]` is set to true.
 //   After one clean exit (cheat_flagged == false):
 //     → `cheat_streak` resets to 0, flag is cleared.
 //
-// This replaces the Isolation Forest's 3-tick confirmation window with a
-// simpler, more transparent, equally effective criterion.
+// This keeps the watchlist logic simple and transparent.
 //
 // ── Memory layout ─────────────────────────────────────────────────────────
 //
@@ -44,10 +40,10 @@
 //
 // Lookup + update cost: 1 multiply (Fibonacci hash) + 5 array reads/writes ≈ 2 ns.
 //
-// Reads happen on `ops.enqueue` and `ops.dispatch`.
-// Updates are applied from the periodic stale-PID flush in `main.rs`, which
-// converts lifetime snapshots into `ExitObservation` records without adding
-// any per-event heap allocation.
+// Reads happen when metrics/TUI want the current watchlist.
+// Updates are applied from the exit/stale-PID cleanup paths in `main.rs`,
+// which convert lifetime snapshots into `ExitObservation` records without
+// adding any per-event heap allocation.
 
 #![allow(dead_code)]
 
@@ -134,10 +130,10 @@ pub fn str_to_comm(s: &str) -> [u8; 16] {
 
 // ── TrustTable ───────────────────────────────────────────────────────────────
 
-/// O(1) combined trust-score and anomaly-detection table.
+/// O(1) combined trust-score and watchlist table.
 ///
-/// Replaces `ReputationEngine` (Bayesian beta priors) and `AntiCheatEngine`
-/// (Isolation Forest) with a flat, fixed-size open-addressing structure.
+/// Uses a flat, fixed-size open-addressing structure so trust/watchlist state
+/// stays bounded and allocation-free after startup.
 ///
 /// All state lives in six `[T; TRUST_TABLE_SIZE]` arrays.
 /// Allocated once via `TrustTable::new()` (which uses `alloc_zeroed`).
@@ -325,9 +321,8 @@ impl TrustTable {
             self.scores[s] = (self.scores[s] - 0.08_f32).max(-1.0);
         }
 
-        // ── Anomaly flag: set after 2 consecutive cheat-flagged exits ──────
-        // This replaces the Isolation Forest 3-tick confirmation window with
-        // a simpler, direct behavioural criterion.
+        // ── Watchlist flag: set after 2 consecutive cheat-flagged exits ────
+        // Keep the criterion direct and predictable.
         if self.cheat_streak[s] >= 2 {
             self.flagged[s] = true;
         }
@@ -449,14 +444,9 @@ impl TrustTable {
 
     /// Periodic maintenance tick — reserved for future time-decay of trust scores.
     ///
-    /// Replaces `AntiCheatEngine::tick()`.  Returns a fixed-size list of newly
-    /// flagged PIDs.  Currently always empty (anomaly flags are set eagerly in
-    /// `update_on_exit`); the return type matches the interface for call-site
-    /// compatibility.
-    ///
-    /// Unlike the old `AntiCheatEngine::tick()` which tried to retrain an
-    /// Isolation Forest on empty stats (the `update()` method was never called
-    /// from `main.rs`), this tick is a guaranteed no-op on the hot path.
+    /// Returns a fixed-size list of newly flagged PIDs. Currently always empty
+    /// because watchlist flags are set eagerly in `update_on_exit`; the return
+    /// type remains for call-site compatibility.
     pub fn tick(&self, _now_ns: u64) -> ([i32; 64], usize) {
         // Future extension: apply periodic trust decay for inactive PIDs.
         // e.g.: score[s] *= 0.999 for slots with last_seen_ns > 30s
