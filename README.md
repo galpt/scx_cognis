@@ -76,7 +76,7 @@ scx_cognis --mode server
 
 Conditionally.
 
-For a tested desktop or workstation setup, Cognis v2.0.2 is intended to be usable as a production scheduler: the normal scheduling path stays in BPF, the install default is the `desktop` profile, and the current tree has passed repeated local benchmark and regression testing before release.
+For a tested desktop or workstation setup, Cognis v2 is intended to be usable as a production scheduler: the normal scheduling path stays in BPF, the install default is the `desktop` profile, and the current tree has passed repeated local benchmark and regression testing before release.
 
 However, this project does not yet claim a blanket "production ready on every machine" guarantee across all kernels, topologies, desktop stacks, and server environments. The honest bar is:
 
