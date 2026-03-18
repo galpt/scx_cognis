@@ -109,6 +109,9 @@ sudo ./target/release/scx_cognis --tui
 
 Only one `sched_ext` scheduler instance should be active at a time. If you installed Cognis as a service, stop that service before launching a foreground or TUI instance.
 
+> [!NOTE]
+> The TUI is best used for short diagnostic sessions. For 24/7 use, run Cognis headless and treat `--tui` as an interactive troubleshooting tool rather than the normal production mode.
+
 ### Monitor a running instance
 
 ```bash
