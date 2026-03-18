@@ -56,7 +56,7 @@ Cognis currently exposes two profiles:
 
 | Profile | Default slice ceiling | Default min slice | Wake behavior | Overflow behavior |
 |:--|:--|:--|:--|:--|
-| `desktop` | `6000 µs` | `500 µs` | stronger wake responsiveness | keeps overflow local when possible |
+| `desktop` | `1000 µs` | `250 µs` | stronger wake responsiveness | keeps the first overflow local, then spills saturated queues to shared |
 | `server` | `8000 µs` | `1000 µs` | less wake-sync bias | prefers shared overflow sooner |
 
 The active profile is selected with:

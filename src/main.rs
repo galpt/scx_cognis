@@ -69,11 +69,11 @@ use tui::SharedState;
 const SCHEDULER_NAME: &str = "Cognis";
 const NSEC_PER_USEC: u64 = 1_000;
 const NSEC_PER_SEC: u64 = 1_000_000_000;
-const DEFAULT_DESKTOP_SLICE_NS: u64 = 6_000_000;
+const DEFAULT_DESKTOP_SLICE_NS: u64 = 1_000_000;
 const DEFAULT_SERVER_SLICE_NS: u64 = 8_000_000;
-const DEFAULT_DESKTOP_SLICE_MIN_NS: u64 = 500_000;
+const DEFAULT_DESKTOP_SLICE_MIN_NS: u64 = 250_000;
 const DEFAULT_SERVER_SLICE_MIN_NS: u64 = 1_000_000;
-const DEFAULT_DESKTOP_SLICE_LAG_NS: u64 = 4_000_000;
+const DEFAULT_DESKTOP_SLICE_LAG_NS: u64 = 40_000_000;
 const DEFAULT_SERVER_SLICE_LAG_NS: u64 = 1_500_000;
 const IDLE_BACKOFF: Duration = Duration::from_micros(250);
 const RESTART_BACKOFF: Duration = Duration::from_millis(250);
@@ -107,7 +107,7 @@ struct Opts {
     /// Maximum scheduling slice duration in microseconds.
     ///
     /// Set to 0 (default) to use the active profile default:
-    /// desktop = 6000 µs, server = 8000 µs.
+    /// desktop = 1000 µs, server = 8000 µs.
     ///
     /// This acts as the BPF-side slice ceiling and the userspace fallback
     /// slice reference.
@@ -117,7 +117,7 @@ struct Opts {
     /// Minimum scheduling slice duration in microseconds.
     ///
     /// Set to 0 (default) to use the active profile default:
-    /// desktop = 500 µs, server = 1000 µs.
+    /// desktop = 250 µs, server = 1000 µs.
     #[clap(short = 'S', long, default_value = "0")]
     slice_us_min: u64,
 

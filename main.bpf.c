@@ -120,7 +120,7 @@ const volatile bool no_wake_sync;
 /* Keep very short-burst tasks on the same CPU to reduce queue churn. */
 const volatile bool sticky_tasks;
 
-/* Server profile prefers shared overflow; desktop keeps overflow local. */
+/* Server profile prefers shared overflow; desktop only keeps the first spill local. */
 const volatile bool server_mode;
 
 /* Allow to use bpf_printk() only when @debug is set */
@@ -467,6 +467,29 @@ static bool task_should_migrate(struct task_struct *p, u64 enq_flags)
 {
 	return !__COMPAT_is_enq_cpu_selected(enq_flags) &&
 	       (!sticky_tasks || !scx_bpf_task_running(p));
+}
+
+/*
+ * Pick the fallback DSQ to use once no idle CPU was available.
+ *
+ * Desktop mode keeps the first overflow item local when the previous CPU
+ * queue is still empty, but once backlog has already formed on that CPU it
+ * spills to the shared DSQ so wake-sensitive work can compete globally
+ * instead of being trapped behind one hot local queue.
+ *
+ * Server mode always uses the shared overflow path.
+ */
+static u64 overflow_dsq(s32 prev_cpu)
+{
+	u64 local_dsq = cpu_to_dsq(prev_cpu);
+
+	if (server_mode)
+		return SHARED_DSQ;
+
+	if (scx_bpf_dsq_nr_queued(local_dsq))
+		return SHARED_DSQ;
+
+	return local_dsq;
 }
 
 static u64 task_slice(const struct task_struct *p, s32 cpu)
@@ -844,11 +867,12 @@ void BPF_STRUCT_OPS(rustland_enqueue, struct task_struct *p, u64 enq_flags)
 	}
 
 	/*
-	 * No idle CPU was available. Desktop mode keeps overflow local to
-	 * preserve cache warmth; server mode uses the shared DSQ to balance
-	 * throughput across CPUs.
+	 * No idle CPU was available. Spill saturated local queues into the
+	 * shared overflow DSQ so desktop wakeups are not trapped behind one hot
+	 * previous CPU, while still preserving a local-first bias when there is
+	 * no backlog yet.
 	 */
-	scx_bpf_dsq_insert_vtime(p, server_mode ? SHARED_DSQ : cpu_to_dsq(prev_cpu),
+	scx_bpf_dsq_insert_vtime(p, overflow_dsq(prev_cpu),
 				 task_slice(p, prev_cpu), task_dl(p, prev_cpu, tctx), enq_flags);
 	__sync_fetch_and_add(&nr_kernel_dispatches, 1);
 
