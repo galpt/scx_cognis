@@ -1,6 +1,6 @@
 [package]
 name = "scx_cognis"
-version = "2.0.5"
+version = "2.0.6"
 authors = ["scx_cognis contributors"]
 edition = "2021"
 description = "BPF-first sched_ext CPU scheduler for desktops, workstations, and servers"
