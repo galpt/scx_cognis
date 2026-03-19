@@ -1,6 +1,6 @@
 # scx_cognis
 
-`scx_cognis` is a BPF-first `sched_ext` scheduler for Linux desktops, workstations, and servers.
+`scx_cognis` is a BPF-first `sched_ext` scheduler aimed at desktops, workstations, and general-purpose servers.
 
 Cognis v2 keeps the normal scheduling path in BPF. Rust remains in the process for loading the scheduler, exporting stats, handling restart/reporting, driving the optional TUI, and servicing a narrow compatibility fallback when work intentionally crosses into userspace.
 
@@ -77,9 +77,9 @@ scx_cognis --mode server
 
 Conditionally.
 
-For a tested desktop or workstation setup, Cognis v2 is intended to be usable as a production scheduler: the normal scheduling path stays in BPF, the install default is the `desktop` profile, and the current tree has passed repeated local benchmark and regression testing before release.
+For a validated target machine and workload mix, Cognis v2 is intended to be usable as a production scheduler: the normal scheduling path stays in BPF, the Rust fallback is meant to be exceptional, and the install default is the `desktop` profile.
 
-However, this project does not yet claim a blanket "production ready on every machine" guarantee across all kernels, topologies, desktop stacks, and server environments. The honest bar is:
+However, this project does not claim a blanket "production ready on every machine" guarantee across all kernels, topologies, desktop stacks, and server environments. The honest bar is:
 
 - `desktop` mode: production-ready when you have validated it on the target machine and workload mix
 - `server` mode: maintained as a first-class profile, but still needs the same workload-specific validation before calling it production-ready for a server deployment
