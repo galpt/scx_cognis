@@ -45,14 +45,13 @@ At a high level, Cognis v2 works like this:
 5. If the local LLC queue is empty, Cognis can steal from another LLC queue before falling back to the current-task refill behavior.
 6. Rust stays available for restart control, stats, TUI, and the compatibility fallback path.
 
-Important implementation details:
-
-- The common case is meant to avoid a Rust round-trip.
-- `nr_queued`, `nr_scheduled`, and `nr_user_dispatches` are compatibility-fallback signals. If they keep rising under a workload, work is escaping the intended BPF fast path.
-- `nr_local_dispatches`, `nr_llc_dispatches`, `nr_shared_dispatches`, and `nr_xllc_steals` describe how saturated work is moving through the BPF hierarchy.
-- The Rust loop is no longer meant to spin continuously when BPF is handling the workload.
-- Rust-side scheduler tables are fixed-capacity and allocated once at startup, while the BPF side uses bounded DSQs plus per-task local storage.
-- The TUI and monitor are observability tools, not the scheduling engine itself.
+> [!IMPORTANT]
+> The common case is meant to avoid a Rust round-trip.
+> `nr_queued`, `nr_scheduled`, and `nr_user_dispatches` are compatibility-fallback signals. If they keep rising under a workload, work is escaping the intended BPF fast path.
+> `nr_local_dispatches`, `nr_llc_dispatches`, `nr_shared_dispatches`, and `nr_xllc_steals` describe how saturated work is moving through the BPF hierarchy.
+> The Rust loop is no longer meant to spin continuously when BPF is handling the workload.
+> Rust-side scheduler tables are fixed-capacity and allocated once at startup, while the BPF side uses bounded DSQs plus per-task local storage.
+> The TUI and monitor are observability tools, not the scheduling engine itself.
 
 ## Profiles
 
