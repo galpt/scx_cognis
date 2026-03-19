@@ -15,10 +15,10 @@ Cognis v2 keeps the normal scheduling path in BPF. Rust remains in the process f
 - [Install and Remove](#install-and-remove)
 - [Observability](#observability)
 - [Benchmark Helper](#benchmark-helper)
-- [Inspirations and References](#inspirations-and-references)
 - [Limitations](#limitations)
 - [Contributing](#contributing)
 - [License](#license)
+- [Inspirations and References](#inspirations-and-references)
 
 ## Status
 
@@ -262,19 +262,6 @@ Current phase layout:
 
 If you want benchmark numbers you can trust on your hardware, keep the environment fixed, run both schedulers multiple times, and compare repeated local runs rather than relying on one-off impressions.
 
-## Inspirations and References
-
-These references informed Cognis' design and evaluation mindset, especially around deadline ordering, bounded wake credit, locality-aware hierarchy design, and BPF-owned hot paths. They are inspirations and reference points, not a claim that Cognis automatically reproduces each cited paper's or project's published results.
-
-1. Linux kernel documentation. (n.d.). *EEVDF Scheduler*. https://docs.kernel.org/scheduler/sched-eevdf.html
-2. Duda, K. J., & Cheriton, D. R. (1999). *Borrowed-virtual-time (BVT) scheduling: Supporting latency-sensitive threads in a general-purpose scheduler*. Proceedings of the 17th ACM Symposium on Operating Systems Principles. https://web.stanford.edu/class/cs240/old/sp2014/readings/duda99borrowed.pdf
-3. Agrawal, K., & Sukha, J. (2011). *Hierarchical scheduling for multicores with multilevel cache hierarchies*. Washington University in St. Louis, Department of Computer Science and Engineering. https://openscholarship.wustl.edu/cse_research/66/
-4. Wang, J., Trach, B., Fu, M., Behrens, D., Schwender, J., Liu, Y., Lei, J., Vafeiadis, V., Härtig, H., & Chen, H. (2023). *BWoS: Formally verified block-based work stealing for parallel processing*. 17th USENIX Symposium on Operating Systems Design and Implementation (OSDI 23). https://www.usenix.org/conference/osdi23/presentation/wang-jiawei
-5. sched-ext maintainers. (n.d.). *scx_bpfland* [Software]. GitHub. https://github.com/sched-ext/scx/tree/main/scheds/rust/scx_bpfland
-6. sched-ext maintainers. (n.d.). *scx_beerland* [Software]. GitHub. https://github.com/sched-ext/scx/tree/main/scheds/rust/scx_beerland
-7. sched-ext maintainers. (n.d.). *scx_lavd* [Software]. GitHub. https://github.com/sched-ext/scx/tree/main/scheds/rust/scx_lavd
-8. sched-ext maintainers. (n.d.). *scx_cake* [Software]. GitHub. https://github.com/sched-ext/scx/tree/main/scheds/rust/scx_cake
-
 ## Limitations
 
 - Cognis v2 is BPF-first, but it is not yet a pure single-language BPF scheduler with no Rust control process.
@@ -302,3 +289,16 @@ If a change alters CLI behavior, profiles, exported stats, install scripts, work
 ## License
 
 This project is licensed under `GPL-2.0-only`. See [LICENSE](LICENSE).
+
+## Inspirations and References
+
+These references informed Cognis' design and evaluation mindset, especially around deadline ordering, bounded wake credit, locality-aware hierarchy design, and BPF-owned hot paths. They are inspirations and reference points, not a claim that Cognis automatically reproduces each cited paper's or project's published results.
+
+1. Linux kernel documentation. (n.d.). *EEVDF Scheduler*. https://docs.kernel.org/scheduler/sched-eevdf.html
+2. Duda, K. J., & Cheriton, D. R. (1999). *Borrowed-virtual-time (BVT) scheduling: Supporting latency-sensitive threads in a general-purpose scheduler*. Proceedings of the 17th ACM Symposium on Operating Systems Principles. https://web.stanford.edu/class/cs240/old/sp2014/readings/duda99borrowed.pdf
+3. Agrawal, K., & Sukha, J. (2011). *Hierarchical scheduling for multicores with multilevel cache hierarchies*. Washington University in St. Louis, Department of Computer Science and Engineering. https://openscholarship.wustl.edu/cse_research/66/
+4. Wang, J., Trach, B., Fu, M., Behrens, D., Schwender, J., Liu, Y., Lei, J., Vafeiadis, V., Härtig, H., & Chen, H. (2023). *BWoS: Formally verified block-based work stealing for parallel processing*. 17th USENIX Symposium on Operating Systems Design and Implementation (OSDI 23). https://www.usenix.org/conference/osdi23/presentation/wang-jiawei
+5. sched-ext maintainers. (n.d.). *scx_bpfland* [Software]. GitHub. https://github.com/sched-ext/scx/tree/main/scheds/rust/scx_bpfland
+6. sched-ext maintainers. (n.d.). *scx_beerland* [Software]. GitHub. https://github.com/sched-ext/scx/tree/main/scheds/rust/scx_beerland
+7. sched-ext maintainers. (n.d.). *scx_lavd* [Software]. GitHub. https://github.com/sched-ext/scx/tree/main/scheds/rust/scx_lavd
+8. sched-ext maintainers. (n.d.). *scx_cake* [Software]. GitHub. https://github.com/sched-ext/scx/tree/main/scheds/rust/scx_cake
