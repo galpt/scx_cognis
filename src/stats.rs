@@ -38,10 +38,14 @@ pub struct Metrics {
     pub nr_local_dispatches: u64,
     #[stat(desc = "BPF routes that spilled into an LLC DSQ")]
     pub nr_llc_dispatches: u64,
+    #[stat(desc = "BPF routes that spilled into a node-wide DSQ")]
+    pub nr_node_dispatches: u64,
     #[stat(desc = "BPF routes that spilled into the global shared DSQ")]
     pub nr_shared_dispatches: u64,
     #[stat(desc = "Cross-LLC steals after the local LLC queue ran empty")]
     pub nr_xllc_steals: u64,
+    #[stat(desc = "Cross-node steals after the local node queue ran empty")]
+    pub nr_xnode_steals: u64,
     #[stat(desc = "Cancelled dispatches")]
     pub nr_cancel_dispatches: u64,
     #[stat(desc = "Dispatches bounced to another DSQ")]
@@ -113,13 +117,17 @@ impl Metrics {
             return "Observability watchlist has active PIDs; review repeated adverse exits.";
         }
         if load >= 0.90
-            && self.nr_shared_dispatches > self.nr_llc_dispatches.saturating_mul(2)
+            && self.nr_shared_dispatches
+                > self
+                    .nr_llc_dispatches
+                    .saturating_add(self.nr_node_dispatches)
+                    .saturating_mul(2)
             && self.nr_shared_dispatches > 0
         {
-            return "System saturated; shared spill dominates, check LLC balance.";
+            return "System saturated; shared spill dominates, check LLC and node balance.";
         }
         if load >= 0.90 && self.nr_kernel_dispatches > 0 {
-            return "System saturated; BPF local/LLC/shared hierarchy is carrying the load.";
+            return "System saturated; BPF local/LLC/node/shared hierarchy is carrying the load.";
         }
         if load >= 0.85 && compute_heavy {
             return "Heavy compute load detected; watch fallback activity and tail latency.";
@@ -187,11 +195,13 @@ impl Metrics {
 
         writeln!(
             w,
-            "             route(local/llc/shared/xllc): {}/{}/{}/{} | slice(base/assigned):{}/{}µs",
+            "             route(local/llc/node/shared/xllc/xnode): {}/{}/{}/{}/{}/{} | slice(base/assigned):{}/{}µs",
             self.nr_local_dispatches,
             self.nr_llc_dispatches,
+            self.nr_node_dispatches,
             self.nr_shared_dispatches,
             self.nr_xllc_steals,
+            self.nr_xnode_steals,
             self.base_slice_us,
             self.assigned_slice_us,
         )?;
@@ -223,10 +233,14 @@ impl Metrics {
                 .nr_local_dispatches
                 .saturating_sub(rhs.nr_local_dispatches),
             nr_llc_dispatches: self.nr_llc_dispatches.saturating_sub(rhs.nr_llc_dispatches),
+            nr_node_dispatches: self
+                .nr_node_dispatches
+                .saturating_sub(rhs.nr_node_dispatches),
             nr_shared_dispatches: self
                 .nr_shared_dispatches
                 .saturating_sub(rhs.nr_shared_dispatches),
             nr_xllc_steals: self.nr_xllc_steals.saturating_sub(rhs.nr_xllc_steals),
+            nr_xnode_steals: self.nr_xnode_steals.saturating_sub(rhs.nr_xnode_steals),
             nr_cancel_dispatches: self
                 .nr_cancel_dispatches
                 .saturating_sub(rhs.nr_cancel_dispatches),

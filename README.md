@@ -22,7 +22,7 @@ Cognis v2 keeps the normal scheduling path in BPF. Rust remains in the process f
 ## Status
 
 - Runtime model: BPF-first `sched_ext` scheduler with a Rust control plane
-- Common path: per-CPU local DSQs, per-LLC overflow DSQs, then a global shared DSQ as the last saturated spill path
+- Common path: per-CPU local DSQs, per-LLC overflow DSQs, then per-node DSQs on multi-node systems, with the global shared DSQ as the final spill path
 - Default install profile: `desktop`
 - Optional profile: `server`
 - Userspace fallback still exists for compatibility, but it is intended to be exceptional rather than the normal path
@@ -39,28 +39,28 @@ At a high level, Cognis v2 works like this:
 
 1. `ops.select_cpu` and `ops.enqueue` try to keep ordinary work in BPF.
 2. The BPF side uses a queue hierarchy:
-   `CPU local DSQ -> LLC DSQ -> shared DSQ`.
+   `CPU local DSQ -> LLC DSQ -> node DSQ -> shared DSQ`.
 3. Dispatch ordering is deadline-based and bounded by profile slice and wake-credit knobs.
-4. When the local CPU queue is empty, Cognis first tries the local LLC queue and only then uses the global shared spill path.
-5. If the local LLC queue is empty, Cognis can steal from another LLC queue before falling back to the current-task refill behavior.
+4. On single-node systems, the node tier collapses away and Cognis behaves as a local/LLC/shared scheduler with smarter remote LLC stealing.
+5. When the local tiers are empty, Cognis first looks at local deadline heads, then tries remote LLC steals, then wider node-domain steals, and only then falls back to the current-task refill behavior.
 6. Rust stays available for restart control, stats, TUI, and the compatibility fallback path.
 
 > [!IMPORTANT]
 > - The common case is meant to avoid a Rust round-trip.
 > - `nr_queued`, `nr_scheduled`, and `nr_user_dispatches` are compatibility-fallback signals. If they keep rising under a workload, work is escaping the intended BPF fast path.
-> - `nr_local_dispatches`, `nr_llc_dispatches`, `nr_shared_dispatches`, and `nr_xllc_steals` describe how saturated work is moving through the BPF hierarchy.
+> - `nr_local_dispatches`, `nr_llc_dispatches`, `nr_node_dispatches`, `nr_shared_dispatches`, `nr_xllc_steals`, and `nr_xnode_steals` describe how saturated work is moving through the BPF hierarchy.
 > - The Rust loop is no longer meant to spin continuously when BPF is handling the workload.
 > - Rust-side scheduler tables are fixed-capacity and allocated once at startup, while the BPF side uses bounded DSQs plus per-task local storage.
 > - The TUI and monitor are observability tools, not the scheduling engine itself.
 
 ## Profiles
 
-Cognis exposes two profiles. Both use the same BPF hierarchy; `desktop` is tuned for faster wake responsiveness and longer LLC-local retention, while `server` spills to the global queue sooner and uses broader balancing under pressure.
+Cognis exposes two profiles. Both use the same BPF hierarchy; `desktop` is tuned for faster wake responsiveness and longer locality retention, while `server` reaches broader spill tiers sooner and uses steadier throughput-oriented balancing under pressure.
 
 | Profile | Default slice ceiling | Default min slice | Wake behavior | Saturated-path bias |
 |:--|:--|:--|:--|:--|
-| `desktop` | `1000 µs` | `250 µs` | stronger wake responsiveness | favors local and LLC spill first |
-| `server` | `8000 µs` | `1000 µs` | less wake-sync bias | uses the same hierarchy but reaches shared spill sooner |
+| `desktop` | `1000 µs` | `250 µs` | stronger wake responsiveness | favors local, LLC, and nearby-domain retention before broader spill |
+| `server` | `8000 µs` | `1000 µs` | less wake-sync bias | uses the same hierarchy but reaches node/shared spill sooner |
 
 The active profile is selected with:
 
@@ -231,15 +231,17 @@ What the main counters mean:
 - `nr_kernel_dispatches`: total tasks handled directly by the BPF scheduler
 - `nr_local_dispatches`: BPF routes that stayed on a CPU-local DSQ
 - `nr_llc_dispatches`: BPF routes that spilled into an LLC DSQ
+- `nr_node_dispatches`: BPF routes that spilled into a node DSQ
 - `nr_shared_dispatches`: BPF routes that spilled into the global shared DSQ
 - `nr_xllc_steals`: dispatch steals from a non-local LLC queue
+- `nr_xnode_steals`: dispatch steals from a non-local node queue
 - `nr_user_dispatches`: tasks that crossed into the userspace compatibility fallback
 - `nr_queued` / `nr_scheduled`: current compatibility-fallback backlog
 - `sched_p50/p95/p99`: userspace fallback latency percentiles, not full-system frame-time metrics
 
 If `nr_user_dispatches`, `nr_queued`, or `nr_scheduled` stay elevated during a workload that should fit the BPF fast path, that is a signal to investigate the BPF policy rather than a sign that the userspace path is “working as intended.”
 
-If `nr_shared_dispatches` dominates `nr_llc_dispatches` during a saturated workload, that is a hint that the workload is spilling past local cache domains and may benefit from more tuning on the saturated path.
+If `nr_shared_dispatches` dominates `nr_llc_dispatches + nr_node_dispatches` during a saturated workload, that is a hint that the workload is spilling past local cache and node domains and may benefit from more tuning on the saturated path.
 
 ## Benchmark Helper
 

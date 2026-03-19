@@ -298,20 +298,23 @@ fn draw_overview(f: &mut Frame, area: Rect, m: &Metrics) {
             m.nr_user_dispatches, m.nr_kernel_dispatches, m.nr_failed_dispatches
         )),
         Line::from(format!(
-            "  BPF Route (local/llc/shared):   {} / {} / {}",
-            m.nr_local_dispatches, m.nr_llc_dispatches, m.nr_shared_dispatches
+            "  BPF Route (local/llc/node/shared): {} / {} / {} / {}",
+            m.nr_local_dispatches,
+            m.nr_llc_dispatches,
+            m.nr_node_dispatches,
+            m.nr_shared_dispatches
         )),
         Line::from(format!(
-            "  Remote LLC Steals / Bounce:     {} / {}",
-            m.nr_xllc_steals, m.nr_bounce_dispatches
+            "  Remote Steals (llc/node):       {} / {}",
+            m.nr_xllc_steals, m.nr_xnode_steals
         )),
         Line::from(format!(
-            "  Cancelled / Congestion:         {} / {}",
-            m.nr_cancel_dispatches, m.nr_sched_congested
+            "  Bounce / Cancelled:             {} / {}",
+            m.nr_bounce_dispatches, m.nr_cancel_dispatches
         )),
         Line::from(format!(
-            "  Page Faults (scheduler):        {}",
-            m.nr_page_faults
+            "  Congestion / Page Faults:       {} / {}",
+            m.nr_sched_congested, m.nr_page_faults
         )),
         Line::from(format!("  CPU Load:                       {}%", load_pct)),
     ];

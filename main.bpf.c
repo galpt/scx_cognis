@@ -9,6 +9,7 @@
  * The hot policy is intentionally simple and research-driven:
  *   - per-CPU local DSQs for locality
  *   - per-LLC overflow DSQs before the global shared fallback
+ *   - per-NUMA node DSQs before the global shared fallback
  *   - EEVDF-like virtual deadlines
  *   - bounded wakeup credit for frequently sleeping tasks
  *   - desktop/server profiles that tune slice, lag, and spill behavior
@@ -48,13 +49,20 @@ UEI_DEFINE(uei);
 #define SHARED_DSQ MAX_CPUS
 
 /*
- * Per-LLC overflow DSQs sit between the CPU-local queues and the global
- * shared spill queue. This keeps saturation mostly inside the closest cache
- * domain and only falls back to the global queue once the LLC domain is also
- * carrying backlog.
+ * Per-LLC overflow DSQs sit between the CPU-local queues and the wider
+ * node-wide spill queue. This keeps saturation mostly inside the closest
+ * cache domain before broadening out to a NUMA domain or the global shared
+ * fallback.
  */
 #define MAX_LLCS 64
 #define LLC_DSQ_BASE (MAX_CPUS + 2)
+
+/*
+ * Per-node overflow DSQs sit between the LLC queues and the global shared
+ * fallback. On single-node systems this layer is skipped entirely.
+ */
+#define MAX_NODES 64
+#define NODE_DSQ_BASE (LLC_DSQ_BASE + MAX_LLCS)
 
 /*
  * The user-space scheduler itself is dispatched using a separate DSQ, that
@@ -74,9 +82,26 @@ UEI_DEFINE(uei);
 const volatile u32 nr_llcs = 1;
 
 /*
+ * Number of compact NUMA domains exported by the Rust loader.
+ *
+ * When topology probing fails, this stays at the safe single-domain default.
+ */
+const volatile u32 nr_nodes = 1;
+
+/*
  * Compact LLC index for each CPU, exported by the Rust loader.
  */
 const volatile u16 cpu_llc_idx_map[MAX_CPUS] = {};
+
+/*
+ * Compact node index for each CPU, exported by the Rust loader.
+ */
+const volatile u16 cpu_node_idx_map[MAX_CPUS] = {};
+
+/*
+ * Compact node index for each LLC domain, exported by the Rust loader.
+ */
+const volatile u16 llc_node_idx_map[MAX_LLCS] = {};
 
 /*
  * Scheduler attributes and statistics.
@@ -128,7 +153,8 @@ volatile u64 nr_user_dispatches, nr_kernel_dispatches,
 
 /* BPF hierarchy routing statistics */
 volatile u64 nr_local_dispatches, nr_llc_dispatches,
-	     nr_shared_dispatches, nr_xllc_steals;
+	     nr_node_dispatches, nr_shared_dispatches,
+	     nr_xllc_steals, nr_xnode_steals;
 
 /* Failure statistics */
 volatile u64 nr_failed_dispatches, nr_sched_congested;
@@ -145,7 +171,7 @@ const volatile bool no_wake_sync;
 /* Keep very short-burst tasks on the same CPU to reduce queue churn. */
 const volatile bool sticky_tasks;
 
-/* Server profile spills to the global shared DSQ sooner, but still uses LLC queues first. */
+/* Server profile spills through the hierarchy sooner, but still keeps the same tiers. */
 const volatile bool server_mode;
 
 /* Allow to use bpf_printk() only when @debug is set */
@@ -443,6 +469,14 @@ static inline u64 llc_to_dsq(u32 llc_idx)
 }
 
 /*
+ * Return the DSQ ID associated to a compact NUMA node domain.
+ */
+static inline u64 node_to_dsq(u32 node_idx)
+{
+	return NODE_DSQ_BASE + node_idx;
+}
+
+/*
  * Return the compact LLC index associated to @cpu.
  */
 static inline u32 cpu_llc_idx_for(s32 cpu)
@@ -454,11 +488,41 @@ static inline u32 cpu_llc_idx_for(s32 cpu)
 }
 
 /*
+ * Return the compact node index associated to @cpu.
+ */
+static inline u32 cpu_node_idx_for(s32 cpu)
+{
+	if (!is_cpu_valid(cpu))
+		return 0;
+
+	return cpu_node_idx_map[cpu];
+}
+
+/*
+ * Return the compact node index associated to an LLC domain.
+ */
+static inline u32 llc_node_idx_for(u32 llc_idx)
+{
+	if (llc_idx >= MAX_LLCS)
+		return 0;
+
+	return llc_node_idx_map[llc_idx];
+}
+
+/*
  * Return the DSQ ID associated to the LLC domain that contains @cpu.
  */
 static inline u64 cpu_llc_dsq(s32 cpu)
 {
 	return llc_to_dsq(cpu_llc_idx_for(cpu));
+}
+
+/*
+ * Return the DSQ ID associated to the node domain that contains @cpu.
+ */
+static inline u64 cpu_node_dsq(s32 cpu)
+{
+	return node_to_dsq(cpu_node_idx_for(cpu));
 }
 
 /*
@@ -544,6 +608,9 @@ static void count_kernel_route(u64 dsq_id)
 {
 	if (dsq_id == SHARED_DSQ) {
 		__sync_fetch_and_add(&nr_shared_dispatches, 1);
+	} else if (dsq_id >= NODE_DSQ_BASE &&
+		   dsq_id < NODE_DSQ_BASE + MAX_NODES) {
+		__sync_fetch_and_add(&nr_node_dispatches, 1);
 	} else if (dsq_id >= LLC_DSQ_BASE &&
 		   dsq_id < LLC_DSQ_BASE + MAX_LLCS) {
 		__sync_fetch_and_add(&nr_llc_dispatches, 1);
@@ -563,6 +630,8 @@ static u64 queue_pressure(s32 cpu)
 
 	pressure += scx_bpf_dsq_nr_queued(cpu_to_dsq(cpu));
 	pressure += scx_bpf_dsq_nr_queued(cpu_llc_dsq(cpu));
+	if (nr_nodes > 1)
+		pressure += scx_bpf_dsq_nr_queued(cpu_node_dsq(cpu));
 
 	return pressure;
 }
@@ -578,21 +647,32 @@ static u64 llc_spill_threshold(void)
 	return cpus_per_llc;
 }
 
+static u64 node_spill_threshold(void)
+{
+	u64 nodes = MAX((u64)nr_nodes, 1);
+	u64 cpus_per_node = MAX((nr_online_cpus + nodes - 1) / nodes, 1);
+
+	if (server_mode)
+		return MAX(cpus_per_node / 2, 1);
+
+	return cpus_per_node;
+}
+
 /*
  * Pick the fallback DSQ to use once no idle CPU was available.
  *
  * Both profiles keep the first spill local when the previous CPU queue is
  * still empty. Once that CPU already carries backlog, Cognis prefers the
- * closest LLC DSQ and only spills to the global shared DSQ if the LLC domain
- * is already saturated too.
+ * closest LLC DSQ and then the wider node DSQ. It only spills to the global
+ * shared DSQ once the nearer domains are already saturated too.
  *
- * Server mode uses the same hierarchy but reaches the shared DSQ sooner to
- * keep throughput-oriented balancing broad under pressure.
+ * Server mode uses the same hierarchy but reaches broader spill tiers sooner
+ * to keep throughput-oriented balancing broad under pressure.
  */
 static u64 overflow_dsq(s32 prev_cpu)
 {
-	u64 local_dsq, llc_dsq;
-	u64 local_depth, llc_depth;
+	u64 local_dsq, llc_dsq, node_dsq;
+	u64 local_depth, llc_depth, node_depth;
 
 	if (!is_cpu_valid(prev_cpu))
 		return SHARED_DSQ;
@@ -606,6 +686,13 @@ static u64 overflow_dsq(s32 prev_cpu)
 	llc_depth = scx_bpf_dsq_nr_queued(llc_dsq);
 	if (llc_depth < llc_spill_threshold())
 		return llc_dsq;
+
+	if (nr_nodes > 1) {
+		node_dsq = cpu_node_dsq(prev_cpu);
+		node_depth = scx_bpf_dsq_nr_queued(node_dsq);
+		if (node_depth < node_spill_threshold())
+			return node_dsq;
+	}
 
 	return SHARED_DSQ;
 }
@@ -810,14 +897,32 @@ out_release:
 	bpf_task_release(p);
 }
 
-static bool steal_remote_llc(s32 cpu)
+static inline bool is_remote_head_better(const struct task_struct *candidate,
+					 u64 candidate_depth,
+					 const struct task_struct *best,
+					 u64 best_depth)
 {
-	u32 my_llc, victim, i;
+	if (!candidate)
+		return false;
+	if (!best)
+		return true;
+	if (candidate->scx.dsq_vtime != best->scx.dsq_vtime)
+		return candidate->scx.dsq_vtime < best->scx.dsq_vtime;
+
+	return candidate_depth > best_depth;
+}
+
+static bool steal_remote_llc(s32 cpu, bool same_node_only)
+{
+	struct task_struct *candidate, *best = NULL;
+	u64 best_depth = 0, candidate_depth, best_dsq = 0;
+	u32 my_llc, my_node, victim, i;
 
 	if (!is_cpu_valid(cpu) || nr_llcs <= 1)
 		return false;
 
 	my_llc = cpu_llc_idx_for(cpu);
+	my_node = cpu_node_idx_for(cpu);
 
 	bpf_for(i, 1, MAX_LLCS) {
 		if (i >= nr_llcs)
@@ -827,10 +932,63 @@ static bool steal_remote_llc(s32 cpu)
 		if (victim >= nr_llcs)
 			victim -= nr_llcs;
 
-		if (scx_bpf_dsq_move_to_local(llc_to_dsq(victim))) {
-			__sync_fetch_and_add(&nr_xllc_steals, 1);
-			return true;
+		if (same_node_only && llc_node_idx_for(victim) != my_node)
+			continue;
+
+		candidate_depth = scx_bpf_dsq_nr_queued(llc_to_dsq(victim));
+		if (!candidate_depth)
+			continue;
+
+		candidate = __COMPAT_scx_bpf_dsq_peek(llc_to_dsq(victim));
+		if (is_remote_head_better(candidate, candidate_depth, best, best_depth)) {
+			best = candidate;
+			best_depth = candidate_depth;
+			best_dsq = llc_to_dsq(victim);
 		}
+	}
+
+	if (best && scx_bpf_dsq_move_to_local(best_dsq)) {
+		__sync_fetch_and_add(&nr_xllc_steals, 1);
+		return true;
+	}
+
+	return false;
+}
+
+static bool steal_remote_node(s32 cpu)
+{
+	struct task_struct *candidate, *best = NULL;
+	u64 best_depth = 0, candidate_depth, best_dsq = 0;
+	u32 my_node, victim, i;
+
+	if (!is_cpu_valid(cpu) || nr_nodes <= 1)
+		return false;
+
+	my_node = cpu_node_idx_for(cpu);
+
+	bpf_for(i, 1, MAX_NODES) {
+		if (i >= nr_nodes)
+			break;
+
+		victim = my_node + i;
+		if (victim >= nr_nodes)
+			victim -= nr_nodes;
+
+		candidate_depth = scx_bpf_dsq_nr_queued(node_to_dsq(victim));
+		if (!candidate_depth)
+			continue;
+
+		candidate = __COMPAT_scx_bpf_dsq_peek(node_to_dsq(victim));
+		if (is_remote_head_better(candidate, candidate_depth, best, best_depth)) {
+			best = candidate;
+			best_depth = candidate_depth;
+			best_dsq = node_to_dsq(victim);
+		}
+	}
+
+	if (best && scx_bpf_dsq_move_to_local(best_dsq)) {
+		__sync_fetch_and_add(&nr_xnode_steals, 1);
+		return true;
 	}
 
 	return false;
@@ -1012,10 +1170,11 @@ void BPF_STRUCT_OPS(rustland_enqueue, struct task_struct *p, u64 enq_flags)
 	/*
 	 * No idle CPU was available. Route through the hierarchy:
 	 *
-	 *   local CPU DSQ -> LLC DSQ -> shared DSQ
+	 *   local CPU DSQ -> LLC DSQ -> node DSQ -> shared DSQ
 	 *
 	 * This keeps saturation mostly inside the closest cache domain before
-	 * paying the contention cost of the global shared queue.
+	 * widening to a node domain and finally paying the contention cost of the
+	 * global shared queue.
 	 */
 	u64 target_dsq = overflow_dsq(prev_cpu);
 	scx_bpf_dsq_insert_vtime(p, target_dsq,
@@ -1059,9 +1218,10 @@ static long handle_dispatched_task(struct bpf_dynptr *dynptr, void *context)
  */
 void BPF_STRUCT_OPS(rustland_dispatch, s32 cpu, struct task_struct *prev)
 {
-	struct task_struct *local, *llc, *shared, *best = NULL;
+	struct task_struct *local, *llc, *node = NULL, *shared, *best = NULL;
 	u64 local_dsq = cpu_to_dsq(cpu);
 	u64 llc_dsq = cpu_llc_dsq(cpu);
+	u64 node_dsq = cpu_node_dsq(cpu);
 	u64 best_dsq = 0;
 
 	/*
@@ -1084,16 +1244,22 @@ void BPF_STRUCT_OPS(rustland_dispatch, s32 cpu, struct task_struct *prev)
 
 	/*
 	 * Pick the earliest deadline between the local CPU DSQ, the local LLC
-	 * overflow DSQ, and the global shared spill DSQ.
+	 * overflow DSQ, the wider node DSQ, and the global shared spill DSQ.
 	 */
 	local = __COMPAT_scx_bpf_dsq_peek(local_dsq);
 	llc = __COMPAT_scx_bpf_dsq_peek(llc_dsq);
+	if (nr_nodes > 1)
+		node = __COMPAT_scx_bpf_dsq_peek(node_dsq);
 	shared = __COMPAT_scx_bpf_dsq_peek(SHARED_DSQ);
 	best = local;
 	best_dsq = local_dsq;
 	if (is_deadline_min(llc, best)) {
 		best = llc;
 		best_dsq = llc_dsq;
+	}
+	if (is_deadline_min(node, best)) {
+		best = node;
+		best_dsq = node_dsq;
 	}
 	if (is_deadline_min(shared, best)) {
 		best = shared;
@@ -1105,9 +1271,15 @@ void BPF_STRUCT_OPS(rustland_dispatch, s32 cpu, struct task_struct *prev)
 		return;
 	if (llc && best_dsq != llc_dsq && scx_bpf_dsq_move_to_local(llc_dsq))
 		return;
+	if (node && best_dsq != node_dsq && scx_bpf_dsq_move_to_local(node_dsq))
+		return;
 	if (shared && best_dsq != SHARED_DSQ && scx_bpf_dsq_move_to_local(SHARED_DSQ))
 		return;
-	if (steal_remote_llc(cpu))
+	if (steal_remote_llc(cpu, true))
+		return;
+	if (steal_remote_node(cpu))
+		return;
+	if (steal_remote_llc(cpu, false))
 		return;
 
 	/*
@@ -1326,7 +1498,7 @@ static s32 get_nr_online_cpus(void)
 /*
  * Create a DSQ hierarchy for each CPU available in the system:
  *
- *   per-CPU DSQs -> per-LLC DSQs -> global shared DSQ
+ *   per-CPU DSQs -> per-LLC DSQs -> per-node DSQs -> global shared DSQ
  *
  * The compatibility user-space scheduler still keeps its own dedicated DSQ.
  */
@@ -1356,6 +1528,19 @@ static int dsq_init(void)
 		err = scx_bpf_create_dsq(llc_to_dsq(llc), -1);
 		if (err) {
 			scx_bpf_error("failed to create llc DSQ %d: %d",
+				      llc, err);
+			return err;
+		}
+	}
+
+	/* Create per-node DSQs */
+	bpf_for(llc, 0, MAX_NODES) {
+		if (llc >= nr_nodes)
+			break;
+
+		err = scx_bpf_create_dsq(node_to_dsq(llc), -1);
+		if (err) {
+			scx_bpf_error("failed to create node DSQ %d: %d",
 				      llc, err);
 			return err;
 		}
@@ -1407,6 +1592,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(rustland_init)
 	/* Compile-time checks */
 	BUILD_BUG_ON((MAX_CPUS % 2));
 	BUILD_BUG_ON(MAX_LLCS > MAX_CPUS);
+	BUILD_BUG_ON(MAX_NODES > MAX_CPUS);
 
 	/* Initialize maximum possible CPU number */
 	nr_cpu_ids = scx_bpf_nr_cpu_ids();

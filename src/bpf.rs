@@ -52,6 +52,7 @@ const SCHED_EXT: i32 = 7;
 const TASK_COMM_LEN: usize = 16;
 const MAX_TOPO_CPUS: usize = bpf_intf::MAX_CPUS as usize;
 const MAX_LLCS: usize = 64;
+const MAX_NODES: usize = 64;
 
 // Allow to dispatch the task on any CPU.
 //
@@ -63,7 +64,10 @@ pub const RL_CPU_ANY: i32 = bpf_intf::RL_CPU_ANY as i32;
 struct TopologyExport {
     smt_enabled: bool,
     nr_llcs: u32,
+    nr_nodes: u32,
     cpu_llc_idx_map: [u16; MAX_TOPO_CPUS],
+    cpu_node_idx_map: [u16; MAX_TOPO_CPUS],
+    llc_node_idx_map: [u16; MAX_LLCS],
 }
 
 impl Default for TopologyExport {
@@ -71,7 +75,10 @@ impl Default for TopologyExport {
         Self {
             smt_enabled: false,
             nr_llcs: 1,
+            nr_nodes: 1,
             cpu_llc_idx_map: [0; MAX_TOPO_CPUS],
+            cpu_node_idx_map: [0; MAX_TOPO_CPUS],
+            llc_node_idx_map: [0; MAX_LLCS],
         }
     }
 }
@@ -97,7 +104,17 @@ impl TopologyExport {
                     return export;
                 }
 
+                if topo.nodes.len() > MAX_NODES {
+                    warn!(
+                        "host exposes {} NUMA domains but Cognis supports at most {MAX_NODES}; falling back to a single logical node",
+                        topo.nodes.len()
+                    );
+                    return export;
+                }
+
+                let mut node_remap = BTreeMap::<usize, u16>::new();
                 let mut llc_remap = BTreeMap::<usize, u16>::new();
+                let mut next_node = 0u16;
                 let mut next_llc = 0u16;
 
                 for (&cpu_id, cpu) in &topo.all_cpus {
@@ -109,6 +126,15 @@ impl TopologyExport {
                         continue;
                     }
 
+                    let node_idx = if let Some(&idx) = node_remap.get(&cpu.node_id) {
+                        idx
+                    } else {
+                        let idx = next_node;
+                        node_remap.insert(cpu.node_id, idx);
+                        next_node = next_node.saturating_add(1);
+                        idx
+                    };
+
                     let llc_idx = if let Some(&idx) = llc_remap.get(&cpu.llc_id) {
                         idx
                     } else {
@@ -117,9 +143,13 @@ impl TopologyExport {
                         next_llc = next_llc.saturating_add(1);
                         idx
                     };
+
+                    export.cpu_node_idx_map[cpu_id] = node_idx;
                     export.cpu_llc_idx_map[cpu_id] = llc_idx;
+                    export.llc_node_idx_map[llc_idx as usize] = node_idx;
                 }
 
+                export.nr_nodes = u32::from(next_node).max(1);
                 export.nr_llcs = u32::from(next_llc).max(1);
             }
             Err(err) => {
@@ -297,7 +327,10 @@ impl<'cb> BpfScheduler<'cb> {
         let topo = TopologyExport::detect();
         rodata.smt_enabled = topo.smt_enabled;
         rodata.nr_llcs = topo.nr_llcs;
+        rodata.nr_nodes = topo.nr_nodes;
         rodata.cpu_llc_idx_map.copy_from_slice(&topo.cpu_llc_idx_map);
+        rodata.cpu_node_idx_map.copy_from_slice(&topo.cpu_node_idx_map);
+        rodata.llc_node_idx_map.copy_from_slice(&topo.llc_node_idx_map);
 
         // Enable scheduler flags.
         skel.struct_ops.rustland_mut().flags =
@@ -520,6 +553,12 @@ impl<'cb> BpfScheduler<'cb> {
         &mut self.skel.maps.bss_data.as_mut().unwrap().nr_llc_dispatches
     }
 
+    // Counter of BPF routes that spilled into a node DSQ.
+    #[allow(dead_code)]
+    pub fn nr_node_dispatches_mut(&mut self) -> &mut u64 {
+        &mut self.skel.maps.bss_data.as_mut().unwrap().nr_node_dispatches
+    }
+
     // Counter of BPF routes that spilled into the global shared DSQ.
     #[allow(dead_code)]
     pub fn nr_shared_dispatches_mut(&mut self) -> &mut u64 {
@@ -530,6 +569,12 @@ impl<'cb> BpfScheduler<'cb> {
     #[allow(dead_code)]
     pub fn nr_xllc_steals_mut(&mut self) -> &mut u64 {
         &mut self.skel.maps.bss_data.as_mut().unwrap().nr_xllc_steals
+    }
+
+    // Counter of remote node steals performed after local tiers drained.
+    #[allow(dead_code)]
+    pub fn nr_xnode_steals_mut(&mut self) -> &mut u64 {
+        &mut self.skel.maps.bss_data.as_mut().unwrap().nr_xnode_steals
     }
 
     // Counter of cancel dispatch events.

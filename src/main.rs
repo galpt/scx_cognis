@@ -8,7 +8,7 @@
 // fallback when work intentionally crosses into userspace:
 //
 //   ┌─────────────────────────────────────────────────────────────────────┐
-//   │  ops.enqueue    → BPF local CPU / LLC / shared hierarchy             │
+//   │  ops.enqueue    → BPF local CPU / LLC / node / shared hierarchy      │
 //   │  ops.dispatch   → bounded wake credit + virtual deadline handoff     │
 //   │  fallback path  → dormant userspace compatibility path               │
 //   │  ops.select_cpu → kernel idle-CPU query (pick_idle_cpu, atomic)     │
@@ -99,9 +99,9 @@ impl SchedulerMode {
 
 /// scx_cognis: a BPF-first CPU scheduler with a minimal userspace fallback.
 ///
-/// Scheduling pipeline: a BPF local CPU / LLC / shared hierarchy owns normal
-/// dispatch, while Rust stays available for stats, restart handling, and a
-/// narrow compatibility fallback path.
+/// Scheduling pipeline: a BPF local CPU / LLC / node / shared hierarchy owns
+/// normal dispatch, while Rust stays available for stats, restart handling,
+/// and a narrow compatibility fallback path.
 #[derive(Debug, Parser)]
 struct Opts {
     /// Maximum scheduling slice duration in microseconds.
@@ -1298,8 +1298,10 @@ impl<'a> Scheduler<'a> {
             nr_kernel_dispatches: *self.bpf.nr_kernel_dispatches_mut(),
             nr_local_dispatches: *self.bpf.nr_local_dispatches_mut(),
             nr_llc_dispatches: *self.bpf.nr_llc_dispatches_mut(),
+            nr_node_dispatches: *self.bpf.nr_node_dispatches_mut(),
             nr_shared_dispatches: *self.bpf.nr_shared_dispatches_mut(),
             nr_xllc_steals: *self.bpf.nr_xllc_steals_mut(),
+            nr_xnode_steals: *self.bpf.nr_xnode_steals_mut(),
             nr_cancel_dispatches: *self.bpf.nr_cancel_dispatches_mut(),
             nr_bounce_dispatches: *self.bpf.nr_bounce_dispatches_mut(),
             nr_failed_dispatches: *self.bpf.nr_failed_dispatches_mut(),
