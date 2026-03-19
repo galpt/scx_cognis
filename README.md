@@ -104,13 +104,13 @@ What still requires real-machine validation:
 
 ## Build and Run
 
-### Requirements
+### Runtime Requirements
 
-To run Cognis you need:
+For normal plug-and-play use with the installer or a release binary, Cognis needs:
 
 - Linux with `sched_ext` support
-- a Rust toolchain
-- common BPF build dependencies such as `clang`, `llvm`, `libbpf`, `libelf`, `zlib`, `libseccomp`, and `pkg-config`
+- `x86_64`: `install.sh` can download a prebuilt release binary
+- other architectures: use `install.sh --build-from-source`
 
 You can check whether the running kernel exposes `sched_ext` with:
 
@@ -118,7 +118,16 @@ You can check whether the running kernel exposes `sched_ext` with:
 grep CONFIG_SCHED_CLASS_EXT /boot/config-$(uname -r)
 ```
 
-### Build from source
+Non-developer users do not need to install Rust manually for the default `x86_64` install path. `sudo sh install.sh` downloads a release binary and sets up the service for you.
+
+### Build from Source Requirements
+
+If you want to compile Cognis locally, you need:
+
+- a Rust toolchain
+- common BPF build dependencies such as `clang`, `llvm`, `libbpf`, `libelf`, `zlib`, `libseccomp`, and `pkg-config`
+
+### Build from Source
 
 ```bash
 git clone https://github.com/galpt/scx_cognis
