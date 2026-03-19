@@ -50,6 +50,7 @@ At a high level, Cognis v2 works like this:
 > - The common case is meant to avoid a Rust round-trip.
 > - `nr_queued`, `nr_scheduled`, and `nr_user_dispatches` are compatibility-fallback signals. If they keep rising under a workload, work is escaping the intended BPF fast path.
 > - `nr_local_dispatches`, `nr_llc_dispatches`, `nr_node_dispatches`, `nr_shared_dispatches`, `nr_xllc_steals`, and `nr_xnode_steals` describe how saturated work is moving through the BPF hierarchy.
+> - `slice(base/assigned)` in the monitor is not a live trace of every BPF dispatch slice: `base` is the active profile ceiling, while `assigned` tracks the userspace-fallback slice estimate.
 > - The Rust loop is no longer meant to spin continuously when BPF is handling the workload.
 > - Rust-side scheduler tables are fixed-capacity and allocated once at startup, while the BPF side uses bounded DSQs plus per-task local storage.
 > - The TUI and monitor are observability tools, not the scheduling engine itself.
@@ -238,6 +239,7 @@ What the main counters mean:
 - `nr_xnode_steals`: dispatch steals from a non-local node queue
 - `nr_user_dispatches`: tasks that crossed into the userspace compatibility fallback
 - `nr_queued` / `nr_scheduled`: current compatibility-fallback backlog
+- `slice(base/assigned)`: profile slice ceiling plus userspace-fallback assigned-slice estimate, not a direct per-task BPF slice trace
 - `sched_p50/p95/p99`: userspace fallback latency percentiles, not full-system frame-time metrics
 
 If `nr_user_dispatches`, `nr_queued`, or `nr_scheduled` stay elevated during a workload that should fit the BPF fast path, that is a signal to investigate the BPF policy rather than a sign that the userspace path is “working as intended.”

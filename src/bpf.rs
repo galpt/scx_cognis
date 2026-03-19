@@ -316,7 +316,7 @@ impl<'cb> BpfScheduler<'cb> {
         // Open the BPF prog first for verification.
         let mut skel_builder = BpfSkelBuilder::default();
         skel_builder.obj_builder.debug(debug);
-        let mut skel = scx_ops_open!(skel_builder, open_object, rustland, open_opts)?;
+        let mut skel = scx_ops_open!(skel_builder, open_object, cognis, open_opts)?;
 
         let rodata = skel
             .maps
@@ -333,12 +333,12 @@ impl<'cb> BpfScheduler<'cb> {
         rodata.llc_node_idx_map.copy_from_slice(&topo.llc_node_idx_map);
 
         // Enable scheduler flags.
-        skel.struct_ops.rustland_mut().flags =
+        skel.struct_ops.cognis_mut().flags =
             *compat::SCX_OPS_ENQ_LAST | *compat::SCX_OPS_ALLOW_QUEUED_WAKEUP;
         if partial {
-            skel.struct_ops.rustland_mut().flags |= *compat::SCX_OPS_SWITCH_PARTIAL;
+            skel.struct_ops.cognis_mut().flags |= *compat::SCX_OPS_SWITCH_PARTIAL;
         }
-        skel.struct_ops.rustland_mut().exit_dump_len = exit_dump_len;
+        skel.struct_ops.cognis_mut().exit_dump_len = exit_dump_len;
         rodata.usersched_pid = std::process::id();
         rodata.builtin_idle = builtin_idle;
         rodata.slice_ns = profile.slice_ns;
@@ -348,17 +348,17 @@ impl<'cb> BpfScheduler<'cb> {
         rodata.sticky_tasks = profile.sticky_tasks;
         rodata.server_mode = profile.is_server();
         rodata.debug = debug;
-        let _ = Self::set_scx_ops_name(&mut skel.struct_ops.rustland_mut().name, name);
+        let _ = Self::set_scx_ops_name(&mut skel.struct_ops.cognis_mut().name, name);
 
         // Attach BPF scheduler.
-        let mut skel = scx_ops_load!(skel, rustland, uei)?;
+        let mut skel = scx_ops_load!(skel, cognis, uei)?;
         let _ = skel
             .maps
             .bss_data
             .as_ref()
             .context("missing bss_data map in BPF skeleton")?;
 
-        let struct_ops = Some(scx_ops_attach!(skel, rustland)?);
+        let struct_ops = Some(scx_ops_attach!(skel, cognis)?);
 
         let queued_slot = Rc::new(RefCell::new(None));
         let exit_slot = Rc::new(RefCell::new(None));

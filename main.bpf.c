@@ -31,6 +31,10 @@ char _license[] SEC("license") = "GPL";
 
 UEI_DEFINE(uei);
 
+#ifndef __COMPAT_HAS_scx_bpf_select_cpu_and
+#define __COMPAT_HAS_scx_bpf_select_cpu_and bpf_ksym_exists(scx_bpf_select_cpu_and)
+#endif
+
 #ifndef NSEC_PER_USEC
 #define NSEC_PER_USEC 1000ULL
 #endif
@@ -785,7 +789,7 @@ static s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu, u64 wake_flags)
 	 *
 	 * This is required to support kernels <= 6.16.
 	 */
-	if (!bpf_ksym_exists(scx_bpf_select_cpu_and)) {
+	if (!__COMPAT_HAS_scx_bpf_select_cpu_and) {
 		bool is_idle = false;
 
 		if (!wake_flags)
@@ -994,7 +998,7 @@ static bool steal_remote_node(s32 cpu)
 	return false;
 }
 
-s32 BPF_STRUCT_OPS(rustland_select_cpu, struct task_struct *p, s32 prev_cpu,
+s32 BPF_STRUCT_OPS(cognis_select_cpu, struct task_struct *p, s32 prev_cpu,
 		   u64 wake_flags)
 {
 	s32 cpu, this_cpu = bpf_get_smp_processor_id();
@@ -1065,7 +1069,7 @@ int rs_select_cpu(struct task_cpu_arg *input)
 	 * ops.select_cpu() and opt.enqueue(), return any idle CPU usable
 	 * by the task in this case.
 	 */
-	if (!bpf_ksym_exists(scx_bpf_select_cpu_and)) {
+	if (!__COMPAT_HAS_scx_bpf_select_cpu_and) {
 		if (!scx_bpf_test_and_clear_cpu_idle(cpu))
 			cpu = scx_bpf_pick_idle_cpu(p->cpus_ptr, 0);
 	} else {
@@ -1097,7 +1101,7 @@ static bool is_queued_wakeup(const struct task_struct *p, u64 enq_flags)
  * user-space scheduler is not required, or enqueue it to be processed by the
  * scheduler.
  */
-void BPF_STRUCT_OPS(rustland_enqueue, struct task_struct *p, u64 enq_flags)
+void BPF_STRUCT_OPS(cognis_enqueue, struct task_struct *p, u64 enq_flags)
 {
 	s32 prev_cpu = scx_bpf_task_cpu(p), cpu;
 	bool should_kick = is_queued_wakeup(p, enq_flags);
@@ -1216,7 +1220,7 @@ static long handle_dispatched_task(struct bpf_dynptr *dynptr, void *context)
  * so (usually if other CPUs are idle we may want to send more tasks to their
  * local DSQ to optimize the scheduling pipeline).
  */
-void BPF_STRUCT_OPS(rustland_dispatch, s32 cpu, struct task_struct *prev)
+void BPF_STRUCT_OPS(cognis_dispatch, s32 cpu, struct task_struct *prev)
 {
 	struct task_struct *local, *llc, *node = NULL, *shared, *best = NULL;
 	u64 local_dsq = cpu_to_dsq(cpu);
@@ -1295,7 +1299,7 @@ void BPF_STRUCT_OPS(rustland_dispatch, s32 cpu, struct task_struct *prev)
 		prev->scx.slice = task_slice(prev, cpu);
 }
 
-void BPF_STRUCT_OPS(rustland_runnable, struct task_struct *p, u64 enq_flags)
+void BPF_STRUCT_OPS(cognis_runnable, struct task_struct *p, u64 enq_flags)
 {
 	u64 now = bpf_ktime_get_ns(), delta_t;
 	struct task_ctx *tctx;
@@ -1318,7 +1322,7 @@ void BPF_STRUCT_OPS(rustland_runnable, struct task_struct *p, u64 enq_flags)
 /*
  * Task @p starts on its selected CPU (update CPU ownership map).
  */
-void BPF_STRUCT_OPS(rustland_running, struct task_struct *p)
+void BPF_STRUCT_OPS(cognis_running, struct task_struct *p)
 {
 	struct task_ctx *tctx;
 	s32 cpu = scx_bpf_task_cpu(p);
@@ -1349,7 +1353,7 @@ void BPF_STRUCT_OPS(rustland_running, struct task_struct *p)
 /*
  * Task @p stops running on its associated CPU (update CPU ownership map).
  */
-void BPF_STRUCT_OPS(rustland_stopping, struct task_struct *p, bool runnable)
+void BPF_STRUCT_OPS(cognis_stopping, struct task_struct *p, bool runnable)
 {
 	u64 now = scx_bpf_now();
 	u64 slice, delta_vtime;
@@ -1384,7 +1388,7 @@ void BPF_STRUCT_OPS(rustland_stopping, struct task_struct *p, bool runnable)
 /*
  * A task joins the sched_ext scheduler.
  */
-void BPF_STRUCT_OPS(rustland_enable, struct task_struct *p)
+void BPF_STRUCT_OPS(cognis_enable, struct task_struct *p)
 {
 	p->scx.dsq_vtime = vtime_now;
 	p->scx.slice = MAX(slice_ns, slice_min_ns);
@@ -1398,7 +1402,7 @@ void BPF_STRUCT_OPS(rustland_enable, struct task_struct *p)
  *
  * Pattern from scx_layered's layered_disable / scx_bpfland's ops.disable.
  */
-void BPF_STRUCT_OPS(rustland_disable, struct task_struct *p)
+void BPF_STRUCT_OPS(cognis_disable, struct task_struct *p)
 {
 	__u32 *pid_slot;
 
@@ -1569,7 +1573,7 @@ static int dsq_init(void)
  * Allocate and initialize all the internal structures for the task (this
  * function is allowed to block, so it can be used to preallocate memory).
  */
-s32 BPF_STRUCT_OPS(rustland_init_task, struct task_struct *p,
+s32 BPF_STRUCT_OPS(cognis_init_task, struct task_struct *p,
 		   struct scx_init_task_args *args)
 {
 	struct task_ctx *tctx;
@@ -1585,7 +1589,7 @@ s32 BPF_STRUCT_OPS(rustland_init_task, struct task_struct *p,
 /*
  * Initialize the scheduling class.
  */
-s32 BPF_STRUCT_OPS_SLEEPABLE(rustland_init)
+s32 BPF_STRUCT_OPS_SLEEPABLE(cognis_init)
 {
 	int err;
 
@@ -1597,7 +1601,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(rustland_init)
 	/* Initialize maximum possible CPU number */
 	nr_cpu_ids = scx_bpf_nr_cpu_ids();
 
-	/* Initialize rustland core */
+	/* Initialize the Cognis BPF scheduler core. */
 	err = dsq_init();
 	if (err)
 		return err;
@@ -1611,7 +1615,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(rustland_init)
 /*
  * Unregister the scheduling class.
  */
-void BPF_STRUCT_OPS(rustland_exit, struct scx_exit_info *ei)
+void BPF_STRUCT_OPS(cognis_exit, struct scx_exit_info *ei)
 {
 	UEI_RECORD(uei, ei);
 }
@@ -1619,18 +1623,18 @@ void BPF_STRUCT_OPS(rustland_exit, struct scx_exit_info *ei)
 /*
  * Scheduling class declaration.
  */
-SCX_OPS_DEFINE(rustland,
-	       .select_cpu		= (void *)rustland_select_cpu,
-	       .enqueue			= (void *)rustland_enqueue,
-	       .dispatch		= (void *)rustland_dispatch,
-	       .runnable		= (void *)rustland_runnable,
-	       .running			= (void *)rustland_running,
-	       .stopping		= (void *)rustland_stopping,
-	       .enable			= (void *)rustland_enable,
-	       .disable			= (void *)rustland_disable,
-	       .init_task		= (void *)rustland_init_task,
-	       .init			= (void *)rustland_init,
-	       .exit			= (void *)rustland_exit,
+SCX_OPS_DEFINE(cognis,
+	       .select_cpu		= (void *)cognis_select_cpu,
+	       .enqueue			= (void *)cognis_enqueue,
+	       .dispatch		= (void *)cognis_dispatch,
+	       .runnable		= (void *)cognis_runnable,
+	       .running			= (void *)cognis_running,
+	       .stopping		= (void *)cognis_stopping,
+	       .enable			= (void *)cognis_enable,
+	       .disable			= (void *)cognis_disable,
+	       .init_task		= (void *)cognis_init_task,
+	       .init			= (void *)cognis_init,
+	       .exit			= (void *)cognis_exit,
 	       .timeout_ms		= 5000,
 	       .dispatch_max_batch	= MAX_DISPATCH_SLOT,
-	       .name			= "rustland");
+	       .name			= "cognis");
