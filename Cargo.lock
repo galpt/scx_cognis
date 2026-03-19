@@ -1260,7 +1260,7 @@ dependencies = [
 
 [[package]]
 name = "scx_cognis"
-version = "2.0.3"
+version = "2.0.4"
 dependencies = [
  "anyhow",
  "clap",
