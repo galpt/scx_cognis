@@ -19,6 +19,8 @@ err()  { printf "${BLD}${RED}[ERROR ]${RST} %s\n" "$1" >&2; }
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 RESULTS_DIR="$SCRIPT_DIR/benchmark-results/mini-benchmarker-$(date +%Y%m%d-%H%M%S)"
 WORKDIR="${XDG_CACHE_HOME:-$HOME/.cache}/scx_cognis/mini-benchmarker-workdir"
+MINI_LOCAL_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/scx_cognis/mini-benchmarker"
+MINI_LOCAL_SCRIPT="$MINI_LOCAL_DIR/mini-benchmarker.sh"
 MODE="desktop"
 RUNS=1
 DROP_CACHES=0
@@ -156,15 +158,22 @@ find_mini_benchmarker() {
         return
     fi
 
-    for candidate in mini-benchmarker.sh mini-benchmarker; do
+    for candidate in \
+        "$MINI_LOCAL_SCRIPT" \
+        mini-benchmarker.sh \
+        mini-benchmarker
+    do
         if command -v "$candidate" >/dev/null 2>&1; then
             MINI_BENCHMARKER_CMD=$(command -v "$candidate")
+            return
+        elif [ -x "$candidate" ]; then
+            MINI_BENCHMARKER_CMD="$candidate"
             return
         fi
     done
 
     err "mini-benchmarker.sh was not found in PATH."
-    say "Install the external Mini Benchmarker tool first, then rerun this script."
+    say "Install it with ./install_benchmark_deps.sh --mini-benchmarker or set --mini-cmd."
     exit 1
 }
 
@@ -235,10 +244,10 @@ print_install_hints() {
 Install hints:
   CachyOS / Arch:
     - benchmark bootstrap helper: ./install_benchmark_deps.sh --mini-benchmarker --plotter
-    - Mini Benchmarker may still require a manual install path or an AUR helper
+    - local fetched copy is searched at ~/.local/share/scx_cognis/mini-benchmarker/mini-benchmarker.sh
   Debian / Ubuntu:
     - common packages: ./install_benchmark_deps.sh --mini-benchmarker --plotter
-    - Mini Benchmarker itself may still need manual installation
+    - local fetched copy is searched at ~/.local/share/scx_cognis/mini-benchmarker/mini-benchmarker.sh
 EOF
 }
 
@@ -273,9 +282,12 @@ PY
         warn "matplotlib not available for $PLOTTER_PYTHON"
     fi
 
-    for candidate in mini-benchmarker.sh mini-benchmarker; do
+    for candidate in "$MINI_LOCAL_SCRIPT" mini-benchmarker.sh mini-benchmarker; do
         if command -v "$candidate" >/dev/null 2>&1; then
             detected_mini=$(command -v "$candidate")
+            break
+        elif [ -x "$candidate" ]; then
+            detected_mini="$candidate"
             break
         fi
     done

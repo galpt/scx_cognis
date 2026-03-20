@@ -17,6 +17,9 @@ err()  { printf "${BLD}${RED}[ERROR ]${RST} %s\n" "$1" >&2; }
 
 INSTALL_MINI=0
 INSTALL_PLOTTER=0
+MINI_LOCAL_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/scx_cognis/mini-benchmarker"
+MINI_LOCAL_SCRIPT="$MINI_LOCAL_DIR/mini-benchmarker.sh"
+MINI_SOURCE_URL="https://gitlab.com/torvic9/mini-benchmarker/-/raw/master/mini-benchmarker.sh"
 
 usage() {
     cat <<'EOF'
@@ -89,6 +92,22 @@ install_plotter() {
     ok "Plotter environment ready at $venv_dir"
 }
 
+fetch_mini_benchmarker_script() {
+    mkdir -p "$MINI_LOCAL_DIR"
+    if command -v curl >/dev/null 2>&1; then
+        say "Fetching Mini Benchmarker from $MINI_SOURCE_URL"
+        curl -L --fail --silent --show-error "$MINI_SOURCE_URL" -o "$MINI_LOCAL_SCRIPT"
+    elif command -v wget >/dev/null 2>&1; then
+        say "Fetching Mini Benchmarker from $MINI_SOURCE_URL"
+        wget -qO "$MINI_LOCAL_SCRIPT" "$MINI_SOURCE_URL"
+    else
+        err "Need curl or wget to fetch Mini Benchmarker."
+        exit 1
+    fi
+    chmod +x "$MINI_LOCAL_SCRIPT"
+    ok "Installed Mini Benchmarker to $MINI_LOCAL_SCRIPT"
+}
+
 install_mini_benchmarker() {
     local distro
     distro=$(detect_distro)
@@ -97,13 +116,12 @@ install_mini_benchmarker() {
         cachyos|arch)
             if command -v pacman >/dev/null 2>&1; then
                 warn "Mini Benchmarker is not guaranteed to be in the standard repos."
-                warn "Preferred path on Arch-derived systems is an AUR helper or manual install."
+                warn "Preferred path on Arch-derived systems is an AUR helper or the local fetched copy."
                 say "Trying common benchmark dependencies from pacman first."
                 run_privileged pacman -S --needed --noconfirm \
                     python python-pip python-matplotlib stress-ng perf blender x265 argon2 \
                     wget git p7zip primesieve inxi bc unzip xz gcc make cmake nasm || true
-                warn "If mini-benchmarker.sh is still missing, install it manually from:"
-                warn "  https://gitlab.com/torvic9/mini-benchmarker"
+                fetch_mini_benchmarker_script
                 return
             fi
             ;;
@@ -114,17 +132,14 @@ install_mini_benchmarker() {
                 run_privileged apt-get install -y --no-install-recommends \
                     python3 python3-venv python3-pip python3-matplotlib stress-ng linux-perf \
                     blender xz-utils wget git p7zip-full build-essential cmake nasm bc unzip || true
-                warn "Mini Benchmarker itself is not packaged consistently on Debian/Ubuntu."
-                warn "Install it manually from:"
-                warn "  https://gitlab.com/torvic9/mini-benchmarker"
+                fetch_mini_benchmarker_script
                 return
             fi
             ;;
     esac
 
-    warn "No supported automatic installer path for this distro."
-    warn "Install Mini Benchmarker manually from:"
-    warn "  https://gitlab.com/torvic9/mini-benchmarker"
+    warn "No supported automatic package install path for this distro."
+    fetch_mini_benchmarker_script
 }
 
 if [ "$INSTALL_PLOTTER" -eq 1 ]; then

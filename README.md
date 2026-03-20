@@ -279,8 +279,8 @@ This script automates a heavier CPU-focused comparison around the external [Mini
 Important scope notes:
 
 - the wrapper is distro-agnostic, and it can report missing prerequisites with `./mini_benchmarker.sh --check-deps`
-- Mini Benchmarker itself is still an external benchmark suite; [install_benchmark_deps.sh](install_benchmark_deps.sh) provides a best-effort dependency bootstrap plus manual-install hints
-- the default executable lookup is `mini-benchmarker.sh`, with `MINI_BENCHMARKER_CMD` or `--mini-cmd` as an override
+- Mini Benchmarker itself is still an external benchmark suite; [install_benchmark_deps.sh](install_benchmark_deps.sh) now fetches Vic's `mini-benchmarker.sh` into `~/.local/share/scx_cognis/mini-benchmarker/` and installs common package dependencies on a best-effort basis
+- the default executable lookup checks that local install first, then `mini-benchmarker.sh` in `PATH`, with `MINI_BENCHMARKER_CMD` or `--mini-cmd` as an override
 - chart generation uses `python3` plus `matplotlib`, and `./mini_benchmarker.sh --bootstrap-plotter` can create a local plotter virtualenv when needed
 - this is still local-machine benchmarking; it does not turn one run into a universal scheduler claim
 
@@ -288,9 +288,9 @@ Typical usage:
 
 ```bash
 ./mini_benchmarker.sh --check-deps
+./install_benchmark_deps.sh --mini-benchmarker --plotter
 ./mini_benchmarker.sh --mode desktop
 ./mini_benchmarker.sh --mode server --runs 3 --bootstrap-plotter
-./install_benchmark_deps.sh --plotter
 ```
 
 If you want benchmark numbers you can trust on your hardware, keep the environment fixed, run both schedulers multiple times, and compare repeated local runs rather than relying on one-off impressions.
