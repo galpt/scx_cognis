@@ -1,29 +1,29 @@
-label,runs,benchmark,mean_seconds
-Linux 6.19.7-1-cachyos,1,stress-ng cpu-cache-mem,15.15
-Linux 6.19.7-1-cachyos,1,y-cruncher pi 1b,40.51
-Linux 6.19.7-1-cachyos,1,perf sched msg fork thread,10.30
-Linux 6.19.7-1-cachyos,1,perf memcpy,10.19
-Linux 6.19.7-1-cachyos,1,namd 92K atoms,50.76
-Linux 6.19.7-1-cachyos,1,calculating prime numbers,12.18
-Linux 6.19.7-1-cachyos,1,argon2 hashing,7.92
-Linux 6.19.7-1-cachyos,1,ffmpeg compilation,74.94
-Linux 6.19.7-1-cachyos,1,xz compression,55.08
-Linux 6.19.7-1-cachyos,1,kernel defconfig,132.66
-Linux 6.19.7-1-cachyos,1,blender render,100.50
-Linux 6.19.7-1-cachyos,1,x265 encoding,22.95
-Linux 6.19.7-1-cachyos,1,Total time (s),533.14
-Linux 6.19.7-1-cachyos,1,Total score,72.12
-Cognis (desktop),1,stress-ng cpu-cache-mem,17.55
-Cognis (desktop),1,y-cruncher pi 1b,40.78
-Cognis (desktop),1,perf sched msg fork thread,9.54
-Cognis (desktop),1,perf memcpy,10.46
-Cognis (desktop),1,namd 92K atoms,50.69
-Cognis (desktop),1,calculating prime numbers,12.31
-Cognis (desktop),1,argon2 hashing,8.85
-Cognis (desktop),1,ffmpeg compilation,76.11
-Cognis (desktop),1,xz compression,59.53
-Cognis (desktop),1,kernel defconfig,135.54
-Cognis (desktop),1,blender render,102.62
-Cognis (desktop),1,x265 encoding,23.27
-Cognis (desktop),1,Total time (s),547.25
-Cognis (desktop),1,Total score,74.39
+label,power_profile,runs,benchmark,mean_seconds
+Linux 6.19.7-1-cachyos,balanced,1,stress-ng cpu-cache-mem,15.99
+Linux 6.19.7-1-cachyos,balanced,1,y-cruncher pi 1b,42.56
+Linux 6.19.7-1-cachyos,balanced,1,perf sched msg fork thread,11.29
+Linux 6.19.7-1-cachyos,balanced,1,perf memcpy,10.96
+Linux 6.19.7-1-cachyos,balanced,1,namd 92K atoms,116.27
+Linux 6.19.7-1-cachyos,balanced,1,calculating prime numbers,13.88
+Linux 6.19.7-1-cachyos,balanced,1,argon2 hashing,8.13
+Linux 6.19.7-1-cachyos,balanced,1,ffmpeg compilation,84.05
+Linux 6.19.7-1-cachyos,balanced,1,xz compression,62.67
+Linux 6.19.7-1-cachyos,balanced,1,kernel defconfig,147.33
+Linux 6.19.7-1-cachyos,balanced,1,blender render,114.45
+Linux 6.19.7-1-cachyos,balanced,1,x265 encoding,25.73
+Linux 6.19.7-1-cachyos,balanced,1,Total time (s),653.31
+Linux 6.19.7-1-cachyos,balanced,1,Total score,84.12
+Cognis (desktop),balanced,1,stress-ng cpu-cache-mem,17.95
+Cognis (desktop),balanced,1,y-cruncher pi 1b,42.13
+Cognis (desktop),balanced,1,perf sched msg fork thread,9.74
+Cognis (desktop),balanced,1,perf memcpy,11.00
+Cognis (desktop),balanced,1,namd 92K atoms,54.93
+Cognis (desktop),balanced,1,calculating prime numbers,13.87
+Cognis (desktop),balanced,1,argon2 hashing,8.96
+Cognis (desktop),balanced,1,ffmpeg compilation,82.33
+Cognis (desktop),balanced,1,xz compression,63.06
+Cognis (desktop),balanced,1,kernel defconfig,146.87
+Cognis (desktop),balanced,1,blender render,116.88
+Cognis (desktop),balanced,1,x265 encoding,26.76
+Cognis (desktop),balanced,1,Total time (s),594.48
+Cognis (desktop),balanced,1,Total score,79.69

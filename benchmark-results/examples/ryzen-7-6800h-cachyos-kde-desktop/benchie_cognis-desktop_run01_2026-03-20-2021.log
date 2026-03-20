@@ -1,0 +1,31 @@
+stress-ng cpu-cache-mem: 17.95
+y-cruncher pi 1b: 42.13
+perf sched msg fork thread: 9.744
+perf memcpy: 11.00
+namd 92K atoms: 54.93
+calculating prime numbers: 13.868
+argon2 hashing: 8.96
+ffmpeg compilation: 82.33
+xz compression: 63.06
+kernel defconfig: 146.87
+blender render: 116.88
+x265 encoding: 26.76
+
+Total time (s): 594.48
+Total score: 79.69
+
+Name: cognis-desktop_run01
+Date: 2026-03-20-2021
+
+System:    Kernel: 6.19.7-1-cachyos__cognis-desktop arch: x86_64 bits: 64
+           Desktop: KDE Plasma v: 6.6.3 Distro: CachyOS
+Memory:    System RAM: total: 64 GiB available: 58.54 GiB used: 25.78 GiB (44.0%)
+           Device-1: Channel-A DIMM 0 type: DDR5 size: 32 GiB speed: 4800 MT/s
+           Device-2: Channel-B DIMM 0 type: DDR5 size: 32 GiB speed: 4800 MT/s
+CPU:       Info: 8-core model: AMD Ryzen 7 6800H with Radeon Graphics bits: 64 type: MT MCP cache: L2: 4 MiB
+           Speed (MHz): avg: 1096 min/max: 404/4787 cores: 1: 1096 2: 1096 3: 1096 4: 1096 5: 1096 6: 1096 7: 1096 8: 1096 9: 1096 10: 1096 11: 1096 12: 1096 13: 1096 14: 1096 15: 1096 16: 1096
+
+Benchmark label: Cognis (desktop)
+Original kernel: 6.19.7-1-cachyos
+Benchmark variant: cognis-desktop
+Power profile: balanced

@@ -312,23 +312,18 @@ Machine used for this example:
 - RAM: `64 GiB DDR5-4800`
 - distro / desktop: `CachyOS` with `KDE Plasma 6.6.3`
 - baseline kernel: `Linux 6.19.7-1-cachyos`
+- power profile: `balanced`
 - Cognis mode: `desktop`
 - runs per variant: `1`
-
-Power-profile note:
-
-- this historical example run did not record the active power profile
-- the committed data therefore does not claim `performance` or `balanced` mode for that run
-- future tagged logs now include a `Power profile:` line for this benchmark helper
 
 Result snapshot from the committed example:
 
 | Variant | Total time (s) | Total score |
 |:--|--:|--:|
-| `Linux 6.19.7-1-cachyos` | `533.14` | `72.12` |
-| `Cognis (desktop)` | `547.25` | `74.39` |
+| `Linux 6.19.7-1-cachyos` | `653.31` | `84.12` |
+| `Cognis (desktop)` | `594.48` | `79.69` |
 
-In this particular run, the baseline kernel finished faster overall. The full chart and raw tagged logs are committed so the result stays inspectable instead of being summarized loosely.
+In this particular run, `Cognis (desktop)` finished faster overall than the baseline kernel. The full chart and raw tagged logs are committed so the result stays inspectable instead of being summarized loosely.
 
 ![Mini Benchmarker example: Linux 6.19.7-1-cachyos vs Cognis desktop](benchmark-results/examples/ryzen-7-6800h-cachyos-kde-desktop/mini_benchmarker_comparison.png)
 
