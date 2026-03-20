@@ -207,8 +207,10 @@ download_binary() {
         exit 1
     }
 
-    cp "${_tmp}/${BINARY_NAME}" "${BINARY_PATH}"
-    chmod 755 "${BINARY_PATH}"
+    _staged="${BINARY_PATH}.new.$$"
+    cp "${_tmp}/${BINARY_NAME}" "${_staged}"
+    chmod 755 "${_staged}"
+    mv -f "${_staged}" "${BINARY_PATH}"
     log_ok "Binary installed: ${BINARY_PATH}"
 }
 
@@ -248,8 +250,10 @@ build_from_source() {
         exit 1
     fi
 
-    run "cp \"${_target_dir}/release/${BINARY_NAME}\" \"${BINARY_PATH}\""
-    run "chmod 755 \"${BINARY_PATH}\""
+    _staged="${BINARY_PATH}.new.$$"
+    run "cp \"${_target_dir}/release/${BINARY_NAME}\" \"${_staged}\""
+    run "chmod 755 \"${_staged}\""
+    run "mv -f \"${_staged}\" \"${BINARY_PATH}\""
     log_ok "Built and installed: ${BINARY_PATH}"
 }
 
