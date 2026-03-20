@@ -410,6 +410,27 @@ DROPIN
     log_ok "Stats socket drop-in written: ${_dropin}"
 }
 
+install_runtime_dropin() {
+    _dropin_dir="/etc/systemd/system/${SERVICE_NAME}.service.d"
+    _dropin="${_dropin_dir}/scx_cognis_runtime.conf"
+
+    if [ -n "$DRY_RUN" ]; then
+        log_info "(dry-run) Would write runtime failure drop-in to ${_dropin}"
+        return
+    fi
+
+    run "mkdir -p '${_dropin_dir}'"
+    cat > "${_dropin}" <<'DROPIN'
+# Drop-in written by scx_cognis installer.
+# Exit code 86 means sched_ext disabled Cognis at runtime (for example,
+# watchdog/runnable-task-stall protection). Leave the system on the kernel
+# scheduler instead of bouncing back into the same failure mode.
+[Service]
+RestartPreventExitStatus=86
+DROPIN
+    log_ok "Runtime failure drop-in written: ${_dropin}"
+}
+
 # ─── Enable and start the scx service ────────────────────────────────────────
 enable_scx_service() {
     log_info "Reloading systemd and enabling scx.service ..."
@@ -496,6 +517,7 @@ main() {
 
     configure_scx_defaults
     install_stats_dropin
+    install_runtime_dropin
     [ "$_service_installed" -eq 1 ] && enable_scx_service
 
     # ── Summary ──────────────────────────────────────────────────────────────
