@@ -14,7 +14,7 @@ Cognis v2 keeps the normal scheduling path in BPF. Rust remains in the process f
 - [Build and Run](#build-and-run)
 - [Install and Remove](#install-and-remove)
 - [Observability](#observability)
-- [Benchmark Helper](#benchmark-helper)
+- [Benchmark Helpers](#benchmark-helpers)
 - [Limitations](#limitations)
 - [Contributing](#contributing)
 - [License](#license)
@@ -27,8 +27,8 @@ Cognis v2 keeps the normal scheduling path in BPF. Rust remains in the process f
 - Default install profile: `desktop`
 - Optional profile: `server`
 - Userspace fallback still exists for compatibility, but it is intended to be exceptional rather than the normal path
-- Local verification on this branch includes `cargo fmt --all -- --check`, `cargo check --locked`, `cargo test --locked`, `sh -n install.sh`, and `sh -n uninstall.sh`
-- CI covers Ubuntu format/test/build plus Arch and CachyOS compile checks
+- Local verification on this branch includes `cargo fmt --all -- --check`, `cargo check --locked`, `cargo test --locked`, `sh -n install.sh`, `sh -n uninstall.sh`, `sh -n cognis_benchmark.sh`, and `bash -n mini_benchmarker.sh`
+- CI covers Ubuntu format/test/build plus Arch and CachyOS compile checks, including shell syntax checks for the benchmark helpers
 
 This repository is still experimental scheduler work. Passing builds and unit tests are necessary, but they do not prove compositor stability, gaming smoothness, watchdog safety, or long-session behavior on your exact machine.
 
@@ -246,11 +246,16 @@ If `nr_user_dispatches`, `nr_queued`, or `nr_scheduled` stay elevated during a w
 
 If `nr_shared_dispatches` dominates `nr_llc_dispatches + nr_node_dispatches` during a saturated workload, that is a hint that the workload is spilling past local cache and node domains and may benefit from more tuning on the saturated path.
 
-## Benchmark Helper
+## Benchmark Helpers
 
-The repository also includes [cognis_benchmark.sh](cognis_benchmark.sh).
+The repository includes two local benchmark helpers:
 
-That script is a local comparison helper, not a source of authoritative benchmark claims. It:
+- [cognis_benchmark.sh](cognis_benchmark.sh) for interactive Aquarium plus `stress-ng` responsiveness checks
+- [mini_benchmarker.sh](mini_benchmarker.sh) for automated Mini Benchmarker baseline-vs-Cognis runs with chart generation
+
+### `cognis_benchmark.sh`
+
+This script is an interactive comparison helper, not a source of authoritative benchmark claims. It:
 
 - opens the WebGL Aquarium benchmark
 - runs three `stress-ng` phases
@@ -261,6 +266,29 @@ Current phase layout:
 1. CPU stress
 2. I/O stress
 3. Mixed CPU + VM pressure
+
+### `mini_benchmarker.sh`
+
+This script automates a heavier CPU-focused comparison around the external [Mini Benchmarker](https://gitlab.com/torvic9/mini-benchmarker) tool. It:
+
+- runs Mini Benchmarker once with Cognis stopped
+- runs Mini Benchmarker again with `scx_cognis --mode desktop` or `--mode server`
+- copies and tags the produced `benchie_*.log` files
+- generates `mini_benchmarker_comparison.png`, `mini_benchmarker_comparison.svg`, and `mini_benchmarker_summary.csv`
+
+Important scope notes:
+
+- the wrapper is distro-agnostic, but Mini Benchmarker itself must already be installed separately
+- the default executable lookup is `mini-benchmarker.sh`, with `MINI_BENCHMARKER_CMD` or `--mini-cmd` as an override
+- chart generation requires `python3` plus `matplotlib`
+- this is still local-machine benchmarking; it does not turn one run into a universal scheduler claim
+
+Typical usage:
+
+```bash
+./mini_benchmarker.sh --mode desktop
+./mini_benchmarker.sh --mode server --runs 3
+```
 
 If you want benchmark numbers you can trust on your hardware, keep the environment fixed, run both schedulers multiple times, and compare repeated local runs rather than relying on one-off impressions.
 

@@ -30,6 +30,8 @@ jobs:
         run: |
           sh -n install.sh
           sh -n uninstall.sh
+          sh -n cognis_benchmark.sh
+          bash -n mini_benchmarker.sh
 
   # ──────────────────────────────────────────────────────────────────────────
   # Test: run all unit tests (no kernel or root required)
