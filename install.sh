@@ -146,8 +146,11 @@ check_sched_ext_support() {
 
 install_deps_arch() {
     log_info "Installing build/runtime dependencies via pacman..."
-    _pkgs="clang llvm libbpf libelf zlib libseccomp pkg-config"
-    run "pacman -Syu --noconfirm"
+    # Avoid forcing a full system upgrade from the installer. On Arch/CachyOS
+    # that can pull in unrelated kernel/package churn and trip local package
+    # conflicts such as zlib vs zlib-ng-compat. We only need the build deps.
+    # zlib itself is not needed explicitly here.
+    _pkgs="clang llvm libbpf libelf libseccomp pkgconf curl"
     run "pacman -S --noconfirm --needed ${_pkgs}"
     log_ok "Dependencies installed"
 }
