@@ -17,9 +17,16 @@ err()  { printf "${BLD}${RED}[ERROR ]${RST} %s\n" "$1" >&2; }
 
 INSTALL_MINI=0
 INSTALL_PLOTTER=0
+REMOVE_MINI=0
+REMOVE_PLOTTER=0
+REMOVE_WORKDIR=0
+REMOVE_RESULTS=0
 MINI_LOCAL_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/scx_cognis/mini-benchmarker"
 MINI_LOCAL_SCRIPT="$MINI_LOCAL_DIR/mini-benchmarker.sh"
 MINI_SOURCE_URL="https://gitlab.com/torvic9/mini-benchmarker/-/raw/master/mini-benchmarker.sh"
+PLOTTER_VENV_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/scx_cognis/mini-benchmarker-venv"
+MINI_WORKDIR="${XDG_CACHE_HOME:-$HOME/.cache}/scx_cognis/mini-benchmarker-workdir"
+RESULTS_ROOT="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/benchmark-results"
 
 usage() {
     cat <<'EOF'
@@ -30,6 +37,12 @@ Best-effort bootstrap for benchmark helper dependencies.
 Options:
   --mini-benchmarker   Try to install Mini Benchmarker when a supported path exists
   --plotter            Install Python matplotlib dependencies for chart rendering
+  --remove-mini-benchmarker
+                       Remove the fetched local Mini Benchmarker script
+  --remove-plotter     Remove the local matplotlib virtualenv
+  --remove-workdir     Remove the Mini Benchmarker asset/work directory
+  --remove-results     Remove generated mini-benchmarker result directories
+  --remove-all         Remove all benchmark helper leftovers above
   -h, --help           Show this help
 EOF
 }
@@ -44,6 +57,29 @@ while [ $# -gt 0 ]; do
             INSTALL_PLOTTER=1
             shift
             ;;
+        --remove-mini-benchmarker)
+            REMOVE_MINI=1
+            shift
+            ;;
+        --remove-plotter)
+            REMOVE_PLOTTER=1
+            shift
+            ;;
+        --remove-workdir)
+            REMOVE_WORKDIR=1
+            shift
+            ;;
+        --remove-results)
+            REMOVE_RESULTS=1
+            shift
+            ;;
+        --remove-all)
+            REMOVE_MINI=1
+            REMOVE_PLOTTER=1
+            REMOVE_WORKDIR=1
+            REMOVE_RESULTS=1
+            shift
+            ;;
         -h|--help)
             usage
             exit 0
@@ -56,7 +92,9 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-if [ "$INSTALL_MINI" -eq 0 ] && [ "$INSTALL_PLOTTER" -eq 0 ]; then
+if [ "$INSTALL_MINI" -eq 0 ] && [ "$INSTALL_PLOTTER" -eq 0 ] && \
+   [ "$REMOVE_MINI" -eq 0 ] && [ "$REMOVE_PLOTTER" -eq 0 ] && \
+   [ "$REMOVE_WORKDIR" -eq 0 ] && [ "$REMOVE_RESULTS" -eq 0 ]; then
     usage
     exit 0
 fi
@@ -79,17 +117,16 @@ detect_distro() {
 }
 
 install_plotter() {
-    local venv_dir="${XDG_CACHE_HOME:-$HOME/.cache}/scx_cognis/mini-benchmarker-venv"
     command -v python3 >/dev/null 2>&1 || {
         err "python3 is required to install plotter dependencies."
         exit 1
     }
-    say "Installing matplotlib into $venv_dir"
-    python3 -m venv "$venv_dir"
+    say "Installing matplotlib into $PLOTTER_VENV_DIR"
+    python3 -m venv "$PLOTTER_VENV_DIR"
     # shellcheck disable=SC1090
-    . "$venv_dir/bin/activate"
+    . "$PLOTTER_VENV_DIR/bin/activate"
     pip install --quiet matplotlib
-    ok "Plotter environment ready at $venv_dir"
+    ok "Plotter environment ready at $PLOTTER_VENV_DIR"
 }
 
 fetch_mini_benchmarker_script() {
@@ -142,10 +179,53 @@ install_mini_benchmarker() {
     fetch_mini_benchmarker_script
 }
 
+remove_tree() {
+    local path="$1"
+    if [ -e "$path" ]; then
+        rm -rf -- "$path"
+        ok "Removed $path"
+    else
+        warn "Nothing to remove at $path"
+    fi
+}
+
+remove_results() {
+    local found=0
+    local result_dir
+    if [ -d "$RESULTS_ROOT" ]; then
+        for result_dir in "$RESULTS_ROOT"/mini-benchmarker-*; do
+            if [ -e "$result_dir" ]; then
+                found=1
+                rm -rf -- "$result_dir"
+                ok "Removed $result_dir"
+            fi
+        done
+    fi
+    if [ "$found" -eq 0 ]; then
+        warn "No mini-benchmarker result directories found under $RESULTS_ROOT"
+    fi
+}
+
 if [ "$INSTALL_PLOTTER" -eq 1 ]; then
     install_plotter
 fi
 
 if [ "$INSTALL_MINI" -eq 1 ]; then
     install_mini_benchmarker
+fi
+
+if [ "$REMOVE_MINI" -eq 1 ]; then
+    remove_tree "$MINI_LOCAL_DIR"
+fi
+
+if [ "$REMOVE_PLOTTER" -eq 1 ]; then
+    remove_tree "$PLOTTER_VENV_DIR"
+fi
+
+if [ "$REMOVE_WORKDIR" -eq 1 ]; then
+    remove_tree "$MINI_WORKDIR"
+fi
+
+if [ "$REMOVE_RESULTS" -eq 1 ]; then
+    remove_results
 fi
