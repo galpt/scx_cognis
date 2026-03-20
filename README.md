@@ -276,9 +276,8 @@ This script automates a heavier CPU-focused comparison around the external [Mini
 - copies and tags the produced `benchie_*.log` files
 - generates `mini_benchmarker_comparison.png`, `mini_benchmarker_comparison.svg`, and `mini_benchmarker_summary.csv`
 
-All reported Mini Benchmarker values are elapsed time in seconds. Lower is better.
-
 > [!IMPORTANT]
+> - all reported Mini Benchmarker values are elapsed time in seconds, so lower is better
 > - the wrapper is distro-agnostic, and it can report missing prerequisites with `./mini_benchmarker.sh --check-deps`
 > - `./mini_benchmarker.sh --check-deps` checks the wrapper, the scheduler binary, sudo availability, and the Mini Benchmarker runtime tools that the upstream script actually uses
 > - Mini Benchmarker itself is still an external benchmark suite; [install_benchmark_deps.sh](install_benchmark_deps.sh) now fetches Vic's `mini-benchmarker.sh` into `~/.local/share/scx_cognis/mini-benchmarker/`, applies a local compatibility patch for GNU `time` lookup, and installs common package dependencies on a best-effort basis
