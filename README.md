@@ -282,7 +282,7 @@ This script automates a heavier CPU-focused comparison around the external [Mini
 > - Mini Benchmarker itself is still an external benchmark suite; [install_benchmark_deps.sh](install_benchmark_deps.sh) now fetches Vic's `mini-benchmarker.sh` into `~/.local/share/scx_cognis/mini-benchmarker/`, applies a local compatibility patch for GNU `time` lookup, and installs common package dependencies on a best-effort basis
 > - the default executable lookup checks that local install first, then `mini-benchmarker.sh` in `PATH`, with `MINI_BENCHMARKER_CMD` or `--mini-cmd` as an override
 > - chart generation uses `python3` plus `matplotlib`, and `./mini_benchmarker.sh --bootstrap-plotter` can create a local plotter virtualenv when needed
-> - when benchmark orchestration needs root, the runner refreshes the sudo ticket once up front instead of prompting later during a background scheduler start
+> - when benchmark orchestration needs root, the runner refreshes the sudo ticket once up front and keeps it alive during long benchmark phases instead of failing later on scheduler stop/start
 > - benchmark bootstrap artifacts can be cleaned explicitly with `./install_benchmark_deps.sh --remove-all` or the narrower `--remove-*` flags
 > - this is still local-machine benchmarking; it does not turn one run into a universal scheduler claim
 
@@ -297,7 +297,7 @@ Typical usage:
 ```
 
 > [!NOTE]
-> Run `./mini_benchmarker.sh` as your normal user, not with `sudo`. The runner now refreshes sudo once when it needs to stop or start Cognis. Running the whole script with `sudo` changes `HOME`, puts Mini Benchmarker assets under `/root/...`, and can leave root-owned benchmark leftovers behind. If you hit a permission error for `benchmark-results`, fix the checkout ownership or pass `--results-dir` to a writable location.
+> Run `./mini_benchmarker.sh` as your normal user, not with `sudo`. The runner now prompts once for sudo when it needs to stop or start Cognis and keeps that ticket alive during the benchmark. Running the whole script with `sudo` changes `HOME`, puts Mini Benchmarker assets under `/root/...`, and can leave root-owned benchmark leftovers behind. If you hit a permission error for `benchmark-results`, fix the checkout ownership or pass `--results-dir` to a writable location.
 
 If you want benchmark numbers you can trust on your hardware, keep the environment fixed, run both schedulers multiple times, and compare repeated local runs rather than relying on one-off impressions.
 

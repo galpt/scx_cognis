@@ -34,6 +34,7 @@ SCX_LAUNCHED=0
 INITIAL_COGNIS_ACTIVE=0
 INITIAL_SERVICE_ACTIVE=0
 RESTORE_NEEDED=0
+SUDO_KEEPALIVE_PID=""
 
 usage() {
     cat <<EOF
@@ -139,6 +140,32 @@ ensure_sudo_ready() {
     }
     say "Refreshing sudo credentials for scheduler stop/start"
     sudo -v
+}
+
+start_sudo_keepalive() {
+    if [ "$(id -u)" -eq 0 ]; then
+        return
+    fi
+
+    if [ -n "$SUDO_KEEPALIVE_PID" ] && kill -0 "$SUDO_KEEPALIVE_PID" >/dev/null 2>&1; then
+        return
+    fi
+
+    (
+        while true; do
+            sudo -n true >/dev/null 2>&1 || exit 0
+            sleep 60
+        done
+    ) &
+    SUDO_KEEPALIVE_PID=$!
+}
+
+stop_sudo_keepalive() {
+    if [ -n "$SUDO_KEEPALIVE_PID" ] && kill -0 "$SUDO_KEEPALIVE_PID" >/dev/null 2>&1; then
+        kill "$SUDO_KEEPALIVE_PID" >/dev/null 2>&1 || true
+        wait "$SUDO_KEEPALIVE_PID" 2>/dev/null || true
+    fi
+    SUDO_KEEPALIVE_PID=""
 }
 
 warn_if_running_as_root() {
@@ -522,6 +549,8 @@ cleanup_exit() {
 
     trap - EXIT
 
+    stop_sudo_keepalive
+
     if [ "$RESTORE_NEEDED" -eq 1 ]; then
         restore_initial_state || true
     fi
@@ -650,6 +679,7 @@ main() {
         exit 1
     }
     ensure_sudo_ready
+    start_sudo_keepalive
     ensure_supported_scheduler_state
 
     if cognis_is_active; then
