@@ -129,6 +129,29 @@ install_plotter() {
     ok "Plotter environment ready at $PLOTTER_VENV_DIR"
 }
 
+patch_mini_benchmarker_script() {
+    [ -f "$MINI_LOCAL_SCRIPT" ] || return 0
+
+    if grep -q 'MB_TIME_BIN=' "$MINI_LOCAL_SCRIPT"; then
+        ok "Mini Benchmarker compatibility patch already present"
+        return 0
+    fi
+
+    say "Patching Mini Benchmarker for portable GNU time lookup"
+    sed -i '/^TMP="\/tmp"$/a\
+MB_TIME_BIN=""\
+for candidate in /usr/bin/time /bin/time /usr/local/bin/time /opt/homebrew/bin/gtime /usr/local/bin/gtime; do\
+\tif [ -x "$candidate" ]; then\
+\t\tMB_TIME_BIN="$candidate"\
+\t\tbreak\
+\tfi\
+done\
+[[ -z "$MB_TIME_BIN" ]] && echo "GNU time executable not found. Please install the time package." && exit 3\
+' "$MINI_LOCAL_SCRIPT"
+    sed -i 's#/usr/bin/time #$MB_TIME_BIN #g' "$MINI_LOCAL_SCRIPT"
+    ok "Applied local compatibility patch to $MINI_LOCAL_SCRIPT"
+}
+
 fetch_mini_benchmarker_script() {
     mkdir -p "$MINI_LOCAL_DIR"
     if command -v curl >/dev/null 2>&1; then
@@ -142,6 +165,7 @@ fetch_mini_benchmarker_script() {
         exit 1
     fi
     chmod +x "$MINI_LOCAL_SCRIPT"
+    patch_mini_benchmarker_script
     ok "Installed Mini Benchmarker to $MINI_LOCAL_SCRIPT"
 }
 
@@ -157,7 +181,7 @@ install_mini_benchmarker() {
                 say "Trying common benchmark dependencies from pacman first."
                 run_privileged pacman -S --needed --noconfirm \
                     python python-pip python-matplotlib stress-ng perf blender x265 argon2 \
-                    wget git p7zip primesieve inxi bc unzip xz gcc make cmake nasm || true
+                    wget git p7zip primesieve inxi bc unzip xz gcc make cmake nasm time || true
                 fetch_mini_benchmarker_script
                 return
             fi
@@ -168,7 +192,8 @@ install_mini_benchmarker() {
                 run_privileged apt-get update -qq
                 run_privileged apt-get install -y --no-install-recommends \
                     python3 python3-venv python3-pip python3-matplotlib stress-ng linux-perf \
-                    blender xz-utils wget git p7zip-full build-essential cmake nasm bc unzip || true
+                    blender xz-utils wget git p7zip-full build-essential cmake nasm bc unzip \
+                    time inxi || true
                 fetch_mini_benchmarker_script
                 return
             fi

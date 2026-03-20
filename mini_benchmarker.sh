@@ -33,6 +33,7 @@ SCX_BIN=""
 SCX_LAUNCHED=0
 INITIAL_COGNIS_ACTIVE=0
 INITIAL_SERVICE_ACTIVE=0
+RESTORE_NEEDED=0
 
 usage() {
     cat <<EOF
@@ -124,8 +125,20 @@ run_privileged() {
     if [ "$(id -u)" -eq 0 ]; then
         "$@"
     else
-        sudo "$@"
+        sudo -n "$@"
     fi
+}
+
+ensure_sudo_ready() {
+    if [ "$(id -u)" -eq 0 ]; then
+        return
+    fi
+    command -v sudo >/dev/null 2>&1 || {
+        err "sudo is required to stop/start Cognis when running as a non-root user."
+        exit 1
+    }
+    say "Refreshing sudo credentials for scheduler stop/start"
+    sudo -v
 }
 
 current_sched_ext_ops() {
@@ -149,12 +162,37 @@ service_is_active() {
     service_exists && systemctl is-active --quiet scx.service
 }
 
+patch_local_mini_benchmarker_compat() {
+    [ -f "$MINI_LOCAL_SCRIPT" ] || return 0
+
+    if grep -q 'MB_TIME_BIN=' "$MINI_LOCAL_SCRIPT"; then
+        return 0
+    fi
+
+    say "Patching local Mini Benchmarker copy for portable GNU time lookup"
+    sed -i '/^TMP="\/tmp"$/a\
+MB_TIME_BIN=""\
+for candidate in /usr/bin/time /bin/time /usr/local/bin/time /opt/homebrew/bin/gtime /usr/local/bin/gtime; do\
+\tif [ -x "$candidate" ]; then\
+\t\tMB_TIME_BIN="$candidate"\
+\t\tbreak\
+\tfi\
+done\
+[[ -z "$MB_TIME_BIN" ]] && echo "GNU time executable not found. Please install the time package." && exit 3\
+' "$MINI_LOCAL_SCRIPT"
+    sed -i 's#/usr/bin/time #$MB_TIME_BIN #g' "$MINI_LOCAL_SCRIPT"
+    ok "Updated local Mini Benchmarker copy."
+}
+
 find_mini_benchmarker() {
     if [ -n "$MINI_BENCHMARKER_CMD" ]; then
         [ -x "$MINI_BENCHMARKER_CMD" ] || {
             err "Mini Benchmarker command '$MINI_BENCHMARKER_CMD' is not executable."
             exit 1
         }
+        if [ "$MINI_BENCHMARKER_CMD" = "$MINI_LOCAL_SCRIPT" ]; then
+            patch_local_mini_benchmarker_compat
+        fi
         return
     fi
 
@@ -165,9 +203,15 @@ find_mini_benchmarker() {
     do
         if command -v "$candidate" >/dev/null 2>&1; then
             MINI_BENCHMARKER_CMD=$(command -v "$candidate")
+            if [ "$MINI_BENCHMARKER_CMD" = "$MINI_LOCAL_SCRIPT" ]; then
+                patch_local_mini_benchmarker_compat
+            fi
             return
         elif [ -x "$candidate" ]; then
             MINI_BENCHMARKER_CMD="$candidate"
+            if [ "$MINI_BENCHMARKER_CMD" = "$MINI_LOCAL_SCRIPT" ]; then
+                patch_local_mini_benchmarker_compat
+            fi
             return
         fi
     done
@@ -251,6 +295,59 @@ Install hints:
 EOF
 }
 
+check_runtime_command() {
+    local label="$1"
+    shift
+    local candidate
+
+    for candidate in "$@"; do
+        if command -v "$candidate" >/dev/null 2>&1; then
+            ok "$label available: $(command -v "$candidate")"
+            return 0
+        fi
+    done
+
+    err "$label missing"
+    return 1
+}
+
+check_gnu_time_binary() {
+    local candidate
+    for candidate in /usr/bin/time /bin/time /usr/local/bin/time /opt/homebrew/bin/gtime /usr/local/bin/gtime; do
+        if [ -x "$candidate" ]; then
+            ok "GNU time executable available: $candidate"
+            return 0
+        fi
+    done
+
+    err "GNU time executable missing"
+    return 1
+}
+
+check_mini_runtime_prereqs() {
+    local missing=0
+
+    check_gnu_time_binary || missing=1
+    check_runtime_command "stress-ng" stress-ng || missing=1
+    check_runtime_command "perf" perf || missing=1
+    check_runtime_command "blender" blender || missing=1
+    check_runtime_command "primesieve" primesieve || missing=1
+    check_runtime_command "argon2" argon2 || missing=1
+    check_runtime_command "x265" x265 || missing=1
+    check_runtime_command "7z" 7z || missing=1
+    check_runtime_command "wget" wget || missing=1
+    check_runtime_command "tar" tar || missing=1
+    check_runtime_command "xz" xz || missing=1
+    check_runtime_command "make" make || missing=1
+    check_runtime_command "cmake" cmake || missing=1
+    check_runtime_command "nasm" nasm || missing=1
+    check_runtime_command "C compiler" cc gcc clang || missing=1
+    check_runtime_command "python shim for Mini Benchmarker" python || missing=1
+    check_runtime_command "inxi" inxi || missing=1
+
+    return "$missing"
+}
+
 check_dependency_status() {
     local missing=0
     local detected_mini=""
@@ -292,6 +389,9 @@ PY
         fi
     done
     if [ -n "$detected_mini" ]; then
+        if [ "$detected_mini" = "$MINI_LOCAL_SCRIPT" ]; then
+            patch_local_mini_benchmarker_compat
+        fi
         ok "Mini Benchmarker found: $detected_mini"
     else
         err "Mini Benchmarker not found in PATH"
@@ -321,6 +421,22 @@ PY
     else
         warn "sched_ext sysfs not visible; benchmarking may not work on this kernel"
     fi
+
+    if [ "$(id -u)" -eq 0 ]; then
+        ok "running as root; sudo ticket not required"
+    elif command -v sudo >/dev/null 2>&1; then
+        if sudo -n true >/dev/null 2>&1; then
+            ok "sudo ticket already valid"
+        else
+            warn "sudo ticket not cached; the runner will prompt before starting benchmark runs"
+        fi
+    else
+        err "sudo missing; non-root benchmark orchestration cannot stop/start Cognis"
+        missing=1
+    fi
+
+    say "Checking Mini Benchmarker runtime tools"
+    check_mini_runtime_prereqs || missing=1
 
     print_install_hints
     return "$missing"
@@ -375,6 +491,18 @@ start_cognis_manual() {
         err "Cognis did not become active."
         exit 1
     }
+}
+
+cleanup_exit() {
+    local status="$1"
+
+    trap - EXIT
+
+    if [ "$RESTORE_NEEDED" -eq 1 ]; then
+        restore_initial_state || true
+    fi
+
+    exit "$status"
 }
 
 restore_initial_state() {
@@ -480,6 +608,7 @@ run_variant() {
 
 main() {
     mkdir -p "$WORKDIR" "$RESULTS_DIR/raw" "$RESULTS_DIR/tagged" "$RESULTS_DIR/console"
+    trap 'cleanup_exit $?' EXIT
 
     if [ "$CHECK_DEPS_ONLY" -eq 1 ]; then
         check_dependency_status
@@ -489,6 +618,12 @@ main() {
     find_mini_benchmarker
     find_scx_binary
     check_plot_deps
+    check_mini_runtime_prereqs || {
+        err "Mini Benchmarker runtime prerequisites are incomplete."
+        say "Run ./mini_benchmarker.sh --check-deps or ./install_benchmark_deps.sh --mini-benchmarker --plotter first."
+        exit 1
+    }
+    ensure_sudo_ready
     ensure_supported_scheduler_state
 
     if cognis_is_active; then
@@ -497,6 +632,7 @@ main() {
     if service_is_active; then
         INITIAL_SERVICE_ACTIVE=1
     fi
+    RESTORE_NEEDED=1
 
     say "Mini Benchmarker command : $MINI_BENCHMARKER_CMD"
     say "scx_cognis binary        : $SCX_BIN"
@@ -512,6 +648,7 @@ main() {
         --title "Mini Benchmarker Comparison (${MODE} mode)"
 
     restore_initial_state
+    RESTORE_NEEDED=0
 
     ok "Mini Benchmarker comparison complete."
     say "Chart: $RESULTS_DIR/tagged/mini_benchmarker_comparison.png"
