@@ -36,6 +36,7 @@ INITIAL_SERVICE_ACTIVE=0
 RESTORE_NEEDED=0
 SUDO_KEEPALIVE_PID=""
 BASELINE_LABEL=""
+POWER_PROFILE="unknown"
 
 usage() {
     cat <<EOF
@@ -177,6 +178,20 @@ detect_baseline_label() {
         BASELINE_LABEL="$kernel_name"
     else
         BASELINE_LABEL="Baseline"
+    fi
+}
+
+detect_power_profile() {
+    local profile=""
+
+    if command -v powerprofilesctl >/dev/null 2>&1; then
+        profile=$(powerprofilesctl get 2>/dev/null || true)
+    elif command -v tuned-adm >/dev/null 2>&1; then
+        profile=$(tuned-adm active 2>/dev/null | sed 's/^Current active profile: //')
+    fi
+
+    if [ -n "$profile" ]; then
+        POWER_PROFILE="$profile"
     fi
 }
 
@@ -593,8 +608,9 @@ tag_log_copy() {
     local tagged_log="$2"
     local label="$3"
     local variant_slug="$4"
+    local power_profile="$5"
 
-    "$PLOTTER_PYTHON" - "$source_log" "$tagged_log" "$label" "$variant_slug" <<'PY'
+    "$PLOTTER_PYTHON" - "$source_log" "$tagged_log" "$label" "$variant_slug" "$power_profile" <<'PY'
 from pathlib import Path
 import re
 import sys
@@ -603,6 +619,7 @@ source = Path(sys.argv[1])
 target = Path(sys.argv[2])
 label = sys.argv[3]
 variant = sys.argv[4]
+power_profile = sys.argv[5]
 text = source.read_text(encoding="utf-8", errors="replace")
 match = re.search(r"Kernel:\s+(\S+)", text)
 if not match:
@@ -610,7 +627,12 @@ if not match:
 kernel = match.group(1)
 tagged = f"Kernel: {kernel}__{variant}"
 text = re.sub(r"Kernel:\s+\S+", tagged, text, count=1)
-text += f"\nBenchmark label: {label}\nOriginal kernel: {kernel}\nBenchmark variant: {variant}\n"
+text += (
+    f"\nBenchmark label: {label}\n"
+    f"Original kernel: {kernel}\n"
+    f"Benchmark variant: {variant}\n"
+    f"Power profile: {power_profile}\n"
+)
 target.write_text(text, encoding="utf-8")
 PY
 }
@@ -642,7 +664,7 @@ run_one_benchmark() {
 
     cp "$raw_log" "$RESULTS_DIR/raw/"
     tagged_log="$RESULTS_DIR/tagged/$(basename "$raw_log")"
-    tag_log_copy "$raw_log" "$tagged_log" "$label" "$variant_slug"
+    tag_log_copy "$raw_log" "$tagged_log" "$label" "$variant_slug" "$POWER_PROFILE"
     ok "Saved $(basename "$raw_log")"
 }
 
@@ -691,6 +713,7 @@ main() {
         exit 1
     }
     detect_baseline_label
+    detect_power_profile
     ensure_sudo_ready
     start_sudo_keepalive
     ensure_supported_scheduler_state
@@ -709,6 +732,7 @@ main() {
     say "Results directory        : $RESULTS_DIR"
     say "Cognis benchmark mode    : $MODE"
     say "Runs per variant         : $RUNS"
+    say "Power profile            : $POWER_PROFILE"
 
     run_variant "baseline" "$BASELINE_LABEL" baseline
     run_variant "cognis-${MODE}" "Cognis (${MODE})" cognis

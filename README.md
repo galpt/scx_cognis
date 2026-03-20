@@ -301,6 +301,36 @@ Typical usage:
 
 If you want benchmark numbers you can trust on your hardware, keep the environment fixed, run both schedulers multiple times, and compare repeated local runs rather than relying on one-off impressions.
 
+### Example Result: Ryzen 7 6800H Laptop
+
+The repository includes one committed Mini Benchmarker example under [benchmark-results/examples/ryzen-7-6800h-cachyos-kde-desktop](benchmark-results/examples/ryzen-7-6800h-cachyos-kde-desktop). It is included as a real output sample, not as a blanket claim about Cognis on all machines.
+
+Machine used for this example:
+
+- CPU: `AMD Ryzen 7 6800H with Radeon Graphics`
+- RAM: `64 GiB DDR5-4800`
+- distro / desktop: `CachyOS` with `KDE Plasma 6.6.3`
+- baseline kernel: `Linux 6.19.7-1-cachyos`
+- Cognis mode: `desktop`
+- runs per variant: `1`
+
+Power-profile note:
+
+- this historical example run did not record the active power profile
+- the committed data therefore does not claim `performance` or `balanced` mode for that run
+- future tagged logs now include a `Power profile:` line for this benchmark helper
+
+Result snapshot from the committed example:
+
+| Variant | Total time (s) | Total score |
+|:--|--:|--:|
+| `Linux 6.19.7-1-cachyos` | `533.14` | `72.12` |
+| `Cognis (desktop)` | `547.25` | `74.39` |
+
+In this particular run, the baseline kernel finished faster overall. The full chart and raw tagged logs are committed so the result stays inspectable instead of being summarized loosely.
+
+![Mini Benchmarker example: Linux 6.19.7-1-cachyos vs Cognis desktop](benchmark-results/examples/ryzen-7-6800h-cachyos-kde-desktop/mini_benchmarker_comparison.png)
+
 ## Limitations
 
 - Cognis v2 is BPF-first, but it is not yet a pure single-language BPF scheduler with no Rust control process.
