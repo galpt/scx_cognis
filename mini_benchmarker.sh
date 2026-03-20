@@ -141,6 +141,13 @@ ensure_sudo_ready() {
     sudo -v
 }
 
+warn_if_running_as_root() {
+    if [ "$(id -u)" -eq 0 ]; then
+        warn "Running the whole benchmark as root changes HOME and benchmark cache paths."
+        warn "Prefer running ./mini_benchmarker.sh as your normal user and let it prompt for sudo when needed."
+    fi
+}
+
 current_sched_ext_ops() {
     if [ -r /sys/kernel/sched_ext/root/ops ]; then
         cat /sys/kernel/sched_ext/root/ops 2>/dev/null || true
@@ -266,6 +273,23 @@ PY
     err "matplotlib is required for chart generation."
     say "Re-run with --bootstrap-plotter to install it in a local virtualenv."
     exit 1
+}
+
+ensure_results_path_writable() {
+    local parent
+    parent=$(dirname "$RESULTS_DIR")
+
+    mkdir -p "$parent" 2>/dev/null || {
+        err "Cannot create benchmark results parent directory: $parent"
+        say "Run the benchmark from a writable checkout, or pass --results-dir to a writable location."
+        exit 1
+    }
+
+    if [ ! -w "$parent" ]; then
+        err "Benchmark results parent directory is not writable: $parent"
+        say "Run the benchmark as your normal user from a writable checkout, or pass --results-dir to a writable location."
+        exit 1
+    fi
 }
 
 bootstrap_plotter_venv() {
@@ -607,6 +631,8 @@ run_variant() {
 }
 
 main() {
+    warn_if_running_as_root
+    ensure_results_path_writable
     mkdir -p "$WORKDIR" "$RESULTS_DIR/raw" "$RESULTS_DIR/tagged" "$RESULTS_DIR/console"
     trap 'cleanup_exit $?' EXIT
 

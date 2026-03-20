@@ -297,6 +297,9 @@ Typical usage:
 ./install_benchmark_deps.sh --remove-all
 ```
 
+> [!NOTE]
+> Run `./mini_benchmarker.sh` as your normal user, not with `sudo`. The runner now refreshes sudo once when it needs to stop or start Cognis. Running the whole script with `sudo` changes `HOME`, puts Mini Benchmarker assets under `/root/...`, and can leave root-owned benchmark leftovers behind. If you hit a permission error for `benchmark-results`, fix the checkout ownership or pass `--results-dir` to a writable location.
+
 If you want benchmark numbers you can trust on your hardware, keep the environment fixed, run both schedulers multiple times, and compare repeated local runs rather than relying on one-off impressions.
 
 ## Limitations
