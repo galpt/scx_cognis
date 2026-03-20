@@ -153,6 +153,14 @@ struct Opts {
     #[clap(long)]
     stats: Option<f64>,
 
+    /// Serve live stats to external monitor clients while the scheduler runs.
+    ///
+    /// This is off by default for the long-running headless service path so
+    /// the Rust control plane stays quieter under load. Foreground `--stats`
+    /// and `--tui` runs still launch the local stats path automatically.
+    #[clap(long, action = clap::ArgAction::SetTrue)]
+    serve_stats: bool,
+
     /// Run in stats monitoring mode only (scheduler not launched).
     #[clap(long)]
     monitor: Option<f64>,
@@ -243,12 +251,19 @@ fn enabled_flag_summary(opts: &Opts) -> String {
     if opts.stats.is_some() {
         flags.push("stats");
     }
+    if opts.serve_stats {
+        flags.push("serve_stats");
+    }
 
     if flags.is_empty() {
         "none".to_string()
     } else {
         flags.join(",")
     }
+}
+
+fn should_launch_stats_server(opts: &Opts) -> bool {
+    opts.serve_stats || opts.stats.is_some() || opts.tui
 }
 
 // ── Task record ────────────────────────────────────────────────────────────
@@ -328,7 +343,7 @@ struct Scheduler<'a> {
     bpf: BpfScheduler<'a>,
     opts: &'a Opts,
     profile: BpfProfile,
-    stats_server: StatsServer<(), Metrics>,
+    stats_server: Option<StatsServer<(), Metrics>>,
 
     // Userspace fallback lanes:
     //   - RT
@@ -413,7 +428,11 @@ impl<'a> Scheduler<'a> {
         open_object: &'a mut MaybeUninit<OpenObject>,
         shutdown: Arc<AtomicBool>,
     ) -> Result<Self> {
-        let stats_server = StatsServer::new(stats::server_data()).launch()?;
+        let stats_server = if should_launch_stats_server(opts) {
+            Some(StatsServer::new(stats::server_data()).launch()?)
+        } else {
+            None
+        };
         let profile = BpfProfile::from_opts(opts);
         let enabled_flags = enabled_flag_summary(opts);
 
@@ -1460,7 +1479,6 @@ impl<'a> Scheduler<'a> {
     }
 
     fn run(&mut self) -> Result<UserExitInfo> {
-        let (res_ch, req_ch) = self.stats_server.channels();
         let mut last_housekeeping = Instant::now();
 
         while !self.bpf.exited() {
@@ -1478,14 +1496,17 @@ impl<'a> Scheduler<'a> {
 
             // Stats: non-blocking try_recv so a disconnected client can't
             // block or crash the scheduler.
-            if !self.stats_channel_failed && req_ch.try_recv().is_ok() {
-                let m = self.get_metrics();
-                self.update_tui(&m);
-                if let Err(err) = res_ch.send(m) {
-                    warn!(
-                        "Stats response channel failed ({err}); continuing scheduler without stats responses"
-                    );
-                    self.stats_channel_failed = true;
+            if let Some(stats_server) = self.stats_server.as_ref() {
+                let (res_ch, req_ch) = stats_server.channels();
+                if !self.stats_channel_failed && req_ch.try_recv().is_ok() {
+                    let m = self.get_metrics();
+                    self.update_tui(&m);
+                    if let Err(err) = res_ch.send(m) {
+                        warn!(
+                            "Stats response channel failed ({err}); continuing scheduler without stats responses"
+                        );
+                        self.stats_channel_failed = true;
+                    }
                 }
             }
 
@@ -1765,10 +1786,10 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        enabled_flag_summary, is_watchdog_runtime_exit, runtime_exit_reason, BpfProfile, Opts,
-        Scheduler, DEFAULT_DESKTOP_SLICE_LAG_NS, DEFAULT_DESKTOP_SLICE_MIN_NS,
-        DEFAULT_DESKTOP_SLICE_NS, DEFAULT_SERVER_SLICE_LAG_NS, DEFAULT_SERVER_SLICE_MIN_NS,
-        DEFAULT_SERVER_SLICE_NS,
+        enabled_flag_summary, is_watchdog_runtime_exit, runtime_exit_reason,
+        should_launch_stats_server, BpfProfile, Opts, Scheduler, DEFAULT_DESKTOP_SLICE_LAG_NS,
+        DEFAULT_DESKTOP_SLICE_MIN_NS, DEFAULT_DESKTOP_SLICE_NS, DEFAULT_SERVER_SLICE_LAG_NS,
+        DEFAULT_SERVER_SLICE_MIN_NS, DEFAULT_SERVER_SLICE_NS,
     };
     use clap::Parser;
 
@@ -1871,12 +1892,36 @@ mod tests {
             "-t",
             "--stats",
             "1",
+            "--serve-stats",
         ]);
 
         assert_eq!(
             enabled_flag_summary(&opts),
-            "partial,percpu_local,verbose,tui,stats"
+            "partial,percpu_local,verbose,tui,stats,serve_stats"
         );
+    }
+
+    #[test]
+    fn stats_server_stays_off_for_default_headless_service_mode() {
+        let opts = Opts::parse_from(["scx_cognis"]);
+        assert!(!should_launch_stats_server(&opts));
+    }
+
+    #[test]
+    fn stats_server_launches_for_explicit_observability_modes() {
+        assert!(should_launch_stats_server(&Opts::parse_from([
+            "scx_cognis",
+            "--serve-stats",
+        ])));
+        assert!(should_launch_stats_server(&Opts::parse_from([
+            "scx_cognis",
+            "--stats",
+            "1",
+        ])));
+        assert!(should_launch_stats_server(&Opts::parse_from([
+            "scx_cognis",
+            "--tui",
+        ])));
     }
 
     #[test]

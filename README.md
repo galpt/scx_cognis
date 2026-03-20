@@ -166,6 +166,7 @@ sudo ./target/release/scx_cognis --mode server
 | `-v, --verbose` | Enables verbose output |
 | `-t, --tui` | Launches the TUI dashboard |
 | `--stats <secs>` | Runs the scheduler and periodic stats output together |
+| `--serve-stats` | Serves live stats to external monitor clients while the scheduler runs |
 | `--monitor <secs>` | Monitor-only mode; does not launch a scheduler |
 | `--help-stats` | Prints descriptions for exported statistics |
 | `-V, --version` | Prints the Cognis version and `scx_rustland_core` version |
@@ -199,6 +200,7 @@ sudo sh install.sh --dry-run
 sudo sh install.sh --build-from-source
 sudo sh install.sh --version vX.Y.Z
 sudo sh install.sh --flags "--mode server --verbose"
+sudo sh install.sh --flags "--mode desktop --serve-stats"
 ```
 
 On CachyOS and Arch, the installer will use `scx-manager` when available and fall back to its own service setup when needed.
@@ -231,6 +233,14 @@ Available surfaces:
 - `scx_cognis --stats 1.0`
 - `scx_cognis --tui`
 - `scx_cognis --help-stats`
+
+The default headless service path does not launch the stats server anymore. If
+you want to attach `--monitor` to a long-running installed service, start that
+service with `--serve-stats`, for example:
+
+```bash
+sudo sh install.sh --flags "--mode desktop --serve-stats"
+```
 
 What the main counters mean:
 
