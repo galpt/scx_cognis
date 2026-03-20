@@ -48,3 +48,4 @@ jobs:
           sh -n uninstall.sh
           sh -n cognis_benchmark.sh
           bash -n mini_benchmarker.sh
+          bash -n install_benchmark_deps.sh

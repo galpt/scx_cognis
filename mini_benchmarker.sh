@@ -24,6 +24,9 @@ RUNS=1
 DROP_CACHES=0
 MINI_BENCHMARKER_CMD="${MINI_BENCHMARKER_CMD:-}"
 PLOTTER="$SCRIPT_DIR/mini_benchmarker_plot.py"
+PLOTTER_PYTHON="${PLOTTER_PYTHON:-python3}"
+BOOTSTRAP_PLOTTER=0
+CHECK_DEPS_ONLY=0
 SCX_BIN=""
 SCX_LAUNCHED=0
 INITIAL_COGNIS_ACTIVE=0
@@ -44,10 +47,13 @@ Options:
   --runs N               Number of repeated runs per variant (default: 1)
   --drop-caches          Answer "yes" to Mini Benchmarker page-cache prompt
   --mini-cmd PATH        Path to mini-benchmarker.sh
+  --bootstrap-plotter    Create a local venv with matplotlib if needed
+  --check-deps           Report benchmark prerequisites and exit
   -h, --help             Show this help
 
 Environment overrides:
   MINI_BENCHMARKER_CMD   Same as --mini-cmd
+  PLOTTER_PYTHON         Python interpreter used for chart generation
 EOF
 }
 
@@ -76,6 +82,14 @@ while [ $# -gt 0 ]; do
         --mini-cmd)
             MINI_BENCHMARKER_CMD="$2"
             shift 2
+            ;;
+        --bootstrap-plotter)
+            BOOTSTRAP_PLOTTER=1
+            shift
+            ;;
+        --check-deps)
+            CHECK_DEPS_ONLY=1
+            shift
             ;;
         -h|--help)
             usage
@@ -173,17 +187,131 @@ find_scx_binary() {
 }
 
 check_plot_deps() {
-    command -v python3 >/dev/null 2>&1 || {
-        err "python3 is required for chart generation."
+    command -v "$PLOTTER_PYTHON" >/dev/null 2>&1 || {
+        err "Python interpreter '$PLOTTER_PYTHON' was not found."
         exit 1
     }
     [ -f "$PLOTTER" ] || {
         err "Missing plot helper: $PLOTTER"
         exit 1
     }
-    python3 - <<'PY'
+    if "$PLOTTER_PYTHON" - <<'PY'
 import matplotlib  # noqa: F401
 PY
+    then
+        return
+    fi
+
+    if [ "$BOOTSTRAP_PLOTTER" -eq 1 ]; then
+        bootstrap_plotter_venv
+        "$PLOTTER_PYTHON" - <<'PY'
+import matplotlib  # noqa: F401
+PY
+        return
+    fi
+
+    err "matplotlib is required for chart generation."
+    say "Re-run with --bootstrap-plotter to install it in a local virtualenv."
+    exit 1
+}
+
+bootstrap_plotter_venv() {
+    local venv_dir="${XDG_CACHE_HOME:-$HOME/.cache}/scx_cognis/mini-benchmarker-venv"
+    command -v python3 >/dev/null 2>&1 || {
+        err "python3 is required to bootstrap the plotter environment."
+        exit 1
+    }
+    say "Bootstrapping local matplotlib venv at $venv_dir"
+    python3 -m venv "$venv_dir"
+    # shellcheck disable=SC1090
+    . "$venv_dir/bin/activate"
+    pip install --quiet matplotlib
+    PLOTTER_PYTHON="$venv_dir/bin/python"
+    ok "Plotter environment ready."
+}
+
+print_install_hints() {
+    cat <<'EOF'
+Install hints:
+  CachyOS / Arch:
+    - benchmark bootstrap helper: ./install_benchmark_deps.sh --mini-benchmarker --plotter
+    - Mini Benchmarker may still require a manual install path or an AUR helper
+  Debian / Ubuntu:
+    - common packages: ./install_benchmark_deps.sh --mini-benchmarker --plotter
+    - Mini Benchmarker itself may still need manual installation
+EOF
+}
+
+check_dependency_status() {
+    local missing=0
+    local detected_mini=""
+    local detected_scx=""
+
+    say "Checking benchmark prerequisites"
+
+    if command -v python3 >/dev/null 2>&1; then
+        ok "python3 available"
+    else
+        err "python3 missing"
+        missing=1
+    fi
+
+    if [ -f "$PLOTTER" ]; then
+        ok "plot helper present: $(basename "$PLOTTER")"
+    else
+        err "plot helper missing: $PLOTTER"
+        missing=1
+    fi
+
+    if command -v "$PLOTTER_PYTHON" >/dev/null 2>&1 && \
+       "$PLOTTER_PYTHON" - <<'PY' >/dev/null 2>&1
+import matplotlib  # noqa: F401
+PY
+    then
+        ok "matplotlib import works"
+    else
+        warn "matplotlib not available for $PLOTTER_PYTHON"
+    fi
+
+    for candidate in mini-benchmarker.sh mini-benchmarker; do
+        if command -v "$candidate" >/dev/null 2>&1; then
+            detected_mini=$(command -v "$candidate")
+            break
+        fi
+    done
+    if [ -n "$detected_mini" ]; then
+        ok "Mini Benchmarker found: $detected_mini"
+    else
+        err "Mini Benchmarker not found in PATH"
+        missing=1
+    fi
+
+    for candidate in \
+        scx_cognis \
+        "$SCRIPT_DIR/target/release/scx_cognis" \
+        /usr/bin/scx_cognis \
+        /usr/local/bin/scx_cognis
+    do
+        if [ -x "$candidate" ]; then
+            detected_scx="$candidate"
+            break
+        fi
+    done
+    if [ -n "$detected_scx" ]; then
+        ok "scx_cognis found: $detected_scx"
+    else
+        err "scx_cognis binary not found"
+        missing=1
+    fi
+
+    if [ -r /sys/kernel/sched_ext/root/ops ]; then
+        ok "sched_ext sysfs present"
+    else
+        warn "sched_ext sysfs not visible; benchmarking may not work on this kernel"
+    fi
+
+    print_install_hints
+    return "$missing"
 }
 
 ensure_supported_scheduler_state() {
@@ -261,7 +389,7 @@ tag_log_copy() {
     local label="$3"
     local variant_slug="$4"
 
-    python3 - "$source_log" "$tagged_log" "$label" "$variant_slug" <<'PY'
+    "$PLOTTER_PYTHON" - "$source_log" "$tagged_log" "$label" "$variant_slug" <<'PY'
 from pathlib import Path
 import re
 import sys
@@ -341,6 +469,11 @@ run_variant() {
 main() {
     mkdir -p "$WORKDIR" "$RESULTS_DIR/raw" "$RESULTS_DIR/tagged" "$RESULTS_DIR/console"
 
+    if [ "$CHECK_DEPS_ONLY" -eq 1 ]; then
+        check_dependency_status
+        exit 0
+    fi
+
     find_mini_benchmarker
     find_scx_binary
     check_plot_deps
@@ -363,7 +496,7 @@ main() {
     run_variant "baseline" "Baseline (kernel default scheduler)" baseline
     run_variant "cognis-${MODE}" "Cognis (${MODE})" cognis
 
-    python3 "$PLOTTER" "$RESULTS_DIR/tagged" \
+    "$PLOTTER_PYTHON" "$PLOTTER" "$RESULTS_DIR/tagged" \
         --title "Mini Benchmarker Comparison (${MODE} mode)"
 
     restore_initial_state

@@ -27,8 +27,8 @@ Cognis v2 keeps the normal scheduling path in BPF. Rust remains in the process f
 - Default install profile: `desktop`
 - Optional profile: `server`
 - Userspace fallback still exists for compatibility, but it is intended to be exceptional rather than the normal path
-- Local verification on this branch includes `cargo fmt --all -- --check`, `cargo check --locked`, `cargo test --locked`, `sh -n install.sh`, `sh -n uninstall.sh`, `sh -n cognis_benchmark.sh`, and `bash -n mini_benchmarker.sh`
-- CI covers Ubuntu format/test/build plus Arch and CachyOS compile checks, including shell syntax checks for the benchmark helpers
+- Local verification on this branch includes `cargo fmt --all -- --check`, `cargo check --locked`, `cargo test --locked`, `sh -n install.sh`, `sh -n uninstall.sh`, `sh -n cognis_benchmark.sh`, `bash -n mini_benchmarker.sh`, and `bash -n install_benchmark_deps.sh`
+- CI covers Ubuntu format/test/build plus Arch and CachyOS compile checks, including shell syntax checks for the benchmark helpers and benchmark bootstrap script
 
 This repository is still experimental scheduler work. Passing builds and unit tests are necessary, but they do not prove compositor stability, gaming smoothness, watchdog safety, or long-session behavior on your exact machine.
 
@@ -278,16 +278,19 @@ This script automates a heavier CPU-focused comparison around the external [Mini
 
 Important scope notes:
 
-- the wrapper is distro-agnostic, but Mini Benchmarker itself must already be installed separately
+- the wrapper is distro-agnostic, and it can report missing prerequisites with `./mini_benchmarker.sh --check-deps`
+- Mini Benchmarker itself is still an external benchmark suite; [install_benchmark_deps.sh](install_benchmark_deps.sh) provides a best-effort dependency bootstrap plus manual-install hints
 - the default executable lookup is `mini-benchmarker.sh`, with `MINI_BENCHMARKER_CMD` or `--mini-cmd` as an override
-- chart generation requires `python3` plus `matplotlib`
+- chart generation uses `python3` plus `matplotlib`, and `./mini_benchmarker.sh --bootstrap-plotter` can create a local plotter virtualenv when needed
 - this is still local-machine benchmarking; it does not turn one run into a universal scheduler claim
 
 Typical usage:
 
 ```bash
+./mini_benchmarker.sh --check-deps
 ./mini_benchmarker.sh --mode desktop
-./mini_benchmarker.sh --mode server --runs 3
+./mini_benchmarker.sh --mode server --runs 3 --bootstrap-plotter
+./install_benchmark_deps.sh --plotter
 ```
 
 If you want benchmark numbers you can trust on your hardware, keep the environment fixed, run both schedulers multiple times, and compare repeated local runs rather than relying on one-off impressions.
@@ -312,6 +315,9 @@ cargo check --locked
 cargo test --locked
 sh -n install.sh
 sh -n uninstall.sh
+sh -n cognis_benchmark.sh
+bash -n mini_benchmarker.sh
+bash -n install_benchmark_deps.sh
 ```
 
 If a change alters CLI behavior, profiles, exported stats, install scripts, workflows, or scheduler behavior documented here, update this README in the same patch.

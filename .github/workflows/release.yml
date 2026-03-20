@@ -80,6 +80,7 @@ jobs:
           sh -n uninstall.sh
           sh -n cognis_benchmark.sh
           bash -n mini_benchmarker.sh
+          bash -n install_benchmark_deps.sh
 
       - name: cargo test
         run: cargo test --locked --all -- --nocapture
@@ -113,6 +114,7 @@ jobs:
           sh -n uninstall.sh
           sh -n cognis_benchmark.sh
           bash -n mini_benchmarker.sh
+          bash -n install_benchmark_deps.sh
 
   # ────────────────────────────────────────────────────────────────────────
   # CI: compile-check on CachyOS
@@ -143,6 +145,7 @@ jobs:
           sh -n uninstall.sh
           sh -n cognis_benchmark.sh
           bash -n mini_benchmarker.sh
+          bash -n install_benchmark_deps.sh
 
   # ────────────────────────────────────────────────────────────────────────
   # Release: build, tag, and publish (only if all CI jobs pass)
