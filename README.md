@@ -282,6 +282,7 @@ This script automates a heavier CPU-focused comparison around the external [Mini
 > - Mini Benchmarker itself is still an external benchmark suite; [install_benchmark_deps.sh](install_benchmark_deps.sh) now fetches Vic's `mini-benchmarker.sh` into `~/.local/share/scx_cognis/mini-benchmarker/`, applies a local compatibility patch for GNU `time` lookup, and installs common package dependencies on a best-effort basis
 > - the default executable lookup checks that local install first, then `mini-benchmarker.sh` in `PATH`, with `MINI_BENCHMARKER_CMD` or `--mini-cmd` as an override
 > - chart generation uses `python3` plus `matplotlib`, and `./mini_benchmarker.sh --bootstrap-plotter` can create a local plotter virtualenv when needed
+> - when tagged logs include `Power profile: ...`, the generated chart legend and summary CSV carry that metadata too
 > - when benchmark orchestration needs root, the runner refreshes the sudo ticket once up front and keeps it alive during long benchmark phases instead of failing later on scheduler stop/start
 > - benchmark bootstrap artifacts can be cleaned explicitly with `./install_benchmark_deps.sh --remove-all` or the narrower `--remove-*` flags
 > - this is still local-machine benchmarking; it does not turn one run into a universal scheduler claim
