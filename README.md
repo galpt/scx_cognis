@@ -77,7 +77,7 @@ scx_cognis --mode server
 
 Conditionally.
 
-For a validated target machine and workload mix, Cognis v2 is intended to be usable as a production scheduler: the normal scheduling path stays in BPF, the Rust fallback is meant to be exceptional, and the install default is the `desktop` profile.
+For a validated target machine and workload mix, Cognis v2 can be used as a production scheduler: the normal scheduling path stays in BPF, the Rust fallback is meant to be exceptional, and the install default is the `desktop` profile.
 
 However, this project does not claim a blanket "production ready on every machine" guarantee across all kernels, topologies, desktop stacks, and server environments. The honest bar is:
 
