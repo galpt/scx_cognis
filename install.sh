@@ -287,6 +287,10 @@ Type=simple
 EnvironmentFile=/etc/default/scx
 ExecStart=/bin/sh -c 'exec ${SCX_SCHEDULER_OVERRIDE:-$SCX_SCHEDULER} ${SCX_FLAGS_OVERRIDE:-$SCX_FLAGS}'
 Restart=on-failure
+# Exit code 86 means sched_ext disabled Cognis at runtime (for example,
+# watchdog/runnable-task-stall protection). Leave the system on the kernel
+# scheduler instead of bouncing back into the same failure mode.
+RestartPreventExitStatus=86
 RestartSec=5
 StandardOutput=journal
 StandardError=journal

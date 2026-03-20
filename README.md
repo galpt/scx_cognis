@@ -45,6 +45,7 @@ At a high level, Cognis v2 works like this:
 4. On single-node systems, the node tier collapses away and Cognis behaves as a local/LLC/shared scheduler with smarter remote LLC stealing.
 5. When the local tiers are empty, Cognis first looks at local deadline heads, then tries remote LLC steals, then wider node-domain steals, and only then falls back to the current-task refill behavior.
 6. Rust stays available for restart control, stats, TUI, and the compatibility fallback path.
+7. If `sched_ext` disables Cognis at runtime, Cognis now fails open to the kernel scheduler instead of treating that exit like a restart request.
 
 > [!IMPORTANT]
 > - The common case is meant to avoid a Rust round-trip.
@@ -95,6 +96,7 @@ What the current code does:
 - Avoids shared mutable global scratch buffers in the BPF bridge
 - Treats malformed ring-buffer messages and topology-probe failures as recoverable conditions with safe fallbacks
 - Keeps `desktop` as the install default while preserving a real `server` mode instead of a neglected side path
+- Treats watchdog / runnable-task-stall exits as non-restartable failures so the system stays on the kernel scheduler instead of bouncing straight back into Cognis
 
 What still requires real-machine validation:
 
@@ -334,6 +336,7 @@ In this particular run, `Cognis (desktop)` finished faster overall than the base
 - The current implementation still uses `scx_rustland_core` as its userspace scaffold.
 - CI cannot prove compositor stability, gaming smoothness, or watchdog safety on GitHub-hosted runners.
 - Runtime behavior still depends heavily on kernel version, topology, firmware, browser workload, GPU/compositor stack, and desktop/server load mix.
+- The current mitigation for watchdog-triggered `sched_ext` exits is fail-open behavior, not a claim that the entire stall class has been eliminated.
 - Any claim of “better” behavior should come from repeated testing on the target machine.
 
 ## Contributing
