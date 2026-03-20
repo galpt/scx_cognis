@@ -238,7 +238,17 @@ build_from_source() {
     fi
 
     run "cargo build --release --manifest-path \"${_src}/Cargo.toml\""
-    run "cp \"${_src}/target/release/${BINARY_NAME}\" \"${BINARY_PATH}\""
+
+    _target_dir=$(cargo metadata --format-version 1 --no-deps --manifest-path "${_src}/Cargo.toml" \
+        | sed -n 's/.*\"target_directory\":\"\([^\"]*\)\".*/\1/p')
+    [ -n "$_target_dir" ] || _target_dir="${_src}/target"
+
+    if [ ! -f "${_target_dir}/release/${BINARY_NAME}" ]; then
+        log_error "Built binary not found at ${_target_dir}/release/${BINARY_NAME}."
+        exit 1
+    fi
+
+    run "cp \"${_target_dir}/release/${BINARY_NAME}\" \"${BINARY_PATH}\""
     run "chmod 755 \"${BINARY_PATH}\""
     log_ok "Built and installed: ${BINARY_PATH}"
 }
