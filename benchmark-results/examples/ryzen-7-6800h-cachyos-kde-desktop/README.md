@@ -21,4 +21,6 @@ Result summary:
 - baseline total score: `84.12`
 - Cognis desktop total score: `79.69`
 
+All values in this example are elapsed time in seconds, so lower is better.
+
 This is a single-machine, single-run example. It is useful as a concrete output sample and a local data point, not as a universal performance claim.

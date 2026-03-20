@@ -276,6 +276,8 @@ This script automates a heavier CPU-focused comparison around the external [Mini
 - copies and tags the produced `benchie_*.log` files
 - generates `mini_benchmarker_comparison.png`, `mini_benchmarker_comparison.svg`, and `mini_benchmarker_summary.csv`
 
+All reported Mini Benchmarker values are elapsed time in seconds. Lower is better.
+
 > [!IMPORTANT]
 > - the wrapper is distro-agnostic, and it can report missing prerequisites with `./mini_benchmarker.sh --check-deps`
 > - `./mini_benchmarker.sh --check-deps` checks the wrapper, the scheduler binary, sudo availability, and the Mini Benchmarker runtime tools that the upstream script actually uses
@@ -323,7 +325,7 @@ Result snapshot from the committed example:
 | `Linux 6.19.7-1-cachyos` | `653.31` | `84.12` |
 | `Cognis (desktop)` | `594.48` | `79.69` |
 
-In this particular run, `Cognis (desktop)` finished faster overall than the baseline kernel. The full chart and raw tagged logs are committed so the result stays inspectable instead of being summarized loosely.
+In this particular run, `Cognis (desktop)` finished faster overall than the baseline kernel. All values in the chart are elapsed time in seconds, so shorter bars and smaller numbers are better. The full chart and raw tagged logs are committed so the result stays inspectable instead of being summarized loosely.
 
 ![Mini Benchmarker example: Linux 6.19.7-1-cachyos vs Cognis desktop](benchmark-results/examples/ryzen-7-6800h-cachyos-kde-desktop/mini_benchmarker_comparison.png)
 
