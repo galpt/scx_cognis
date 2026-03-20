@@ -535,8 +535,17 @@ main() {
     log_info "                   (should print: scx_cognis)"
     echo ""
     log_info "── Live stats (while service is running) ──────────────────────────────────"
-    log_info "  Stats monitor  : scx_cognis --monitor 1.0"
-    log_info "  (connects to the stats socket at /run/scx/root/stats; no root needed)"
+    case " ${SCX_FLAGS:-$DEFAULT_SCX_FLAGS} " in
+        *" --serve-stats "*)
+            log_info "  Stats monitor  : scx_cognis --monitor 1.0"
+            log_info "  (connects to the stats socket at /run/scx/root/stats; no root needed)"
+            ;;
+        *)
+            log_info "  This install did not enable the long-running stats socket."
+            log_info "  Reinstall with : sudo sh install.sh --flags \"${SCX_FLAGS:-$DEFAULT_SCX_FLAGS} --serve-stats\""
+            log_info "  if you want external scx_cognis --monitor clients to attach."
+            ;;
+    esac
     echo ""
     log_info "── TUI dashboard ──────────────────────────────────────────────────────────"
     log_info "  The TUI starts its own scheduler instance, so the systemd service"
