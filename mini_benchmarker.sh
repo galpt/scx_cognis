@@ -35,6 +35,7 @@ INITIAL_COGNIS_ACTIVE=0
 INITIAL_SERVICE_ACTIVE=0
 RESTORE_NEEDED=0
 SUDO_KEEPALIVE_PID=""
+BASELINE_LABEL=""
 
 usage() {
     cat <<EOF
@@ -166,6 +167,17 @@ stop_sudo_keepalive() {
         wait "$SUDO_KEEPALIVE_PID" 2>/dev/null || true
     fi
     SUDO_KEEPALIVE_PID=""
+}
+
+detect_baseline_label() {
+    local kernel_name
+
+    kernel_name=$(uname -sr 2>/dev/null || true)
+    if [ -n "$kernel_name" ]; then
+        BASELINE_LABEL="$kernel_name"
+    else
+        BASELINE_LABEL="Baseline"
+    fi
 }
 
 warn_if_running_as_root() {
@@ -678,6 +690,7 @@ main() {
         say "Run ./mini_benchmarker.sh --check-deps or ./install_benchmark_deps.sh --mini-benchmarker --plotter first."
         exit 1
     }
+    detect_baseline_label
     ensure_sudo_ready
     start_sudo_keepalive
     ensure_supported_scheduler_state
@@ -697,7 +710,7 @@ main() {
     say "Cognis benchmark mode    : $MODE"
     say "Runs per variant         : $RUNS"
 
-    run_variant "baseline" "Baseline (kernel default scheduler)" baseline
+    run_variant "baseline" "$BASELINE_LABEL" baseline
     run_variant "cognis-${MODE}" "Cognis (${MODE})" cognis
 
     "$PLOTTER_PYTHON" "$PLOTTER" "$RESULTS_DIR/tagged" \

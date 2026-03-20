@@ -271,7 +271,7 @@ Current phase layout:
 
 This script automates a heavier CPU-focused comparison around the external [Mini Benchmarker](https://gitlab.com/torvic9/mini-benchmarker) tool. It:
 
-- runs Mini Benchmarker once with Cognis stopped
+- runs Mini Benchmarker once with Cognis stopped and labels that baseline with the detected kernel release, such as `Linux 6.19.7-1-cachyos`
 - runs Mini Benchmarker again with `scx_cognis --mode desktop` or `--mode server`
 - copies and tags the produced `benchie_*.log` files
 - generates `mini_benchmarker_comparison.png`, `mini_benchmarker_comparison.svg`, and `mini_benchmarker_summary.csv`
