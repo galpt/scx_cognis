@@ -113,6 +113,7 @@ const volatile u16 llc_node_idx_map[MAX_LLCS] = {};
 const volatile bool usersched_enabled; /* Legacy compatibility fallback gate */
 const volatile u32 usersched_pid; /* User-space scheduler PID */
 u64 usersched_last_run_at; /* Timestamp of the last user-space scheduler execution */
+u64 last_dispatch_at; /* Timestamp of the last ops.dispatch entry */
 static u64 nr_cpu_ids; /* Maximum possible CPU number */
 
 /*
@@ -346,6 +347,7 @@ struct {
  * user-space scheduler and check if there is any pending activity.
  */
 #define USERSCHED_TIMER_NS	NSEC_PER_SEC
+#define DISPATCH_PROGRESS_GUARD_NS (4ULL * NSEC_PER_SEC)
 
 /*
  * Return true if the target task @p is the user-space scheduler.
@@ -1007,6 +1009,35 @@ static bool steal_remote_node(s32 cpu)
 	return false;
 }
 
+static bool dsq_backlog_exists(void)
+{
+	s32 cpu, llc, node;
+
+	if (scx_bpf_dsq_nr_queued(SHARED_DSQ))
+		return true;
+
+	bpf_for(cpu, 0, nr_cpu_ids) {
+		if (scx_bpf_dsq_nr_queued(cpu_to_dsq(cpu)))
+			return true;
+	}
+
+	bpf_for(llc, 0, MAX_LLCS) {
+		if (llc >= nr_llcs)
+			break;
+		if (scx_bpf_dsq_nr_queued(llc_to_dsq(llc)))
+			return true;
+	}
+
+	bpf_for(node, 0, MAX_NODES) {
+		if (node >= nr_nodes)
+			break;
+		if (scx_bpf_dsq_nr_queued(node_to_dsq(node)))
+			return true;
+	}
+
+	return false;
+}
+
 s32 BPF_STRUCT_OPS(cognis_select_cpu, struct task_struct *p, s32 prev_cpu,
 		   u64 wake_flags)
 {
@@ -1238,6 +1269,8 @@ void BPF_STRUCT_OPS(cognis_dispatch, s32 cpu, struct task_struct *prev)
 	u64 node_dsq = cpu_node_dsq(cpu);
 	u64 best_dsq = 0;
 
+	last_dispatch_at = scx_bpf_now();
+
 	/*
 	 * Consume all tasks from the @dispatched list and immediately
 	 * dispatch them on the target CPU decided by the user-space
@@ -1440,16 +1473,25 @@ void BPF_STRUCT_OPS(cognis_disable, struct task_struct *p)
 static int usersched_timer_fn(void *map, int *key, struct bpf_timer *timer)
 {
 	struct task_struct *p;
+	u64 now = scx_bpf_now();
 	int err = 0;
 
-	if (!usersched_enabled)
+	if (dsq_backlog_exists() &&
+	    time_delta(now, last_dispatch_at) >= DISPATCH_PROGRESS_GUARD_NS) {
+		scx_bpf_exit(0,
+			     "dispatch progress guard fired before the kernel watchdog: no ops.dispatch progress for %llu ns while backlog remained",
+			     time_delta(now, last_dispatch_at));
 		return 0;
+	}
+
+	if (!usersched_enabled)
+		goto rearm;
 
 	/*
 	 * Trigger the user-space scheduler if it has been inactive for
 	 * more than USERSCHED_TIMER_NS.
 	 */
-	if (time_delta(scx_bpf_now(), usersched_last_run_at) >= USERSCHED_TIMER_NS) {
+	if (time_delta(now, usersched_last_run_at) >= USERSCHED_TIMER_NS) {
 		bpf_rcu_read_lock();
 		p = bpf_task_from_pid(usersched_pid);
 		if (p) {
@@ -1460,6 +1502,7 @@ static int usersched_timer_fn(void *map, int *key, struct bpf_timer *timer)
 		bpf_rcu_read_unlock();
 	}
 
+rearm:
 	/* Re-arm the timer */
 	err = bpf_timer_start(timer, USERSCHED_TIMER_NS, 0);
 	if (err)
@@ -1615,6 +1658,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(cognis_init)
 
 	/* Initialize maximum possible CPU number */
 	nr_cpu_ids = scx_bpf_nr_cpu_ids();
+	last_dispatch_at = scx_bpf_now();
 
 	/* Initialize the Cognis BPF scheduler core. */
 	err = dsq_init();

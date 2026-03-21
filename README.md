@@ -47,6 +47,7 @@ At a high level, Cognis v2 works like this:
 6. Rust stays available for restart control, stats, TUI, and the opt-in compatibility fallback path.
 7. If `sched_ext` disables Cognis at runtime, Cognis now fails open to the kernel scheduler instead of treating that exit like a restart request.
 8. In headless no-fallback periods, the Rust control loop now backs off more aggressively and no longer boosts its own userspace priority by default.
+9. A BPF-side dispatch-progress guard now exits Cognis before the kernel watchdog window if backlog remains but `ops.dispatch` stops making progress.
 
 > [!IMPORTANT]
 > - The common case is meant to avoid a Rust round-trip.
@@ -99,6 +100,7 @@ What the current code does:
 - Treats malformed ring-buffer messages and topology-probe failures as recoverable conditions with safe fallbacks
 - Keeps `desktop` as the install default while preserving a real `server` mode instead of a neglected side path
 - Treats watchdog / runnable-task-stall exits as non-restartable failures so the system stays on the kernel scheduler instead of bouncing straight back into Cognis
+- Uses a BPF-side dispatch-progress guard to bail out before the kernel watchdog window when backlog remains but `ops.dispatch` stops running
 
 What still requires real-machine validation:
 
