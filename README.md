@@ -361,6 +361,7 @@ In this particular run, `Cognis (desktop)` finished faster overall than the base
 
 The current local follow-up work is split into two tracks so the remaining questions stay clear:
 
+- [V3_DESIGN.md](V3_DESIGN.md): liveness-first redesign target for a future Cognis rewrite
 - [RT_WATCHDOG_FOLLOWUP.md](RT_WATCHDOG_FOLLOWUP.md): current evidence and next steps for the RT-heavy watchdog stall
 - [DESKTOP_RESPONSIVENESS_NOTES.md](DESKTOP_RESPONSIVENESS_NOTES.md): future desktop-feel ideas such as burst/sleep heuristics and interactive prioritization
 
