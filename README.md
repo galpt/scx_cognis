@@ -1,5 +1,10 @@
 # scx_cognis
 
+> [!WARNING]
+> This branch is an experimental Cognis v3 lab, not a stable or release-ready
+> branch. It is where redesign work happens before anything is considered for
+> `main` or a future upstream PR.
+
 `scx_cognis` is a BPF-first `sched_ext` scheduler aimed at desktops, workstations, and general-purpose servers.
 
 Cognis keeps the normal scheduling path in BPF. Rust remains in the process for loading the scheduler, exporting stats, handling restart/reporting, driving the optional TUI, and servicing an opt-in compatibility fallback when work intentionally crosses into userspace.
@@ -7,6 +12,7 @@ Cognis keeps the normal scheduling path in BPF. Rust remains in the process for 
 ## Table of Contents
 
 - [Status](#status)
+- [V3 Branch Notes](#v3-branch-notes)
 - [Design](#design)
 - [Profiles](#profiles)
 - [Production Ready?](#production-ready)
@@ -31,6 +37,19 @@ Cognis keeps the normal scheduling path in BPF. Rust remains in the process for 
 - CI covers Ubuntu format/test/build plus Arch and CachyOS compile checks, including shell syntax checks for the benchmark helpers and benchmark bootstrap script
 
 This repository is still experimental scheduler work. Passing builds and unit tests are necessary, but they do not prove compositor stability, gaming smoothness, watchdog safety, or long-session behavior on your exact machine.
+
+## V3 Branch Notes
+
+This branch exists to prototype a redesign with a stricter local validation bar
+than the current stable branch.
+
+- [V3_DESIGN.md](V3_DESIGN.md): architecture target and design rules for the
+  redesign
+- [V3_IMPLEMENTATION_PLAN.md](V3_IMPLEMENTATION_PLAN.md): branch-local checklist
+  for getting from the current tree to a cleaner v3 base
+
+The branch is allowed to be incomplete while it is converging, but its
+documentation should stay honest about what is and is not already implemented.
 
 ## Design
 
