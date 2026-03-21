@@ -12,7 +12,6 @@ Cognis keeps the normal scheduling path in BPF. Rust remains in the process for 
 ## Table of Contents
 
 - [Status](#status)
-- [V3 Branch Notes](#v3-branch-notes)
 - [Design](#design)
 - [Profiles](#profiles)
 - [Production Ready?](#production-ready)
@@ -37,23 +36,6 @@ Cognis keeps the normal scheduling path in BPF. Rust remains in the process for 
 - CI covers Ubuntu format/test/build plus Arch and CachyOS compile checks, including shell syntax checks for the benchmark helpers and benchmark bootstrap script
 
 This repository is still experimental scheduler work. Passing builds and unit tests are necessary, but they do not prove compositor stability, gaming smoothness, watchdog safety, or long-session behavior on your exact machine.
-
-## V3 Branch Notes
-
-This branch exists to prototype a redesign with a stricter local validation bar
-than the current stable branch.
-
-- [V3_DESIGN.md](V3_DESIGN.md): architecture target and design rules for the
-  redesign
-- [V3_BASE_SELECTION.md](V3_BASE_SELECTION.md): chosen phase-1 base shape from
-  `cake`, `beerland`, and `lavd`
-- [V3_PHASE1_HOTPATH_MAP.md](V3_PHASE1_HOTPATH_MAP.md): function-level map for
-  stripping the current tree down to the chosen phase-1 base
-- [V3_IMPLEMENTATION_PLAN.md](V3_IMPLEMENTATION_PLAN.md): branch-local checklist
-  for getting from the current tree to a cleaner v3 base
-
-The branch is allowed to be incomplete while it is converging, but its
-documentation should stay honest about what is and is not already implemented.
 
 ## Design
 
