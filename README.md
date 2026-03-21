@@ -16,7 +16,6 @@ Cognis keeps the normal scheduling path in BPF. Rust remains in the process for 
 - [Observability](#observability)
 - [Benchmark Helpers](#benchmark-helpers)
 - [Limitations](#limitations)
-- [Research Notes](#research-notes)
 - [Contributing](#contributing)
 - [License](#license)
 - [Inspirations and References](#inspirations-and-references)
@@ -356,14 +355,6 @@ In this particular run, `Cognis (desktop)` finished faster overall than the base
 - The current mitigation for watchdog-triggered `sched_ext` exits is fail-open behavior, not a claim that the entire stall class has been eliminated.
 - Local `cachyos-benchmarker` repros still show a runnable-task-stall watchdog edge case under heavy RT-class pressure. That remains an active follow-up item rather than a solved claim.
 - Any claim of “better” behavior should come from repeated testing on the target machine.
-
-## Research Notes
-
-The current local follow-up work is split into two tracks so the remaining questions stay clear:
-
-- [V3_DESIGN.md](V3_DESIGN.md): liveness-first redesign target for a future Cognis rewrite
-- [RT_WATCHDOG_FOLLOWUP.md](RT_WATCHDOG_FOLLOWUP.md): current evidence and next steps for the RT-heavy watchdog stall
-- [DESKTOP_RESPONSIVENESS_NOTES.md](DESKTOP_RESPONSIVENESS_NOTES.md): future desktop-feel ideas such as burst/sleep heuristics and interactive prioritization
 
 ## Contributing
 
