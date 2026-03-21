@@ -24,7 +24,7 @@ Cognis v2 keeps the normal scheduling path in BPF. Rust remains in the process f
 ## Status
 
 - Runtime model: BPF-first `sched_ext` scheduler with a Rust control plane
-- Common path: direct local dispatch for immediate CPU placements, then per-LLC and per-node overflow DSQs with the global shared DSQ as the final spill path
+- Common path: direct local dispatch for immediate CPU placements, then a shallow stealable per-CPU deferred tier, then per-LLC and per-node overflow DSQs with the global shared DSQ as the final spill path
 - Default install profile: `desktop`
 - Optional profile: `server`
 - Userspace fallback still exists for compatibility, but it is now an explicit opt-in path instead of part of the default service runtime
@@ -41,10 +41,10 @@ At a high level, Cognis v2 works like this:
 
 1. `ops.select_cpu` and `ops.enqueue` try to keep ordinary work in BPF.
 2. Immediate placements dispatch straight to the kernel local DSQ. Deferred saturation paths use the Cognis overflow hierarchy:
-   `LLC DSQ -> node DSQ -> shared DSQ`.
+   `CPU DSQ -> LLC DSQ -> node DSQ -> shared DSQ`.
 3. Dispatch ordering is deadline-based and bounded by profile slice and wake-credit knobs.
 4. On single-node systems, the node tier collapses away and Cognis behaves as a local/LLC/shared scheduler with smarter remote LLC stealing.
-5. When the local tiers are empty, Cognis first looks at local deadline heads, then tries remote LLC steals, then wider node-domain steals, and only then falls back to the current-task refill behavior.
+5. When the local tiers are empty, Cognis first looks at local deadline heads, then tries remote per-CPU steals, then remote LLC steals, then wider node-domain steals, and only then falls back to the current-task refill behavior.
 6. Rust stays available for restart control, stats, TUI, and the opt-in compatibility fallback path.
 7. If `sched_ext` disables Cognis at runtime, Cognis now fails open to the kernel scheduler instead of treating that exit like a restart request.
 8. In headless no-fallback periods, the Rust control loop now backs off more aggressively and no longer boosts its own userspace priority by default.
@@ -53,7 +53,7 @@ At a high level, Cognis v2 works like this:
 > [!IMPORTANT]
 > - The common case is meant to avoid a Rust round-trip.
 > - `nr_queued`, `nr_scheduled`, and `nr_user_dispatches` are compatibility-fallback signals. They are only expected to move when `--userspace-fallback` is enabled; otherwise they should stay at zero.
-> - `nr_local_dispatches`, `nr_llc_dispatches`, `nr_node_dispatches`, `nr_shared_dispatches`, `nr_xllc_steals`, and `nr_xnode_steals` describe how work is moving through the direct-local and deferred overflow paths.
+> - `nr_local_dispatches`, `nr_llc_dispatches`, `nr_node_dispatches`, `nr_shared_dispatches`, `nr_xllc_steals`, and `nr_xnode_steals` describe how work is moving through the direct-local and deferred overflow paths. The current branch also experiments with remote steals from the shallow per-CPU deferred tier before broader LLC/node steals.
 > - `slice(base/assigned)` in the monitor is not a live trace of every BPF dispatch slice: `base` is the active profile ceiling, while `assigned` tracks the userspace-fallback slice estimate.
 > - The Rust loop is no longer meant to spin continuously when BPF is handling the workload.
 > - Headless no-fallback operation now uses a quieter backoff and does not raise the Cognis userspace thread to `nice -20` by default.

@@ -683,14 +683,23 @@ static u64 queue_pressure(s32 cpu)
 	if (!is_cpu_valid(cpu))
 		return pressure;
 
+	pressure += scx_bpf_dsq_nr_queued(cpu_to_dsq(cpu));
 	pressure += scx_bpf_dsq_nr_queued(cpu_llc_dsq(cpu));
 	if (nr_nodes > 1)
 		pressure += scx_bpf_dsq_nr_queued(cpu_node_dsq(cpu));
 
-	if (usersched_enabled)
-		pressure += scx_bpf_dsq_nr_queued(cpu_to_dsq(cpu));
-
 	return pressure;
+}
+
+static u64 cpu_spill_threshold(void)
+{
+	/*
+	 * Keep at most one queued task in the scheduler-owned per-CPU DSQ
+	 * before widening into the LLC/node/shared hierarchy. This keeps a
+	 * stealable local backlog slot without letting an RT-dominated CPU
+	 * accumulate an arbitrarily deep private queue.
+	 */
+	return 1;
 }
 
 static u64 llc_spill_threshold(void)
@@ -719,21 +728,28 @@ static u64 node_spill_threshold(void)
  * Pick the fallback DSQ to use once no idle CPU was available.
  *
  * The default runtime keeps immediate placements on kernel local DSQs and
- * uses the deferred hierarchy only once no direct placement is available.
- * Overflow therefore starts at the closest LLC DSQ, then widens to a node DSQ,
- * and finally uses the global shared DSQ when the nearer domains are already
- * saturated too.
+ * uses a scheduler-owned per-CPU DSQ as the first deferred tier once no
+ * direct placement is available. Other CPUs can steal from that tier when a
+ * runnable task would otherwise get stranded behind RT-heavy local pressure.
+ * If that queue already has backlog, overflow widens to the closest LLC DSQ,
+ * then a node DSQ, and finally the global shared DSQ when the nearer domains
+ * are already saturated too.
  *
  * Server mode uses the same hierarchy but reaches broader spill tiers sooner
  * to keep throughput-oriented balancing broad under pressure.
  */
 static u64 overflow_dsq(s32 prev_cpu)
 {
-	u64 llc_dsq, node_dsq;
-	u64 llc_depth, node_depth;
+	u64 local_dsq, llc_dsq, node_dsq;
+	u64 local_depth, llc_depth, node_depth;
 
 	if (!is_cpu_valid(prev_cpu))
 		return SHARED_DSQ;
+
+	local_dsq = cpu_to_dsq(prev_cpu);
+	local_depth = scx_bpf_dsq_nr_queued(local_dsq);
+	if (local_depth < cpu_spill_threshold())
+		return local_dsq;
 
 	llc_dsq = cpu_llc_dsq(prev_cpu);
 	llc_depth = scx_bpf_dsq_nr_queued(llc_dsq);
@@ -1010,6 +1026,39 @@ static bool steal_remote_llc(s32 cpu, bool same_node_only)
 	return false;
 }
 
+static bool steal_remote_cpu(s32 cpu, bool same_llc_only)
+{
+	struct task_struct *candidate, *best = NULL;
+	u64 best_depth = 0, candidate_depth, best_dsq = 0;
+	s32 victim;
+
+	if (!is_cpu_valid(cpu))
+		return false;
+
+	bpf_for(victim, 0, nr_cpu_ids) {
+		if (victim == cpu)
+			continue;
+		if (same_llc_only && !cpus_share_cache(cpu, victim))
+			continue;
+
+		candidate_depth = scx_bpf_dsq_nr_queued(cpu_to_dsq(victim));
+		if (!candidate_depth)
+			continue;
+
+		candidate = __COMPAT_scx_bpf_dsq_peek(cpu_to_dsq(victim));
+		if (!candidate || !bpf_cpumask_test_cpu(cpu, candidate->cpus_ptr))
+			continue;
+
+		if (is_remote_head_better(candidate, candidate_depth, best, best_depth)) {
+			best = candidate;
+			best_depth = candidate_depth;
+			best_dsq = cpu_to_dsq(victim);
+		}
+	}
+
+	return best && scx_bpf_dsq_move_to_local(best_dsq);
+}
+
 static bool steal_remote_node(s32 cpu)
 {
 	struct task_struct *candidate, *best = NULL;
@@ -1245,11 +1294,12 @@ void BPF_STRUCT_OPS(cognis_enqueue, struct task_struct *p, u64 enq_flags)
 	/*
 	 * No idle CPU was available. Route through the deferred hierarchy:
 	 *
-	 *   LLC DSQ -> node DSQ -> shared DSQ
+	 *   CPU DSQ -> LLC DSQ -> node DSQ -> shared DSQ
 	 *
-	 * This keeps saturation inside a stealable cache domain before
-	 * widening to a node domain and finally paying the contention cost of the
-	 * global shared queue.
+	 * The scheduler-owned per-CPU tier is intentionally shallow and
+	 * stealable. It lets other CPUs drain a task that was originally
+	 * closest to @prev_cpu before the task is widened into broader LLC,
+	 * node, and global spill queues.
 	 */
 	u64 target_dsq = (can_migrate && prev_cpu_rt_busy) ?
 			 SHARED_DSQ : overflow_dsq(prev_cpu);
@@ -1321,14 +1371,11 @@ void BPF_STRUCT_OPS(cognis_dispatch, s32 cpu, struct task_struct *prev)
 		return;
 
 	/*
-	 * Pick the earliest deadline between the local LLC overflow DSQ, the
-	 * wider node DSQ, and the global shared spill DSQ.
-	 *
-	 * The custom per-CPU DSQ is kept only for the opt-in userspace fallback
-	 * path, so the default runtime does not put it on the hot deferred path.
+	 * Pick the earliest deadline between the scheduler-owned per-CPU queue,
+	 * the local LLC overflow DSQ, the wider node DSQ, and the global shared
+	 * spill DSQ.
 	 */
-	if (usersched_enabled)
-		local = __COMPAT_scx_bpf_dsq_peek(local_dsq);
+	local = __COMPAT_scx_bpf_dsq_peek(local_dsq);
 	llc = __COMPAT_scx_bpf_dsq_peek(llc_dsq);
 	if (nr_nodes > 1)
 		node = __COMPAT_scx_bpf_dsq_peek(node_dsq);
@@ -1356,6 +1403,10 @@ void BPF_STRUCT_OPS(cognis_dispatch, s32 cpu, struct task_struct *prev)
 	if (node && best_dsq != node_dsq && scx_bpf_dsq_move_to_local(node_dsq))
 		return;
 	if (shared && best_dsq != SHARED_DSQ && scx_bpf_dsq_move_to_local(SHARED_DSQ))
+		return;
+	if (steal_remote_cpu(cpu, true))
+		return;
+	if (steal_remote_cpu(cpu, false))
 		return;
 	if (steal_remote_llc(cpu, true))
 		return;
