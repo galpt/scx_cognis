@@ -4,7 +4,7 @@
  *
  * Scheduling decisions are made in BPF. The Rust process remains responsible
  * for loading the scheduler, exporting stats, handling restart/reporting, and
- * keeping a dormant compatibility path for legacy user-space dispatch.
+ * keeping an opt-in compatibility path for legacy user-space dispatch.
  *
  * The hot policy is intentionally simple and research-driven:
  *   - per-CPU local DSQs for locality
@@ -110,6 +110,7 @@ const volatile u16 llc_node_idx_map[MAX_LLCS] = {};
 /*
  * Scheduler attributes and statistics.
  */
+const volatile bool usersched_enabled; /* Legacy compatibility fallback gate */
 const volatile u32 usersched_pid; /* User-space scheduler PID */
 u64 usersched_last_run_at; /* Timestamp of the last user-space scheduler execution */
 static u64 nr_cpu_ids; /* Maximum possible CPU number */
@@ -429,6 +430,9 @@ static bool test_and_clear_usersched_needed(void)
  */
 static bool usersched_has_pending_tasks(void)
 {
+	if (!usersched_enabled)
+		return false;
+
 	if (test_and_clear_usersched_needed())
 		return true;
 
@@ -1122,7 +1126,8 @@ void BPF_STRUCT_OPS(cognis_enqueue, struct task_struct *p, u64 enq_flags)
 	 * scheduling action to do.
 	 */
 	if (is_usersched_task(p)) {
-		scx_bpf_dsq_insert(p, SCHED_DSQ, slice_ns, enq_flags);
+		if (usersched_enabled)
+			scx_bpf_dsq_insert(p, SCHED_DSQ, slice_ns, enq_flags);
 		goto out;
 	}
 
@@ -1437,6 +1442,9 @@ static int usersched_timer_fn(void *map, int *key, struct bpf_timer *timer)
 	struct task_struct *p;
 	int err = 0;
 
+	if (!usersched_enabled)
+		return 0;
+
 	/*
 	 * Trigger the user-space scheduler if it has been inactive for
 	 * more than USERSCHED_TIMER_NS.
@@ -1563,10 +1571,12 @@ static int dsq_init(void)
 	}
 
 	/* Create the scheduler's DSQ */
-	err = scx_bpf_create_dsq(SCHED_DSQ, -1);
-	if (err) {
-		scx_bpf_error("failed to create scheduler DSQ: %d", err);
-		return err;
+	if (usersched_enabled) {
+		err = scx_bpf_create_dsq(SCHED_DSQ, -1);
+		if (err) {
+			scx_bpf_error("failed to create scheduler DSQ: %d", err);
+			return err;
+		}
 	}
 
 	return 0;
@@ -1610,9 +1620,11 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(cognis_init)
 	err = dsq_init();
 	if (err)
 		return err;
-	err = usersched_timer_init();
-	if (err)
-		return err;
+	if (usersched_enabled) {
+		err = usersched_timer_init();
+		if (err)
+			return err;
+	}
 
 	return 0;
 }

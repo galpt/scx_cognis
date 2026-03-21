@@ -4,7 +4,7 @@
 // scx_cognis — BPF-first CPU Scheduler
 //
 // Cognis v2 keeps the scheduling policy in BPF and uses Rust as the control
-// plane for loading, stats, restart handling, and a narrow compatibility
+// plane for loading, stats, restart handling, and an opt-in compatibility
 // fallback when work intentionally crosses into userspace:
 //
 //   ┌─────────────────────────────────────────────────────────────────────┐
@@ -102,7 +102,7 @@ impl SchedulerMode {
 ///
 /// Scheduling pipeline: a BPF local CPU / LLC / node / shared hierarchy owns
 /// normal dispatch, while Rust stays available for stats, restart handling,
-/// and a narrow compatibility fallback path.
+/// and an opt-in compatibility fallback path.
 #[derive(Debug, Parser)]
 struct Opts {
     /// Maximum scheduling slice duration in microseconds.
@@ -152,6 +152,14 @@ struct Opts {
     /// Enable stats monitoring with the specified interval (seconds).
     #[clap(long)]
     stats: Option<f64>,
+
+    /// Re-enable the legacy userspace compatibility fallback path.
+    ///
+    /// This is off by default in the service/runtime path so Cognis behaves
+    /// more like a BPF-owned scheduler under heavy load. Use it only for
+    /// compatibility experiments or focused diagnostics.
+    #[clap(long, action = clap::ArgAction::SetTrue)]
+    userspace_fallback: bool,
 
     /// Serve live stats to external monitor clients while the scheduler runs.
     ///
@@ -250,6 +258,9 @@ fn enabled_flag_summary(opts: &Opts) -> String {
     }
     if opts.stats.is_some() {
         flags.push("stats");
+    }
+    if opts.userspace_fallback {
+        flags.push("userspace_fallback");
     }
     if opts.serve_stats {
         flags.push("serve_stats");
@@ -458,6 +469,7 @@ impl<'a> Scheduler<'a> {
             opts.libbpf.clone().into_bpf_open_opts(),
             opts.exit_dump_len,
             opts.partial,
+            opts.userspace_fallback,
             opts.verbose,
             true,
             &profile,
@@ -1892,13 +1904,20 @@ mod tests {
             "-t",
             "--stats",
             "1",
+            "--userspace-fallback",
             "--serve-stats",
         ]);
 
         assert_eq!(
             enabled_flag_summary(&opts),
-            "partial,percpu_local,verbose,tui,stats,serve_stats"
+            "partial,percpu_local,verbose,tui,stats,userspace_fallback,serve_stats"
         );
+    }
+
+    #[test]
+    fn userspace_fallback_stays_off_by_default() {
+        let opts = Opts::parse_from(["scx_cognis"]);
+        assert!(!opts.userspace_fallback);
     }
 
     #[test]

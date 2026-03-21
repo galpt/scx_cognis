@@ -2,7 +2,7 @@
 
 `scx_cognis` is a BPF-first `sched_ext` scheduler aimed at desktops, workstations, and general-purpose servers.
 
-Cognis v2 keeps the normal scheduling path in BPF. Rust remains in the process for loading the scheduler, exporting stats, handling restart/reporting, driving the optional TUI, and servicing a narrow compatibility fallback when work intentionally crosses into userspace.
+Cognis v2 keeps the normal scheduling path in BPF. Rust remains in the process for loading the scheduler, exporting stats, handling restart/reporting, driving the optional TUI, and servicing an opt-in compatibility fallback when work intentionally crosses into userspace.
 
 ## Table of Contents
 
@@ -26,7 +26,7 @@ Cognis v2 keeps the normal scheduling path in BPF. Rust remains in the process f
 - Common path: per-CPU local DSQs, per-LLC overflow DSQs, then per-node DSQs on multi-node systems, with the global shared DSQ as the final spill path
 - Default install profile: `desktop`
 - Optional profile: `server`
-- Userspace fallback still exists for compatibility, but it is intended to be exceptional rather than the normal path
+- Userspace fallback still exists for compatibility, but it is now an explicit opt-in path instead of part of the default service runtime
 - Local verification on this branch includes `cargo fmt --all -- --check`, `cargo check --locked`, `cargo test --locked`, `sh -n install.sh`, `sh -n uninstall.sh`, `sh -n cognis_benchmark.sh`, `bash -n mini_benchmarker.sh`, and `bash -n install_benchmark_deps.sh`
 - CI covers Ubuntu format/test/build plus Arch and CachyOS compile checks, including shell syntax checks for the benchmark helpers and benchmark bootstrap script
 
@@ -44,13 +44,13 @@ At a high level, Cognis v2 works like this:
 3. Dispatch ordering is deadline-based and bounded by profile slice and wake-credit knobs.
 4. On single-node systems, the node tier collapses away and Cognis behaves as a local/LLC/shared scheduler with smarter remote LLC stealing.
 5. When the local tiers are empty, Cognis first looks at local deadline heads, then tries remote LLC steals, then wider node-domain steals, and only then falls back to the current-task refill behavior.
-6. Rust stays available for restart control, stats, TUI, and the compatibility fallback path.
+6. Rust stays available for restart control, stats, TUI, and the opt-in compatibility fallback path.
 7. If `sched_ext` disables Cognis at runtime, Cognis now fails open to the kernel scheduler instead of treating that exit like a restart request.
 8. In headless no-fallback periods, the Rust control loop now backs off more aggressively and no longer boosts its own userspace priority by default.
 
 > [!IMPORTANT]
 > - The common case is meant to avoid a Rust round-trip.
-> - `nr_queued`, `nr_scheduled`, and `nr_user_dispatches` are compatibility-fallback signals. If they keep rising under a workload, work is escaping the intended BPF fast path.
+> - `nr_queued`, `nr_scheduled`, and `nr_user_dispatches` are compatibility-fallback signals. They are only expected to move when `--userspace-fallback` is enabled; otherwise they should stay at zero.
 > - `nr_local_dispatches`, `nr_llc_dispatches`, `nr_node_dispatches`, `nr_shared_dispatches`, `nr_xllc_steals`, and `nr_xnode_steals` describe how saturated work is moving through the BPF hierarchy.
 > - `slice(base/assigned)` in the monitor is not a live trace of every BPF dispatch slice: `base` is the active profile ceiling, while `assigned` tracks the userspace-fallback slice estimate.
 > - The Rust loop is no longer meant to spin continuously when BPF is handling the workload.
@@ -80,7 +80,7 @@ scx_cognis --mode server
 
 Conditionally.
 
-For a validated target machine and workload mix, Cognis v2 can be used as a production scheduler: the normal scheduling path stays in BPF, the Rust fallback is meant to be exceptional, and the install default is the `desktop` profile.
+For a validated target machine and workload mix, Cognis v2 can be used as a production scheduler: the normal scheduling path stays in BPF, the optional Rust fallback stays off by default, and the install default is the `desktop` profile.
 
 However, this project does not claim a blanket "production ready on every machine" guarantee across all kernels, topologies, desktop stacks, and server environments. The honest bar is:
 
@@ -166,6 +166,7 @@ sudo ./target/release/scx_cognis --mode server
 | `-v, --verbose` | Enables verbose output |
 | `-t, --tui` | Launches the TUI dashboard |
 | `--stats <secs>` | Runs the scheduler and periodic stats output together |
+| `--userspace-fallback` | Re-enables the legacy userspace compatibility fallback path for diagnostics or compatibility testing |
 | `--serve-stats` | Serves live stats to external monitor clients while the scheduler runs |
 | `--monitor <secs>` | Monitor-only mode; does not launch a scheduler |
 | `--help-stats` | Prints descriptions for exported statistics |
@@ -234,9 +235,10 @@ Available surfaces:
 - `scx_cognis --tui`
 - `scx_cognis --help-stats`
 
-The default headless service path does not launch the stats server anymore. If
-you want to attach `--monitor` to a long-running installed service, start that
-service with `--serve-stats`, for example:
+The default headless service path does not launch the stats server anymore and
+does not enable the legacy userspace fallback path. If you want to attach
+`--monitor` to a long-running installed service, start that service with
+`--serve-stats`, for example:
 
 ```bash
 sudo sh install.sh --flags "--mode desktop --serve-stats"
@@ -256,7 +258,7 @@ What the main counters mean:
 - `slice(base/assigned)`: profile slice ceiling plus userspace-fallback assigned-slice estimate, not a direct per-task BPF slice trace
 - `sched_p50/p95/p99`: userspace fallback latency percentiles, not full-system frame-time metrics
 
-If `nr_user_dispatches`, `nr_queued`, or `nr_scheduled` stay elevated during a workload that should fit the BPF fast path, that is a signal to investigate the BPF policy rather than a sign that the userspace path is “working as intended.”
+If `--userspace-fallback` is off, `nr_user_dispatches`, `nr_queued`, and `nr_scheduled` should stay at zero. If they stay elevated when the fallback is enabled during a workload that should fit the BPF fast path, that is a signal to investigate the BPF policy rather than a sign that the userspace path is “working as intended.”
 
 If `nr_shared_dispatches` dominates `nr_llc_dispatches + nr_node_dispatches` during a saturated workload, that is a hint that the workload is spilling past local cache and node domains and may benefit from more tuning on the saturated path.
 

@@ -323,6 +323,7 @@ impl<'cb> BpfScheduler<'cb> {
         open_opts: Option<bpf_object_open_opts>,
         exit_dump_len: u32,
         partial: bool,
+        userspace_fallback: bool,
         debug: bool,
         builtin_idle: bool,
         profile: &BpfProfile,
@@ -355,7 +356,12 @@ impl<'cb> BpfScheduler<'cb> {
             skel.struct_ops.cognis_mut().flags |= *compat::SCX_OPS_SWITCH_PARTIAL;
         }
         skel.struct_ops.cognis_mut().exit_dump_len = exit_dump_len;
-        rodata.usersched_pid = std::process::id();
+        rodata.usersched_enabled = userspace_fallback;
+        rodata.usersched_pid = if userspace_fallback {
+            std::process::id()
+        } else {
+            0
+        };
         rodata.builtin_idle = builtin_idle;
         rodata.slice_ns = profile.slice_ns;
         rodata.slice_min_ns = profile.slice_min_ns;
