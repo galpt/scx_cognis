@@ -634,6 +634,13 @@ static void count_kernel_route(u64 dsq_id)
 	__sync_fetch_and_add(&nr_kernel_dispatches, 1);
 }
 
+static void direct_local_dispatch(struct task_struct *p, s32 cpu, u64 slice,
+				       u64 enq_flags)
+{
+	scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu, slice, enq_flags);
+	count_kernel_route(SCX_DSQ_LOCAL_ON | cpu);
+}
+
 static u64 queue_pressure(s32 cpu)
 {
 	u64 pressure = scx_bpf_dsq_nr_queued(SHARED_DSQ);
@@ -1043,7 +1050,6 @@ s32 BPF_STRUCT_OPS(cognis_select_cpu, struct task_struct *p, s32 prev_cpu,
 {
 	s32 cpu, this_cpu = bpf_get_smp_processor_id();
 	bool is_this_cpu_allowed = bpf_cpumask_test_cpu(this_cpu, p->cpus_ptr);
-	struct task_ctx *tctx;
 
 	/*
 	 * Make sure @prev_cpu is usable, otherwise try to move close to
@@ -1072,12 +1078,7 @@ s32 BPF_STRUCT_OPS(cognis_select_cpu, struct task_struct *p, s32 prev_cpu,
 	 */
 	cpu = pick_idle_cpu(p, prev_cpu, wake_flags);
 	if (cpu >= 0) {
-		tctx = try_lookup_task_ctx(p);
-		if (tctx) {
-			scx_bpf_dsq_insert_vtime(p, cpu_to_dsq(cpu),
-						 task_slice(p, cpu), task_dl(p, cpu, tctx), 0);
-			count_kernel_route(cpu_to_dsq(cpu));
-		}
+		direct_local_dispatch(p, cpu, task_slice(p, cpu), 0);
 		return cpu;
 	}
 
@@ -1179,9 +1180,7 @@ void BPF_STRUCT_OPS(cognis_enqueue, struct task_struct *p, u64 enq_flags)
 	 * redundant checks removed.
 	 */
 	if (is_kthread(p)) {
-		scx_bpf_dsq_insert_vtime(p, cpu_to_dsq(prev_cpu),
-					 task_slice(p, prev_cpu), p->scx.dsq_vtime, enq_flags);
-		count_kernel_route(cpu_to_dsq(prev_cpu));
+		direct_local_dispatch(p, prev_cpu, task_slice(p, prev_cpu), enq_flags);
 		goto out;
 	}
 
@@ -1190,9 +1189,7 @@ void BPF_STRUCT_OPS(cognis_enqueue, struct task_struct *p, u64 enq_flags)
 	 * preserve cache locality.
 	 */
 	if (is_task_sticky(tctx)) {
-		scx_bpf_dsq_insert_vtime(p, cpu_to_dsq(prev_cpu),
-					 task_slice(p, prev_cpu), task_dl(p, prev_cpu, tctx), enq_flags);
-		count_kernel_route(cpu_to_dsq(prev_cpu));
+		direct_local_dispatch(p, prev_cpu, task_slice(p, prev_cpu), enq_flags);
 		goto out;
 	}
 
@@ -1203,9 +1200,7 @@ void BPF_STRUCT_OPS(cognis_enqueue, struct task_struct *p, u64 enq_flags)
 	if (task_should_migrate(p, enq_flags)) {
 		cpu = pick_idle_cpu(p, prev_cpu, 0);
 		if (cpu >= 0) {
-			scx_bpf_dsq_insert_vtime(p, cpu_to_dsq(cpu),
-						 task_slice(p, cpu), task_dl(p, cpu, tctx), enq_flags);
-			count_kernel_route(cpu_to_dsq(cpu));
+			direct_local_dispatch(p, cpu, task_slice(p, cpu), enq_flags);
 			if (prev_cpu != cpu || !scx_bpf_task_running(p))
 				scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
 			return;

@@ -23,7 +23,7 @@ Cognis v2 keeps the normal scheduling path in BPF. Rust remains in the process f
 ## Status
 
 - Runtime model: BPF-first `sched_ext` scheduler with a Rust control plane
-- Common path: per-CPU local DSQs, per-LLC overflow DSQs, then per-node DSQs on multi-node systems, with the global shared DSQ as the final spill path
+- Common path: direct local dispatch for immediate CPU placements, then per-LLC and per-node overflow DSQs with the global shared DSQ as the final spill path
 - Default install profile: `desktop`
 - Optional profile: `server`
 - Userspace fallback still exists for compatibility, but it is now an explicit opt-in path instead of part of the default service runtime
@@ -39,7 +39,7 @@ The kernel-facing policy lives in [main.bpf.c](main.bpf.c). The Rust control pla
 At a high level, Cognis v2 works like this:
 
 1. `ops.select_cpu` and `ops.enqueue` try to keep ordinary work in BPF.
-2. The BPF side uses a queue hierarchy:
+2. Immediate placements dispatch straight to the kernel local DSQ. Deferred saturation paths use the Cognis queue hierarchy:
    `CPU local DSQ -> LLC DSQ -> node DSQ -> shared DSQ`.
 3. Dispatch ordering is deadline-based and bounded by profile slice and wake-credit knobs.
 4. On single-node systems, the node tier collapses away and Cognis behaves as a local/LLC/shared scheduler with smarter remote LLC stealing.
@@ -47,7 +47,7 @@ At a high level, Cognis v2 works like this:
 6. Rust stays available for restart control, stats, TUI, and the opt-in compatibility fallback path.
 7. If `sched_ext` disables Cognis at runtime, Cognis now fails open to the kernel scheduler instead of treating that exit like a restart request.
 8. In headless no-fallback periods, the Rust control loop now backs off more aggressively and no longer boosts its own userspace priority by default.
-9. A BPF-side dispatch-progress guard now exits Cognis before the kernel watchdog window if backlog remains but `ops.dispatch` stops making progress.
+9. Cognis still carries an experimental BPF-side dispatch-progress guard, but local validation under `cachyos-benchmarker` has not yet shown it reliably preempting the kernel watchdog path.
 
 > [!IMPORTANT]
 > - The common case is meant to avoid a Rust round-trip.
