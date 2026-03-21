@@ -16,6 +16,7 @@ Cognis v2 keeps the normal scheduling path in BPF. Rust remains in the process f
 - [Observability](#observability)
 - [Benchmark Helpers](#benchmark-helpers)
 - [Limitations](#limitations)
+- [Follow-Up Notes](#follow-up-notes)
 - [Contributing](#contributing)
 - [License](#license)
 - [Inspirations and References](#inspirations-and-references)
@@ -47,7 +48,7 @@ At a high level, Cognis v2 works like this:
 6. Rust stays available for restart control, stats, TUI, and the opt-in compatibility fallback path.
 7. If `sched_ext` disables Cognis at runtime, Cognis now fails open to the kernel scheduler instead of treating that exit like a restart request.
 8. In headless no-fallback periods, the Rust control loop now backs off more aggressively and no longer boosts its own userspace priority by default.
-9. Cognis still carries an experimental BPF-side dispatch-progress guard, but local validation under `cachyos-benchmarker` has not yet shown it reliably preempting the kernel watchdog path.
+9. Cognis still carries an experimental BPF-side dispatch-progress guard, but local validation under `cachyos-benchmarker` has not yet shown it reliably preempting the kernel watchdog path under RT-heavy pressure.
 
 > [!IMPORTANT]
 > - The common case is meant to avoid a Rust round-trip.
@@ -100,7 +101,7 @@ What the current code does:
 - Treats malformed ring-buffer messages and topology-probe failures as recoverable conditions with safe fallbacks
 - Keeps `desktop` as the install default while preserving a real `server` mode instead of a neglected side path
 - Treats watchdog / runnable-task-stall exits as non-restartable failures so the system stays on the kernel scheduler instead of bouncing straight back into Cognis
-- Uses a BPF-side dispatch-progress guard to bail out before the kernel watchdog window when backlog remains but `ops.dispatch` stops running
+- Carries an experimental BPF-side dispatch-progress guard, but local validation has not yet shown it reliably preempting the kernel watchdog window under RT-heavy pressure
 
 What still requires real-machine validation:
 
@@ -353,7 +354,15 @@ In this particular run, `Cognis (desktop)` finished faster overall than the base
 - CI cannot prove compositor stability, gaming smoothness, or watchdog safety on GitHub-hosted runners.
 - Runtime behavior still depends heavily on kernel version, topology, firmware, browser workload, GPU/compositor stack, and desktop/server load mix.
 - The current mitigation for watchdog-triggered `sched_ext` exits is fail-open behavior, not a claim that the entire stall class has been eliminated.
+- Local `cachyos-benchmarker` repros still show a runnable-task-stall watchdog edge case under heavy RT-class pressure. That remains an active follow-up item rather than a solved v2 claim.
 - Any claim of “better” behavior should come from repeated testing on the target machine.
+
+## Follow-Up Notes
+
+The current local follow-up work is split into two tracks so the remaining questions stay clear:
+
+- [V2_RT_WATCHDOG_FOLLOWUP.md](V2_RT_WATCHDOG_FOLLOWUP.md): current evidence and next steps for the RT-heavy watchdog stall
+- [V3_DESKTOP_RESPONSIVENESS_NOTES.md](V3_DESKTOP_RESPONSIVENESS_NOTES.md): future desktop-feel ideas such as burst/sleep heuristics and interactive prioritization
 
 ## Contributing
 
