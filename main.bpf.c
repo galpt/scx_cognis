@@ -648,10 +648,12 @@ static u64 queue_pressure(s32 cpu)
 	if (!is_cpu_valid(cpu))
 		return pressure;
 
-	pressure += scx_bpf_dsq_nr_queued(cpu_to_dsq(cpu));
 	pressure += scx_bpf_dsq_nr_queued(cpu_llc_dsq(cpu));
 	if (nr_nodes > 1)
 		pressure += scx_bpf_dsq_nr_queued(cpu_node_dsq(cpu));
+
+	if (usersched_enabled)
+		pressure += scx_bpf_dsq_nr_queued(cpu_to_dsq(cpu));
 
 	return pressure;
 }
@@ -681,28 +683,24 @@ static u64 node_spill_threshold(void)
 /*
  * Pick the fallback DSQ to use once no idle CPU was available.
  *
- * Both profiles keep the first spill local when the previous CPU queue is
- * still empty. Once that CPU already carries backlog, Cognis prefers the
- * closest LLC DSQ and then the wider node DSQ. It only spills to the global
- * shared DSQ once the nearer domains are already saturated too.
+ * The default runtime keeps immediate placements on kernel local DSQs and
+ * uses the deferred hierarchy only once no direct placement is available.
+ * Overflow therefore starts at the closest LLC DSQ, then widens to a node DSQ,
+ * and finally uses the global shared DSQ when the nearer domains are already
+ * saturated too.
  *
  * Server mode uses the same hierarchy but reaches broader spill tiers sooner
  * to keep throughput-oriented balancing broad under pressure.
  */
 static u64 overflow_dsq(s32 prev_cpu)
 {
-	u64 local_dsq, llc_dsq, node_dsq;
-	u64 local_depth, llc_depth, node_depth;
+	u64 llc_dsq, node_dsq;
+	u64 llc_depth, node_depth;
 
 	if (!is_cpu_valid(prev_cpu))
 		return SHARED_DSQ;
 
-	local_dsq = cpu_to_dsq(prev_cpu);
 	llc_dsq = cpu_llc_dsq(prev_cpu);
-	local_depth = scx_bpf_dsq_nr_queued(local_dsq);
-	if (!local_depth)
-		return local_dsq;
-
 	llc_depth = scx_bpf_dsq_nr_queued(llc_dsq);
 	if (llc_depth < llc_spill_threshold())
 		return llc_dsq;
@@ -1208,11 +1206,11 @@ void BPF_STRUCT_OPS(cognis_enqueue, struct task_struct *p, u64 enq_flags)
 	}
 
 	/*
-	 * No idle CPU was available. Route through the hierarchy:
+	 * No idle CPU was available. Route through the deferred hierarchy:
 	 *
-	 *   local CPU DSQ -> LLC DSQ -> node DSQ -> shared DSQ
+	 *   LLC DSQ -> node DSQ -> shared DSQ
 	 *
-	 * This keeps saturation mostly inside the closest cache domain before
+	 * This keeps saturation inside a stealable cache domain before
 	 * widening to a node domain and finally paying the contention cost of the
 	 * global shared queue.
 	 */
@@ -1258,7 +1256,7 @@ static long handle_dispatched_task(struct bpf_dynptr *dynptr, void *context)
  */
 void BPF_STRUCT_OPS(cognis_dispatch, s32 cpu, struct task_struct *prev)
 {
-	struct task_struct *local, *llc, *node = NULL, *shared, *best = NULL;
+	struct task_struct *local = NULL, *llc, *node = NULL, *shared, *best = NULL;
 	u64 local_dsq = cpu_to_dsq(cpu);
 	u64 llc_dsq = cpu_llc_dsq(cpu);
 	u64 node_dsq = cpu_node_dsq(cpu);
@@ -1285,16 +1283,20 @@ void BPF_STRUCT_OPS(cognis_dispatch, s32 cpu, struct task_struct *prev)
 		return;
 
 	/*
-	 * Pick the earliest deadline between the local CPU DSQ, the local LLC
-	 * overflow DSQ, the wider node DSQ, and the global shared spill DSQ.
+	 * Pick the earliest deadline between the local LLC overflow DSQ, the
+	 * wider node DSQ, and the global shared spill DSQ.
+	 *
+	 * The custom per-CPU DSQ is kept only for the opt-in userspace fallback
+	 * path, so the default runtime does not put it on the hot deferred path.
 	 */
-	local = __COMPAT_scx_bpf_dsq_peek(local_dsq);
+	if (usersched_enabled)
+		local = __COMPAT_scx_bpf_dsq_peek(local_dsq);
 	llc = __COMPAT_scx_bpf_dsq_peek(llc_dsq);
 	if (nr_nodes > 1)
 		node = __COMPAT_scx_bpf_dsq_peek(node_dsq);
 	shared = __COMPAT_scx_bpf_dsq_peek(SHARED_DSQ);
 	best = local;
-	best_dsq = local_dsq;
+	best_dsq = local ? local_dsq : 0;
 	if (is_deadline_min(llc, best)) {
 		best = llc;
 		best_dsq = llc_dsq;

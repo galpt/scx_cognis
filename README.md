@@ -39,8 +39,8 @@ The kernel-facing policy lives in [main.bpf.c](main.bpf.c). The Rust control pla
 At a high level, Cognis v2 works like this:
 
 1. `ops.select_cpu` and `ops.enqueue` try to keep ordinary work in BPF.
-2. Immediate placements dispatch straight to the kernel local DSQ. Deferred saturation paths use the Cognis queue hierarchy:
-   `CPU local DSQ -> LLC DSQ -> node DSQ -> shared DSQ`.
+2. Immediate placements dispatch straight to the kernel local DSQ. Deferred saturation paths use the Cognis overflow hierarchy:
+   `LLC DSQ -> node DSQ -> shared DSQ`.
 3. Dispatch ordering is deadline-based and bounded by profile slice and wake-credit knobs.
 4. On single-node systems, the node tier collapses away and Cognis behaves as a local/LLC/shared scheduler with smarter remote LLC stealing.
 5. When the local tiers are empty, Cognis first looks at local deadline heads, then tries remote LLC steals, then wider node-domain steals, and only then falls back to the current-task refill behavior.
@@ -52,7 +52,7 @@ At a high level, Cognis v2 works like this:
 > [!IMPORTANT]
 > - The common case is meant to avoid a Rust round-trip.
 > - `nr_queued`, `nr_scheduled`, and `nr_user_dispatches` are compatibility-fallback signals. They are only expected to move when `--userspace-fallback` is enabled; otherwise they should stay at zero.
-> - `nr_local_dispatches`, `nr_llc_dispatches`, `nr_node_dispatches`, `nr_shared_dispatches`, `nr_xllc_steals`, and `nr_xnode_steals` describe how saturated work is moving through the BPF hierarchy.
+> - `nr_local_dispatches`, `nr_llc_dispatches`, `nr_node_dispatches`, `nr_shared_dispatches`, `nr_xllc_steals`, and `nr_xnode_steals` describe how work is moving through the direct-local and deferred overflow paths.
 > - `slice(base/assigned)` in the monitor is not a live trace of every BPF dispatch slice: `base` is the active profile ceiling, while `assigned` tracks the userspace-fallback slice estimate.
 > - The Rust loop is no longer meant to spin continuously when BPF is handling the workload.
 > - Headless no-fallback operation now uses a quieter backoff and does not raise the Cognis userspace thread to `nice -20` by default.
