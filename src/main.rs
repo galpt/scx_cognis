@@ -8,8 +8,9 @@
 // fallback when work intentionally crosses into userspace:
 //
 //   ┌─────────────────────────────────────────────────────────────────────┐
-//   │  ops.enqueue    → direct local dispatch, then LLC / node / shared    │
-//   │  ops.dispatch   → bounded wake credit + deferred overflow handoff    │
+//   │  ops.enqueue    → direct local dispatch, then CPU / LLC / node /     │
+//   │                   shared deferred tiers                              │
+//   │  ops.dispatch   → deadline ordering + stealable deferred handoff     │
 //   │  fallback path  → dormant userspace compatibility path               │
 //   │  ops.select_cpu → kernel idle-CPU query (pick_idle_cpu, atomic)     │
 //   │  housekeeping   → slice-base refresh + observability cleanup         │
@@ -101,9 +102,9 @@ impl SchedulerMode {
 /// scx_cognis: a BPF-first CPU scheduler with a minimal userspace fallback.
 ///
 /// Scheduling pipeline: direct local dispatch handles immediate placements,
-/// while the BPF overflow hierarchy owns the deferred LLC / node / shared
-/// path. Rust stays available for stats, restart handling, and an opt-in
-/// compatibility fallback path.
+/// while the BPF deferred hierarchy owns the shallow per-CPU / LLC / node /
+/// shared path. Rust stays available for stats, restart handling, and an
+/// opt-in compatibility fallback path.
 #[derive(Debug, Parser)]
 struct Opts {
     /// Maximum scheduling slice duration in microseconds.

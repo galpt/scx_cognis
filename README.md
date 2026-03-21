@@ -250,7 +250,7 @@ sudo sh install.sh --flags "--mode desktop --serve-stats"
 What the main counters mean:
 
 - `nr_kernel_dispatches`: total tasks handled directly by the BPF scheduler
-- `nr_local_dispatches`: BPF routes that stayed on a CPU-local DSQ
+- `nr_local_dispatches`: BPF routes that stayed on an immediate local DSQ or the shallow scheduler-owned per-CPU deferred tier
 - `nr_llc_dispatches`: BPF routes that spilled into an LLC DSQ
 - `nr_node_dispatches`: BPF routes that spilled into a node DSQ
 - `nr_shared_dispatches`: BPF routes that spilled into the global shared DSQ
@@ -263,7 +263,7 @@ What the main counters mean:
 
 If `--userspace-fallback` is off, `nr_user_dispatches`, `nr_queued`, and `nr_scheduled` should stay at zero. If they stay elevated when the fallback is enabled during a workload that should fit the BPF fast path, that is a signal to investigate the BPF policy rather than a sign that the userspace path is “working as intended.”
 
-If `nr_shared_dispatches` dominates `nr_llc_dispatches + nr_node_dispatches` during a saturated workload, that is a hint that the workload is spilling past local cache and node domains and may benefit from more tuning on the saturated path.
+If `nr_shared_dispatches` dominates `nr_local_dispatches + nr_llc_dispatches + nr_node_dispatches` during a saturated workload, that is a hint that the workload is spilling past CPU-local, cache-local, and node-local domains and may benefit from more tuning on the saturated path.
 
 ## Benchmark Helpers
 
