@@ -1,6 +1,6 @@
-# V2 RT Watchdog Follow-Up
+# RT Watchdog Follow-Up
 
-This note tracks the remaining v2 robustness issue that showed up during local `cachyos-benchmarker` repro runs.
+This note tracks the remaining RT-heavy robustness issue that showed up during local `cachyos-benchmarker` repro runs.
 
 ## What We Proved Locally
 
@@ -30,6 +30,6 @@ This note is intentionally narrow. It does not claim that Cognis is fundamentall
 
 The professional current claim is:
 
-- Cognis v2 has a real RT-heavy watchdog edge case.
+- Cognis has a real RT-heavy watchdog edge case.
 - Recovery behavior is improved and verified locally.
 - The underlying stall is still an active follow-up item.

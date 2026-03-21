@@ -3,7 +3,7 @@
 //
 // scx_cognis — BPF-first CPU Scheduler
 //
-// Cognis v2 keeps the scheduling policy in BPF and uses Rust as the control
+// Cognis keeps the scheduling policy in BPF and uses Rust as the control
 // plane for loading, stats, restart handling, and an opt-in compatibility
 // fallback when work intentionally crosses into userspace:
 //

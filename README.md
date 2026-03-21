@@ -2,7 +2,7 @@
 
 `scx_cognis` is a BPF-first `sched_ext` scheduler aimed at desktops, workstations, and general-purpose servers.
 
-Cognis v2 keeps the normal scheduling path in BPF. Rust remains in the process for loading the scheduler, exporting stats, handling restart/reporting, driving the optional TUI, and servicing an opt-in compatibility fallback when work intentionally crosses into userspace.
+Cognis keeps the normal scheduling path in BPF. Rust remains in the process for loading the scheduler, exporting stats, handling restart/reporting, driving the optional TUI, and servicing an opt-in compatibility fallback when work intentionally crosses into userspace.
 
 ## Table of Contents
 
@@ -16,7 +16,7 @@ Cognis v2 keeps the normal scheduling path in BPF. Rust remains in the process f
 - [Observability](#observability)
 - [Benchmark Helpers](#benchmark-helpers)
 - [Limitations](#limitations)
-- [Follow-Up Notes](#follow-up-notes)
+- [Research Notes](#research-notes)
 - [Contributing](#contributing)
 - [License](#license)
 - [Inspirations and References](#inspirations-and-references)
@@ -37,7 +37,7 @@ This repository is still experimental scheduler work. Passing builds and unit te
 
 The kernel-facing policy lives in [main.bpf.c](main.bpf.c). The Rust control plane lives in [src/main.rs](src/main.rs) and [src/bpf.rs](src/bpf.rs).
 
-At a high level, Cognis v2 works like this:
+At a high level, Cognis works like this:
 
 1. `ops.select_cpu` and `ops.enqueue` try to keep ordinary work in BPF.
 2. Immediate placements dispatch straight to the kernel local DSQ. Deferred saturation paths use the Cognis overflow hierarchy:
@@ -82,7 +82,7 @@ scx_cognis --mode server
 
 Conditionally.
 
-For a validated target machine and workload mix, Cognis v2 can be used as a production scheduler: the normal scheduling path stays in BPF, the optional Rust fallback stays off by default, and the install default is the `desktop` profile.
+For a validated target machine and workload mix, Cognis can be used as a production scheduler: the normal scheduling path stays in BPF, the optional Rust fallback stays off by default, and the install default is the `desktop` profile.
 
 However, this project does not claim a blanket "production ready on every machine" guarantee across all kernels, topologies, desktop stacks, and server environments. The honest bar is:
 
@@ -349,20 +349,20 @@ In this particular run, `Cognis (desktop)` finished faster overall than the base
 
 ## Limitations
 
-- Cognis v2 is BPF-first, but it is not yet a pure single-language BPF scheduler with no Rust control process.
+- Cognis is BPF-first, but it is not yet a pure single-language BPF scheduler with no Rust control process.
 - The current implementation still uses `scx_rustland_core` as its userspace scaffold.
 - CI cannot prove compositor stability, gaming smoothness, or watchdog safety on GitHub-hosted runners.
 - Runtime behavior still depends heavily on kernel version, topology, firmware, browser workload, GPU/compositor stack, and desktop/server load mix.
 - The current mitigation for watchdog-triggered `sched_ext` exits is fail-open behavior, not a claim that the entire stall class has been eliminated.
-- Local `cachyos-benchmarker` repros still show a runnable-task-stall watchdog edge case under heavy RT-class pressure. That remains an active follow-up item rather than a solved v2 claim.
+- Local `cachyos-benchmarker` repros still show a runnable-task-stall watchdog edge case under heavy RT-class pressure. That remains an active follow-up item rather than a solved claim.
 - Any claim of “better” behavior should come from repeated testing on the target machine.
 
-## Follow-Up Notes
+## Research Notes
 
 The current local follow-up work is split into two tracks so the remaining questions stay clear:
 
-- [V2_RT_WATCHDOG_FOLLOWUP.md](V2_RT_WATCHDOG_FOLLOWUP.md): current evidence and next steps for the RT-heavy watchdog stall
-- [V3_DESKTOP_RESPONSIVENESS_NOTES.md](V3_DESKTOP_RESPONSIVENESS_NOTES.md): future desktop-feel ideas such as burst/sleep heuristics and interactive prioritization
+- [RT_WATCHDOG_FOLLOWUP.md](RT_WATCHDOG_FOLLOWUP.md): current evidence and next steps for the RT-heavy watchdog stall
+- [DESKTOP_RESPONSIVENESS_NOTES.md](DESKTOP_RESPONSIVENESS_NOTES.md): future desktop-feel ideas such as burst/sleep heuristics and interactive prioritization
 
 ## Contributing
 
@@ -405,4 +405,4 @@ These references informed Cognis' design and evaluation mindset, especially arou
 3. sched-ext maintainers. (n.d.). *scx_lavd* [Software]. GitHub. https://github.com/sched-ext/scx/tree/main/scheds/rust/scx_lavd
 4. sched-ext maintainers. (n.d.). *scx_cake* [Software]. GitHub. https://github.com/sched-ext/scx/tree/main/scheds/rust/scx_cake
 5. sched-ext maintainers. (n.d.). *scx_layered* [Software]. GitHub. Referenced directly in Cognis' disable-path comments and fallback handling pattern. https://github.com/sched-ext/scx/tree/main/scheds/rust/scx_layered
-6. sched-ext maintainers. (n.d.). *scx_rustland_core* [Software]. GitHub. Cognis v2 still uses this crate as its userspace scaffold rather than reimplementing the loader/control-plane substrate from scratch. https://github.com/sched-ext/scx/tree/main/rust/scx_rustland_core
+6. sched-ext maintainers. (n.d.). *scx_rustland_core* [Software]. GitHub. Current Cognis still uses this crate as its userspace scaffold rather than reimplementing the loader/control-plane substrate from scratch. https://github.com/sched-ext/scx/tree/main/rust/scx_rustland_core

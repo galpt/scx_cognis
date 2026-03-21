@@ -1,6 +1,6 @@
 /* Copyright (c) Andrea Righi <andrea.righi@linux.dev> */
 /*
- * Cognis v2 — BPF-owned sched_ext policy with a minimal Rust companion.
+ * Cognis — BPF-owned sched_ext policy with a minimal Rust companion.
  *
  * Scheduling decisions are made in BPF. The Rust process remains responsible
  * for loading the scheduler, exporting stats, handling restart/reporting, and
@@ -197,7 +197,7 @@ const volatile bool smt_enabled = true;
 
 /*
  * Legacy compatibility buffers between kernel and the dormant user-space
- * fallback path. In Cognis v2 the default desktop/server profiles do not
+ * fallback path. In the current default desktop/server profiles, tasks do not
  * normally enqueue tasks here.
  */
 #define MAX_ENQUEUED_TASKS 4096
