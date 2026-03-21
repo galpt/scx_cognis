@@ -10,7 +10,7 @@ Target outcome:
 - quiet Rust control plane
 - clear liveness story before any Cognis-specific hierarchy is added
 
-Candidate base ingredients:
+Selected base ingredients:
 
 - `scx_cake`
   - common immediate path
@@ -18,14 +18,15 @@ Candidate base ingredients:
 - `scx_beerland`
   - stealable scheduler-owned per-CPU queue behavior
 - `scx_lavd`
-  - anti-stranding ideas
-  - widening behavior for pressured paths
+  - anti-stranding ideas for a later phase
+  - widening behavior for pressured paths after the small base is stable
 
-Initial decision rule:
+Decision:
 
-- prefer the smallest base that survives repeated local `cachyos-benchmarker`
-  runs
-- only add more policy after that smaller base is stable
+- phase 1 should use a `cake`-style immediate path plus a `beerland`-style
+  stealable deferred tier
+- `lavd`-style anti-stranding logic should be introduced only after that
+  smaller base survives repeated local `cachyos-benchmarker` runs
 
 ## Phase 2: Reintroduce Cognis-Specific Behavior
 
@@ -54,8 +55,9 @@ Before any new upstream PR:
 
 ## Immediate Branch Tasks
 
-- [ ] compare `cake`, `beerland`, and `lavd` hot paths function by function
-- [ ] choose the smallest base runtime model
+- [x] compare `cake`, `beerland`, and `lavd` hot paths function by function
+- [x] choose the smallest base runtime model
+- [ ] write the phase-1 target hot-path map in code-oriented terms
 - [ ] strip the current branch down to that base
 - [ ] rerun local benchmark repros before reintroducing any Cognis-specific
       policy

@@ -45,6 +45,8 @@ than the current stable branch.
 
 - [V3_DESIGN.md](V3_DESIGN.md): architecture target and design rules for the
   redesign
+- [V3_BASE_SELECTION.md](V3_BASE_SELECTION.md): chosen phase-1 base shape from
+  `cake`, `beerland`, and `lavd`
 - [V3_IMPLEMENTATION_PLAN.md](V3_IMPLEMENTATION_PLAN.md): branch-local checklist
   for getting from the current tree to a cleaner v3 base
 
