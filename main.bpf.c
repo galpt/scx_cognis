@@ -43,6 +43,10 @@ UEI_DEFINE(uei);
 #define NSEC_PER_MSEC 1000000ULL
 #endif
 
+#ifndef MAX_RT_PRIO
+#define MAX_RT_PRIO 100
+#endif
+
 /*
  * Introduce a custom DSQ shared across all the CPUs, where we can dispatch
  * tasks that will be executed on the first CPU available.
@@ -617,6 +621,37 @@ static bool task_should_migrate(struct task_struct *p, u64 enq_flags)
 	       (!sticky_tasks || !scx_bpf_task_running(p));
 }
 
+static inline bool rt_or_dl_task(struct task_struct *p)
+{
+	return unlikely(p->prio < MAX_RT_PRIO);
+}
+
+static inline bool is_ksoftirqd(struct task_struct *p)
+{
+	return !__builtin_memcmp(p->comm, "ksoftirqd/", 10);
+}
+
+/*
+ * Return true when @cpu is currently owned by RT/DL work or ksoftirqd.
+ *
+ * This does not mean the CPU is permanently unusable. It is a narrow signal
+ * for "don't stick ordinary migratable work to this CPU right now if we have
+ * a stealable overflow path available instead".
+ */
+static bool cpu_under_rt_pressure(s32 cpu)
+{
+	struct task_struct *curr;
+
+	if (!is_cpu_valid(cpu))
+		return false;
+
+	curr = __COMPAT_scx_bpf_cpu_curr(cpu);
+	if (!curr || (curr->flags & PF_IDLE))
+		return false;
+
+	return rt_or_dl_task(curr) || is_ksoftirqd(curr);
+}
+
 static void count_kernel_route(u64 dsq_id)
 {
 	if (dsq_id == SHARED_DSQ) {
@@ -1144,6 +1179,8 @@ void BPF_STRUCT_OPS(cognis_enqueue, struct task_struct *p, u64 enq_flags)
 {
 	s32 prev_cpu = scx_bpf_task_cpu(p), cpu;
 	bool should_kick = is_queued_wakeup(p, enq_flags);
+	bool can_migrate = task_should_migrate(p, enq_flags);
+	bool prev_cpu_rt_busy = cpu_under_rt_pressure(prev_cpu);
 	struct task_ctx *tctx;
 
 	tctx = try_lookup_task_ctx(p);
@@ -1186,7 +1223,7 @@ void BPF_STRUCT_OPS(cognis_enqueue, struct task_struct *p, u64 enq_flags)
 	 * Keep very short-burst tasks on the same CPU to reduce queue churn and
 	 * preserve cache locality.
 	 */
-	if (is_task_sticky(tctx)) {
+	if (is_task_sticky(tctx) && !prev_cpu_rt_busy) {
 		direct_local_dispatch(p, prev_cpu, task_slice(p, prev_cpu), enq_flags);
 		goto out;
 	}
@@ -1195,7 +1232,7 @@ void BPF_STRUCT_OPS(cognis_enqueue, struct task_struct *p, u64 enq_flags)
 	 * Attempt to move the task directly to an idle CPU when migration is
 	 * still worth the cost.
 	 */
-	if (task_should_migrate(p, enq_flags)) {
+	if (can_migrate) {
 		cpu = pick_idle_cpu(p, prev_cpu, 0);
 		if (cpu >= 0) {
 			direct_local_dispatch(p, cpu, task_slice(p, cpu), enq_flags);
@@ -1214,7 +1251,8 @@ void BPF_STRUCT_OPS(cognis_enqueue, struct task_struct *p, u64 enq_flags)
 	 * widening to a node domain and finally paying the contention cost of the
 	 * global shared queue.
 	 */
-	u64 target_dsq = overflow_dsq(prev_cpu);
+	u64 target_dsq = (can_migrate && prev_cpu_rt_busy) ?
+			 SHARED_DSQ : overflow_dsq(prev_cpu);
 	scx_bpf_dsq_insert_vtime(p, target_dsq,
 				 task_slice(p, prev_cpu), task_dl(p, prev_cpu, tctx), enq_flags);
 	count_kernel_route(target_dsq);
