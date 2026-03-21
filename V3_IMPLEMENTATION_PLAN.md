@@ -57,7 +57,7 @@ Before any new upstream PR:
 
 - [x] compare `cake`, `beerland`, and `lavd` hot paths function by function
 - [x] choose the smallest base runtime model
-- [ ] write the phase-1 target hot-path map in code-oriented terms
+- [x] write the phase-1 target hot-path map in code-oriented terms
 - [ ] strip the current branch down to that base
 - [ ] rerun local benchmark repros before reintroducing any Cognis-specific
       policy

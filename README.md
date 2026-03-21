@@ -47,6 +47,8 @@ than the current stable branch.
   redesign
 - [V3_BASE_SELECTION.md](V3_BASE_SELECTION.md): chosen phase-1 base shape from
   `cake`, `beerland`, and `lavd`
+- [V3_PHASE1_HOTPATH_MAP.md](V3_PHASE1_HOTPATH_MAP.md): function-level map for
+  stripping the current tree down to the chosen phase-1 base
 - [V3_IMPLEMENTATION_PLAN.md](V3_IMPLEMENTATION_PLAN.md): branch-local checklist
   for getting from the current tree to a cleaner v3 base
 
