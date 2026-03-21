@@ -28,7 +28,7 @@ Cognis keeps the normal scheduling path in BPF. Rust remains in the process for 
 ## Status
 
 - Runtime model: BPF-first `sched_ext` scheduler with a Rust control plane
-- Common path: direct local dispatch for immediate CPU placements, then a shallow stealable per-CPU deferred tier, then per-LLC and per-node overflow DSQs with the global shared DSQ as the final spill path
+- Common path: direct local dispatch for immediate CPU placements, then a scheduler-owned stealable per-CPU deferred tier for ordinary busy-path work
 - Default install profile: `desktop`
 - Optional profile: `server`
 - Userspace fallback still exists for compatibility, but it is now an explicit opt-in path instead of part of the default service runtime
@@ -44,11 +44,9 @@ The kernel-facing policy lives in [main.bpf.c](main.bpf.c). The Rust control pla
 At a high level, Cognis works like this:
 
 1. `ops.select_cpu` and `ops.enqueue` try to keep ordinary work in BPF.
-2. Immediate placements dispatch straight to the kernel local DSQ. Deferred saturation paths use the Cognis overflow hierarchy:
-   `CPU DSQ -> LLC DSQ -> node DSQ -> shared DSQ`.
-3. Dispatch ordering is deadline-based and bounded by profile slice and wake-credit knobs.
-4. On single-node systems, the node tier collapses away and Cognis behaves as a local/LLC/shared scheduler with smarter remote LLC stealing.
-5. When the local tiers are empty, Cognis first looks at local deadline heads, then tries remote per-CPU steals, then remote LLC steals, then wider node-domain steals, and only then falls back to the current-task refill behavior.
+2. Immediate placements dispatch straight to the kernel local DSQ. Ordinary busy-path work currently uses a scheduler-owned stealable per-CPU deferred tier, while the shared DSQ is reserved for the opt-in userspace compatibility path.
+3. Dispatch ordering is still deadline-based and bounded by profile slice and wake-credit knobs.
+4. When the local deferred tier is empty, Cognis first tries local consume, then remote per-CPU steals, and only then falls back to the current-task refill behavior.
 6. Rust stays available for restart control, stats, TUI, and the opt-in compatibility fallback path.
 7. If `sched_ext` disables Cognis at runtime, Cognis now fails open to the kernel scheduler instead of treating that exit like a restart request.
 8. In headless no-fallback periods, the Rust control loop now backs off more aggressively and no longer boosts its own userspace priority by default.
@@ -57,7 +55,8 @@ At a high level, Cognis works like this:
 > [!IMPORTANT]
 > - The common case is meant to avoid a Rust round-trip.
 > - `nr_queued`, `nr_scheduled`, and `nr_user_dispatches` are compatibility-fallback signals. They are only expected to move when `--userspace-fallback` is enabled; otherwise they should stay at zero.
-> - `nr_local_dispatches`, `nr_llc_dispatches`, `nr_node_dispatches`, `nr_shared_dispatches`, `nr_xllc_steals`, and `nr_xnode_steals` describe how work is moving through the direct-local and deferred overflow paths. The current branch also experiments with remote steals from the shallow per-CPU deferred tier before broader LLC/node steals.
+> - `nr_local_dispatches` and `nr_shared_dispatches` are the most meaningful routing counters for the current reduced phase-1 branch.
+> - `nr_llc_dispatches`, `nr_node_dispatches`, `nr_xllc_steals`, and `nr_xnode_steals` are older hierarchy counters that are expected to stay at zero while the reduced phase-1 path is active.
 > - `slice(base/assigned)` in the monitor is not a live trace of every BPF dispatch slice: `base` is the active profile ceiling, while `assigned` tracks the userspace-fallback slice estimate.
 > - The Rust loop is no longer meant to spin continuously when BPF is handling the workload.
 > - Headless no-fallback operation now uses a quieter backoff and does not raise the Cognis userspace thread to `nice -20` by default.
@@ -71,7 +70,7 @@ Cognis exposes two profiles. Both use the same BPF hierarchy; `desktop` is tuned
 | Profile | Default slice ceiling | Default min slice | Wake behavior | Saturated-path bias |
 |:--|:--|:--|:--|:--|
 | `desktop` | `1000 µs` | `250 µs` | stronger wake responsiveness | favors local, LLC, and nearby-domain retention before broader spill |
-| `server` | `8000 µs` | `1000 µs` | less wake-sync bias | uses the same hierarchy but reaches node/shared spill sooner |
+| `server` | `8000 µs` | `1000 µs` | less wake-sync bias | currently shares the reduced phase-1 queue model while keeping different slice defaults |
 
 The active profile is selected with:
 
@@ -255,11 +254,11 @@ What the main counters mean:
 
 - `nr_kernel_dispatches`: total tasks handled directly by the BPF scheduler
 - `nr_local_dispatches`: BPF routes that stayed on an immediate local DSQ or the shallow scheduler-owned per-CPU deferred tier
-- `nr_llc_dispatches`: BPF routes that spilled into an LLC DSQ
-- `nr_node_dispatches`: BPF routes that spilled into a node DSQ
-- `nr_shared_dispatches`: BPF routes that spilled into the global shared DSQ
-- `nr_xllc_steals`: dispatch steals from a non-local LLC queue
-- `nr_xnode_steals`: dispatch steals from a non-local node queue
+- `nr_llc_dispatches`: older hierarchy counter; expected to stay at zero in the reduced phase-1 path
+- `nr_node_dispatches`: older hierarchy counter; expected to stay at zero in the reduced phase-1 path
+- `nr_shared_dispatches`: BPF routes that went to the shared compatibility/fallback DSQ
+- `nr_xllc_steals`: older hierarchy counter; expected to stay at zero in the reduced phase-1 path
+- `nr_xnode_steals`: older hierarchy counter; expected to stay at zero in the reduced phase-1 path
 - `nr_user_dispatches`: tasks that crossed into the userspace compatibility fallback
 - `nr_queued` / `nr_scheduled`: current compatibility-fallback backlog
 - `slice(base/assigned)`: profile slice ceiling plus userspace-fallback assigned-slice estimate, not a direct per-task BPF slice trace
@@ -267,7 +266,7 @@ What the main counters mean:
 
 If `--userspace-fallback` is off, `nr_user_dispatches`, `nr_queued`, and `nr_scheduled` should stay at zero. If they stay elevated when the fallback is enabled during a workload that should fit the BPF fast path, that is a signal to investigate the BPF policy rather than a sign that the userspace path is “working as intended.”
 
-If `nr_shared_dispatches` dominates `nr_local_dispatches + nr_llc_dispatches + nr_node_dispatches` during a saturated workload, that is a hint that the workload is spilling past CPU-local, cache-local, and node-local domains and may benefit from more tuning on the saturated path.
+If `nr_shared_dispatches` climbs during a workload that should stay on the BPF-owned path, that is a hint that the branch is still leaning on the compatibility/fallback side more than intended.
 
 ## Benchmark Helpers
 

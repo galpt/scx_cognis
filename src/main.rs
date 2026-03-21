@@ -8,9 +8,9 @@
 // fallback when work intentionally crosses into userspace:
 //
 //   ┌─────────────────────────────────────────────────────────────────────┐
-//   │  ops.enqueue    → direct local dispatch, then CPU / LLC / node /     │
-//   │                   shared deferred tiers                              │
-//   │  ops.dispatch   → deadline ordering + stealable deferred handoff     │
+//   │  ops.enqueue    → direct local dispatch, then a stealable per-CPU    │
+//   │                   deferred tier                                      │
+//   │  ops.dispatch   → local deferred consume + remote deferred draining  │
 //   │  fallback path  → dormant userspace compatibility path               │
 //   │  ops.select_cpu → kernel idle-CPU query (pick_idle_cpu, atomic)     │
 //   │  housekeeping   → slice-base refresh + observability cleanup         │
@@ -102,9 +102,10 @@ impl SchedulerMode {
 /// scx_cognis: a BPF-first CPU scheduler with a minimal userspace fallback.
 ///
 /// Scheduling pipeline: direct local dispatch handles immediate placements,
-/// while the BPF deferred hierarchy owns the shallow per-CPU / LLC / node /
-/// shared path. Rust stays available for stats, restart handling, and an
-/// opt-in compatibility fallback path.
+/// while the reduced BPF deferred path currently keeps ordinary busy-path work
+/// on a scheduler-owned per-CPU tier that other CPUs can drain. Rust stays
+/// available for stats, restart handling, and an opt-in compatibility fallback
+/// path.
 #[derive(Debug, Parser)]
 struct Opts {
     /// Maximum scheduling slice duration in microseconds.
@@ -127,7 +128,9 @@ struct Opts {
     /// Scheduling profile.
     ///
     /// `desktop` favors wake responsiveness, locality, and sticky short bursts.
-    /// `server` favors shared overflow and steadier throughput under saturation.
+    /// `server` remains available, but the reduced phase-1 branch is primarily
+    /// validating the smaller common-path runtime rather than the old deeper
+    /// overflow hierarchy.
     #[clap(long, value_enum, default_value = "desktop")]
     mode: SchedulerMode,
 

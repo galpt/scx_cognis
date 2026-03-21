@@ -6,13 +6,13 @@
  * for loading the scheduler, exporting stats, handling restart/reporting, and
  * keeping an opt-in compatibility path for legacy user-space dispatch.
  *
- * The hot policy is intentionally simple and research-driven:
- *   - per-CPU local DSQs for locality
- *   - per-LLC overflow DSQs before the global shared fallback
- *   - per-NUMA node DSQs before the global shared fallback
- *   - EEVDF-like virtual deadlines
- *   - bounded wakeup credit for frequently sleeping tasks
- *   - desktop/server profiles that tune slice, lag, and spill behavior
+ * The hot policy is intentionally being reduced toward a smaller v3 base:
+ *   - direct local dispatch for obvious immediate placements
+ *   - one scheduler-owned stealable per-CPU deferred tier for ordinary busy paths
+ *   - shared DSQ use reserved for the opt-in user-space compatibility path
+ *   - EEVDF-like virtual deadlines and bounded wakeup credit retained for now
+ *   - desktop/server profiles still exist, but the deep spill hierarchy is no
+ *     longer the default runtime story in this branch
  *
  * This software may be used and distributed according to the terms of the
  * GNU General Public License version 2.
@@ -57,18 +57,13 @@ UEI_DEFINE(uei);
 #define SHARED_DSQ MAX_CPUS
 
 /*
- * Per-LLC overflow DSQs sit between the CPU-local queues and the wider
- * node-wide spill queue. This keeps saturation mostly inside the closest
- * cache domain before broadening out to a NUMA domain or the global shared
- * fallback.
+ * Additional DSQ tiers from the older Cognis hierarchy are intentionally kept
+ * out of the phase-1 default path while the branch is reduced toward a smaller
+ * v3 base.
  */
 #define MAX_LLCS 64
 #define LLC_DSQ_BASE (MAX_CPUS + 2)
 
-/*
- * Per-node overflow DSQs sit between the LLC queues and the global shared
- * fallback. On single-node systems this layer is skipped entirely.
- */
 #define MAX_NODES 64
 #define NODE_DSQ_BASE (LLC_DSQ_BASE + MAX_LLCS)
 
@@ -478,71 +473,6 @@ static u64 cpu_to_dsq(s32 cpu)
 }
 
 /*
- * Return the DSQ ID associated to a compact LLC domain.
- */
-static inline u64 llc_to_dsq(u32 llc_idx)
-{
-	return LLC_DSQ_BASE + llc_idx;
-}
-
-/*
- * Return the DSQ ID associated to a compact NUMA node domain.
- */
-static inline u64 node_to_dsq(u32 node_idx)
-{
-	return NODE_DSQ_BASE + node_idx;
-}
-
-/*
- * Return the compact LLC index associated to @cpu.
- */
-static inline u32 cpu_llc_idx_for(s32 cpu)
-{
-	if (!is_cpu_valid(cpu))
-		return 0;
-
-	return cpu_llc_idx_map[cpu];
-}
-
-/*
- * Return the compact node index associated to @cpu.
- */
-static inline u32 cpu_node_idx_for(s32 cpu)
-{
-	if (!is_cpu_valid(cpu))
-		return 0;
-
-	return cpu_node_idx_map[cpu];
-}
-
-/*
- * Return the compact node index associated to an LLC domain.
- */
-static inline u32 llc_node_idx_for(u32 llc_idx)
-{
-	if (llc_idx >= MAX_LLCS)
-		return 0;
-
-	return llc_node_idx_map[llc_idx];
-}
-
-/*
- * Return the DSQ ID associated to the LLC domain that contains @cpu.
- */
-static inline u64 cpu_llc_dsq(s32 cpu)
-{
-	return llc_to_dsq(cpu_llc_idx_for(cpu));
-}
-
-/*
- * Return the DSQ ID associated to the node domain that contains @cpu.
- */
-static inline u64 cpu_node_dsq(s32 cpu)
-{
-	return node_to_dsq(cpu_node_idx_for(cpu));
-}
-
-/*
  * Return true if @this_cpu and @that_cpu are in the same LLC, false
  * otherwise.
  */
@@ -684,86 +614,20 @@ static u64 queue_pressure(s32 cpu)
 		return pressure;
 
 	pressure += scx_bpf_dsq_nr_queued(cpu_to_dsq(cpu));
-	pressure += scx_bpf_dsq_nr_queued(cpu_llc_dsq(cpu));
-	if (nr_nodes > 1)
-		pressure += scx_bpf_dsq_nr_queued(cpu_node_dsq(cpu));
 
 	return pressure;
 }
 
-static u64 cpu_spill_threshold(void)
-{
-	/*
-	 * Keep at most one queued task in the scheduler-owned per-CPU DSQ
-	 * before widening into the LLC/node/shared hierarchy. This keeps a
-	 * stealable local backlog slot without letting an RT-dominated CPU
-	 * accumulate an arbitrarily deep private queue.
-	 */
-	return 1;
-}
-
-static u64 llc_spill_threshold(void)
-{
-	u64 llcs = MAX((u64)nr_llcs, 1);
-	u64 cpus_per_llc = MAX((nr_online_cpus + llcs - 1) / llcs, 1);
-
-	if (server_mode)
-		return MAX(cpus_per_llc / 2, 1);
-
-	return cpus_per_llc;
-}
-
-static u64 node_spill_threshold(void)
-{
-	u64 nodes = MAX((u64)nr_nodes, 1);
-	u64 cpus_per_node = MAX((nr_online_cpus + nodes - 1) / nodes, 1);
-
-	if (server_mode)
-		return MAX(cpus_per_node / 2, 1);
-
-	return cpus_per_node;
-}
-
 /*
- * Pick the fallback DSQ to use once no idle CPU was available.
+ * Pick the deferred DSQ to use once no immediate direct placement is available.
  *
- * The default runtime keeps immediate placements on kernel local DSQs and
- * uses a scheduler-owned per-CPU DSQ as the first deferred tier once no
- * direct placement is available. Other CPUs can steal from that tier when a
- * runnable task would otherwise get stranded behind RT-heavy local pressure.
- * If that queue already has backlog, overflow widens to the closest LLC DSQ,
- * then a node DSQ, and finally the global shared DSQ when the nearer domains
- * are already saturated too.
- *
- * Server mode uses the same hierarchy but reaches broader spill tiers sooner
- * to keep throughput-oriented balancing broad under pressure.
+ * Phase 1 keeps ordinary BPF-managed work on a scheduler-owned per-CPU DSQ so
+ * other CPUs can steal from it. The shared DSQ is reserved for the opt-in
+ * user-space compatibility path and other recoverable fallback cases.
  */
-static u64 overflow_dsq(s32 prev_cpu)
+static u64 deferred_dsq(s32 prev_cpu)
 {
-	u64 local_dsq, llc_dsq, node_dsq;
-	u64 local_depth, llc_depth, node_depth;
-
-	if (!is_cpu_valid(prev_cpu))
-		return SHARED_DSQ;
-
-	local_dsq = cpu_to_dsq(prev_cpu);
-	local_depth = scx_bpf_dsq_nr_queued(local_dsq);
-	if (local_depth < cpu_spill_threshold())
-		return local_dsq;
-
-	llc_dsq = cpu_llc_dsq(prev_cpu);
-	llc_depth = scx_bpf_dsq_nr_queued(llc_dsq);
-	if (llc_depth < llc_spill_threshold())
-		return llc_dsq;
-
-	if (nr_nodes > 1) {
-		node_dsq = cpu_node_dsq(prev_cpu);
-		node_depth = scx_bpf_dsq_nr_queued(node_dsq);
-		if (node_depth < node_spill_threshold())
-			return node_dsq;
-	}
-
-	return SHARED_DSQ;
+	return cpu_to_dsq(prev_cpu);
 }
 
 static u64 task_slice(const struct task_struct *p, s32 cpu)
@@ -983,49 +847,6 @@ static inline bool is_remote_head_better(const struct task_struct *candidate,
 	return candidate_depth > best_depth;
 }
 
-static bool steal_remote_llc(s32 cpu, bool same_node_only)
-{
-	struct task_struct *candidate, *best = NULL;
-	u64 best_depth = 0, candidate_depth, best_dsq = 0;
-	u32 my_llc, my_node, victim, i;
-
-	if (!is_cpu_valid(cpu) || nr_llcs <= 1)
-		return false;
-
-	my_llc = cpu_llc_idx_for(cpu);
-	my_node = cpu_node_idx_for(cpu);
-
-	bpf_for(i, 1, MAX_LLCS) {
-		if (i >= nr_llcs)
-			break;
-
-		victim = my_llc + i;
-		if (victim >= nr_llcs)
-			victim -= nr_llcs;
-
-		if (same_node_only && llc_node_idx_for(victim) != my_node)
-			continue;
-
-		candidate_depth = scx_bpf_dsq_nr_queued(llc_to_dsq(victim));
-		if (!candidate_depth)
-			continue;
-
-		candidate = __COMPAT_scx_bpf_dsq_peek(llc_to_dsq(victim));
-		if (is_remote_head_better(candidate, candidate_depth, best, best_depth)) {
-			best = candidate;
-			best_depth = candidate_depth;
-			best_dsq = llc_to_dsq(victim);
-		}
-	}
-
-	if (best && scx_bpf_dsq_move_to_local(best_dsq)) {
-		__sync_fetch_and_add(&nr_xllc_steals, 1);
-		return true;
-	}
-
-	return false;
-}
-
 static bool steal_remote_cpu(s32 cpu, bool same_llc_only)
 {
 	struct task_struct *candidate, *best = NULL;
@@ -1059,68 +880,15 @@ static bool steal_remote_cpu(s32 cpu, bool same_llc_only)
 	return best && scx_bpf_dsq_move_to_local(best_dsq);
 }
 
-static bool steal_remote_node(s32 cpu)
-{
-	struct task_struct *candidate, *best = NULL;
-	u64 best_depth = 0, candidate_depth, best_dsq = 0;
-	u32 my_node, victim, i;
-
-	if (!is_cpu_valid(cpu) || nr_nodes <= 1)
-		return false;
-
-	my_node = cpu_node_idx_for(cpu);
-
-	bpf_for(i, 1, MAX_NODES) {
-		if (i >= nr_nodes)
-			break;
-
-		victim = my_node + i;
-		if (victim >= nr_nodes)
-			victim -= nr_nodes;
-
-		candidate_depth = scx_bpf_dsq_nr_queued(node_to_dsq(victim));
-		if (!candidate_depth)
-			continue;
-
-		candidate = __COMPAT_scx_bpf_dsq_peek(node_to_dsq(victim));
-		if (is_remote_head_better(candidate, candidate_depth, best, best_depth)) {
-			best = candidate;
-			best_depth = candidate_depth;
-			best_dsq = node_to_dsq(victim);
-		}
-	}
-
-	if (best && scx_bpf_dsq_move_to_local(best_dsq)) {
-		__sync_fetch_and_add(&nr_xnode_steals, 1);
-		return true;
-	}
-
-	return false;
-}
-
 static bool dsq_backlog_exists(void)
 {
-	s32 cpu, llc, node;
+	s32 cpu;
 
 	if (scx_bpf_dsq_nr_queued(SHARED_DSQ))
 		return true;
 
 	bpf_for(cpu, 0, nr_cpu_ids) {
 		if (scx_bpf_dsq_nr_queued(cpu_to_dsq(cpu)))
-			return true;
-	}
-
-	bpf_for(llc, 0, MAX_LLCS) {
-		if (llc >= nr_llcs)
-			break;
-		if (scx_bpf_dsq_nr_queued(llc_to_dsq(llc)))
-			return true;
-	}
-
-	bpf_for(node, 0, MAX_NODES) {
-		if (node >= nr_nodes)
-			break;
-		if (scx_bpf_dsq_nr_queued(node_to_dsq(node)))
 			return true;
 	}
 
@@ -1292,17 +1060,13 @@ void BPF_STRUCT_OPS(cognis_enqueue, struct task_struct *p, u64 enq_flags)
 	}
 
 	/*
-	 * No idle CPU was available. Route through the deferred hierarchy:
+	 * No idle CPU was available. Phase 1 keeps ordinary BPF-managed work on a
+	 * single scheduler-owned deferred tier so other CPUs can steal it.
 	 *
-	 *   CPU DSQ -> LLC DSQ -> node DSQ -> shared DSQ
-	 *
-	 * The scheduler-owned per-CPU tier is intentionally shallow and
-	 * stealable. It lets other CPUs drain a task that was originally
-	 * closest to @prev_cpu before the task is widened into broader LLC,
-	 * node, and global spill queues.
+	 * The shared DSQ remains reserved for the user-space compatibility path
+	 * rather than as the default overflow target for normal tasks.
 	 */
-	u64 target_dsq = (can_migrate && prev_cpu_rt_busy) ?
-			 SHARED_DSQ : overflow_dsq(prev_cpu);
+	u64 target_dsq = deferred_dsq(prev_cpu);
 	scx_bpf_dsq_insert_vtime(p, target_dsq,
 				 task_slice(p, prev_cpu), task_dl(p, prev_cpu, tctx), enq_flags);
 	count_kernel_route(target_dsq);
@@ -1344,10 +1108,8 @@ static long handle_dispatched_task(struct bpf_dynptr *dynptr, void *context)
  */
 void BPF_STRUCT_OPS(cognis_dispatch, s32 cpu, struct task_struct *prev)
 {
-	struct task_struct *local = NULL, *llc, *node = NULL, *shared, *best = NULL;
+	struct task_struct *local = NULL, *shared, *best = NULL;
 	u64 local_dsq = cpu_to_dsq(cpu);
-	u64 llc_dsq = cpu_llc_dsq(cpu);
-	u64 node_dsq = cpu_node_dsq(cpu);
 	u64 best_dsq = 0;
 
 	last_dispatch_at = scx_bpf_now();
@@ -1371,25 +1133,13 @@ void BPF_STRUCT_OPS(cognis_dispatch, s32 cpu, struct task_struct *prev)
 		return;
 
 	/*
-	 * Pick the earliest deadline between the scheduler-owned per-CPU queue,
-	 * the local LLC overflow DSQ, the wider node DSQ, and the global shared
-	 * spill DSQ.
+	 * Phase 1 only compares the scheduler-owned per-CPU deferred queue with
+	 * the shared compatibility-fallback queue.
 	 */
 	local = __COMPAT_scx_bpf_dsq_peek(local_dsq);
-	llc = __COMPAT_scx_bpf_dsq_peek(llc_dsq);
-	if (nr_nodes > 1)
-		node = __COMPAT_scx_bpf_dsq_peek(node_dsq);
 	shared = __COMPAT_scx_bpf_dsq_peek(SHARED_DSQ);
 	best = local;
 	best_dsq = local ? local_dsq : 0;
-	if (is_deadline_min(llc, best)) {
-		best = llc;
-		best_dsq = llc_dsq;
-	}
-	if (is_deadline_min(node, best)) {
-		best = node;
-		best_dsq = node_dsq;
-	}
 	if (is_deadline_min(shared, best)) {
 		best = shared;
 		best_dsq = SHARED_DSQ;
@@ -1398,21 +1148,11 @@ void BPF_STRUCT_OPS(cognis_dispatch, s32 cpu, struct task_struct *prev)
 		return;
 	if (local && best_dsq != local_dsq && scx_bpf_dsq_move_to_local(local_dsq))
 		return;
-	if (llc && best_dsq != llc_dsq && scx_bpf_dsq_move_to_local(llc_dsq))
-		return;
-	if (node && best_dsq != node_dsq && scx_bpf_dsq_move_to_local(node_dsq))
-		return;
 	if (shared && best_dsq != SHARED_DSQ && scx_bpf_dsq_move_to_local(SHARED_DSQ))
 		return;
 	if (steal_remote_cpu(cpu, true))
 		return;
 	if (steal_remote_cpu(cpu, false))
-		return;
-	if (steal_remote_llc(cpu, true))
-		return;
-	if (steal_remote_node(cpu))
-		return;
-	if (steal_remote_llc(cpu, false))
 		return;
 
 	/*
@@ -1642,16 +1382,17 @@ static s32 get_nr_online_cpus(void)
 }
 
 /*
- * Create a DSQ hierarchy for each CPU available in the system:
+ * Create the phase-1 DSQ layout:
  *
- *   per-CPU DSQs -> per-LLC DSQs -> per-node DSQs -> global shared DSQ
+ *   per-CPU deferred DSQs -> global shared compatibility DSQ
  *
- * The compatibility user-space scheduler still keeps its own dedicated DSQ.
+ * The compatibility user-space scheduler still keeps its own dedicated DSQ
+ * when that path is enabled.
  */
 static int dsq_init(void)
 {
 	int err;
-	s32 cpu, llc;
+	s32 cpu;
 
 	/* Initialize amount of online CPUs */
 	nr_online_cpus = get_nr_online_cpus();
@@ -1662,32 +1403,6 @@ static int dsq_init(void)
 		if (err) {
 			scx_bpf_error("failed to create pcpu DSQ %d: %d",
 				      cpu, err);
-			return err;
-		}
-	}
-
-	/* Create per-LLC DSQs */
-	bpf_for(llc, 0, MAX_LLCS) {
-		if (llc >= nr_llcs)
-			break;
-
-		err = scx_bpf_create_dsq(llc_to_dsq(llc), -1);
-		if (err) {
-			scx_bpf_error("failed to create llc DSQ %d: %d",
-				      llc, err);
-			return err;
-		}
-	}
-
-	/* Create per-node DSQs */
-	bpf_for(llc, 0, MAX_NODES) {
-		if (llc >= nr_nodes)
-			break;
-
-		err = scx_bpf_create_dsq(node_to_dsq(llc), -1);
-		if (err) {
-			scx_bpf_error("failed to create node DSQ %d: %d",
-				      llc, err);
 			return err;
 		}
 	}
