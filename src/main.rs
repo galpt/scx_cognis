@@ -8,8 +8,8 @@
 // fallback when work intentionally crosses into userspace:
 //
 //   ┌─────────────────────────────────────────────────────────────────────┐
-//   │  ops.enqueue    → BPF local CPU / LLC / node / shared hierarchy      │
-//   │  ops.dispatch   → bounded wake credit + virtual deadline handoff     │
+//   │  ops.enqueue    → direct local dispatch, then LLC / node / shared    │
+//   │  ops.dispatch   → bounded wake credit + deferred overflow handoff    │
 //   │  fallback path  → dormant userspace compatibility path               │
 //   │  ops.select_cpu → kernel idle-CPU query (pick_idle_cpu, atomic)     │
 //   │  housekeeping   → slice-base refresh + observability cleanup         │
@@ -100,9 +100,10 @@ impl SchedulerMode {
 
 /// scx_cognis: a BPF-first CPU scheduler with a minimal userspace fallback.
 ///
-/// Scheduling pipeline: a BPF local CPU / LLC / node / shared hierarchy owns
-/// normal dispatch, while Rust stays available for stats, restart handling,
-/// and an opt-in compatibility fallback path.
+/// Scheduling pipeline: direct local dispatch handles immediate placements,
+/// while the BPF overflow hierarchy owns the deferred LLC / node / shared
+/// path. Rust stays available for stats, restart handling, and an opt-in
+/// compatibility fallback path.
 #[derive(Debug, Parser)]
 struct Opts {
     /// Maximum scheduling slice duration in microseconds.
@@ -1414,18 +1415,15 @@ impl<'a> Scheduler<'a> {
         // This is the critical fix for runnable-task stall crashes:
         //
         //   notify_complete(N > 0) sets nr_scheduled > 0, which makes
-        //   usersched_has_pending_tasks() return true in BPF.  ops.dispatch
-        //   then prioritises running the cognis kthread (SCHED_DSQ) over
-        //   cpu_to_dsq(X) on every CPU X.  Kworkers dispatched by BPF to
-        //   cpu_to_dsq(X) — the CPU currently hosting cognis — can only be
-        //   consumed once that CPU stops picking cognis from SCHED_DSQ; if
-        //   nr_scheduled stays > 0 for 5+ seconds the sched_ext watchdog fires.
+        //   usersched_has_pending_tasks() return true in BPF. ops.dispatch
+        //   then prioritises running the Cognis kthread (SCHED_DSQ) over the
+        //   normal deferred overflow path. If nr_scheduled stays > 0 for 5+
+        //   seconds, the sched_ext watchdog can still fire.
         //
         //   By dispatching every internally-queued task before returning,
         //   tasks_len() == 0 → notify_complete(0) → nr_scheduled = 0 →
         //   usersched_has_pending_tasks() returns false → every CPU's
-        //   ops.dispatch falls through to its local per-CPU DSQ and drains
-        //   kworkers normally.
+        //   ops.dispatch falls back to the normal BPF-owned overflow path.
         //
         // Dispatch order is maintained by pop_highest_priority_task() (RT
         // first). User-space managed tasks fall back to SHARED_DSQ unless
